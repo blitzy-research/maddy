@@ -141,9 +141,11 @@ Free-form formatted text with no JSON fields. Still prefixed with the logger nam
 
 ### Annotated Example
 
+From actual `TestSMTPDelivery` output:
+
 ```
-smtp: incoming message	{"msg_id":"a1b2c3d4","sender":"user@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:12345"}
-^^^^^  ^^^^^^^^^^^^^^^^^	^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+smtp: incoming message	{"msg_id":"0e7384cf","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:35134"}
+^^^^^  ^^^^^^^^^^^^^^^^^	^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 |      |                	|
 |      |                	JSON fields (alphabetically ordered keys, tab-separated from message)
 |      message text
@@ -163,7 +165,9 @@ The logger is created with name `"smtp"` in tests (Source: `internal/endpoint/sm
 | Context | Format | Generation | Source |
 |---------|--------|------------|--------|
 | **Production** | 8-character hex string | 4 random bytes via `crypto/rand.Read()`, hex-encoded. Called via `msgpipeline.GenerateMsgID()` | `msgpipeline/msgid.go` lines 12–15; called from smtp.go line 112 |
-| **Tests** | 40-character hex string | Full SHA-1 hash of `t.Name()`, hex-encoded | `testutils/target.go` lines 239–240 |
+| **Tests (queue/remote)** | 40-character hex string | Full SHA-1 hash of `t.Name()`, hex-encoded; used by `testutils.DoTestDelivery()` | `testutils/target.go` lines 239–240 |
+
+> **Note:** SMTP endpoint tests use the production `GenerateMsgID()` path, producing 8-character hex IDs (e.g., `"0e7384cf"`). Queue and remote delivery tests use `testutils.DoTestDelivery()`, producing 40-character hex IDs (e.g., `"10a443bb0a7e5de1d30121b8c14dd6c4aa957760"`).
 
 Test implementation:
 ```go
@@ -174,6 +178,14 @@ encodedID := hex.EncodeToString(IDRaw[:])
 ### Successful Delivery Log Trace
 
 Source: `TestSMTPDelivery` in `smtp_test.go` lines 122–158.
+
+**Actual test output** (from `TestSMTPDelivery`):
+```
+smtp: incoming message	{"msg_id":"0e7384cf","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:35134"}
+smtp: RCPT ok	{"msg_id":"0e7384cf","rcpt":"rcpt1@example.com"}
+smtp: RCPT ok	{"msg_id":"0e7384cf","rcpt":"rcpt2@example.com"}
+smtp: accepted	{"msg_id":"0e7384cf"}
+```
 
 **Step 1: `incoming message`** — smtp.go lines 127–142
 
@@ -230,6 +242,14 @@ s.log.Msg("accepted", "msg_id", s.msgMeta.ID)
 ### Aborted Delivery Log Trace
 
 Source: `TestSMTPDelivery_AbortData` in `smtp_test.go` lines 360–396.
+
+**Actual test output** (from `TestSMTPDelivery_AbortData`):
+```
+smtp: incoming message	{"msg_id":"f5b1bd27","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:35144"}
+smtp: RCPT ok	{"msg_id":"f5b1bd27","rcpt":"test@example.com"}
+smtp: DATA error	{"msg_id":"f5b1bd27","reason":"unexpected EOF"}
+smtp: aborted	{"msg_id":"f5b1bd27"}
+```
 
 **Step 1: `incoming message`** — Same as successful delivery (smtp.go lines 136–141).
 
@@ -291,6 +311,15 @@ s.log.Msg("aborted", "msg_id", s.msgMeta.ID)
 ### Submission Auth Log Trace
 
 Source: `TestSMTPDelivery_SubmissionAuthOK` in `smtp_test.go` lines 480–520.
+
+**Actual test output** (from `TestSMTPDelivery_SubmissionAuthOK`):
+```
+smtp: incoming message	{"msg_id":"e138fd8a","sender":"sender@example.org","src_host":"localhost","src_ip":"127.0.0.1:35152","username":"user"}
+smtp: RCPT ok	{"msg_id":"e138fd8a","rcpt":"rcpt@example.org"}
+smtp: adding missing Message-ID	
+smtp: adding missing Date header	
+smtp: accepted	{"msg_id":"e138fd8a"}
+```
 
 For authenticated submission, the `incoming message` log line includes the extra `"username"` field (smtp.go lines 127–134):
 ```go
@@ -356,6 +385,12 @@ msgMeta.ID = msgMeta.ID + "-" + strconv.Itoa(meta.TriesCount+1)
 
 Source: `TestQueueDelivery` — successful single-attempt delivery.
 
+**Actual test output** (from `TestQueueDelivery`):
+```
+queue: delivered	{"attempt":1,"msg_id":"10a443bb0a7e5de1d30121b8c14dd6c4aa957760","rcpt":"tester1@example.org"}
+queue: delivered	{"attempt":1,"msg_id":"10a443bb0a7e5de1d30121b8c14dd6c4aa957760","rcpt":"tester2@example.org"}
+```
+
 **Step 1: Debug `delivery attempt #N`** — queue.go line 367:
 ```go
 dl.Debugf("delivery attempt #%d", meta.TriesCount+1)
@@ -376,6 +411,14 @@ dl.Msg("delivered", "rcpt", rcpt, "attempt", meta.TriesCount+1)
 ### Permanent Failure Log Trace
 
 Source: `TestQueueDelivery_PermanentFail_NonPartial`.
+
+**Actual test output** (from `TestQueueDelivery_PermanentFail_NonPartial`):
+```
+queue: delivery attempt failed	{"msg_id":"a2fe56ad0f3684e4366c111f6c6a51955028ce2c","rcpt":"tester1@example.org","reason":"you shall not pass"}
+queue: delivery attempt failed	{"msg_id":"a2fe56ad0f3684e4366c111f6c6a51955028ce2c","rcpt":"tester2@example.org","reason":"you shall not pass"}
+queue: not delivered, permanent error	{"msg_id":"a2fe56ad0f3684e4366c111f6c6a51955028ce2c","rcpt":"tester1@example.org"}
+queue: not delivered, permanent error	{"msg_id":"a2fe56ad0f3684e4366c111f6c6a51955028ce2c","rcpt":"tester2@example.org"}
+```
 
 **Step 1: `delivery attempt failed`** — queue.go line 384:
 ```go
@@ -403,6 +446,15 @@ dl.Msg("not delivered, permanent error", "rcpt", rcpt)
 ### Temporary Failure with Retry Log Trace
 
 Source: `TestQueueDelivery_TemporaryFail` and `TestQueueDelivery_MultipleAttempts`.
+
+**Actual test output** (from `TestQueueDelivery_TemporaryFail`):
+```
+queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org","reason":"you shall not pass"}
+queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org","reason":"you shall not pass"}
+queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-320ns","rcpts":["tester1@example.org","tester2@example.org"]}
+queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org"}
+queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org"}
+```
 
 **Step 1: `delivery attempt failed`** — Same as permanent failure (queue.go line 384).
 
@@ -489,6 +541,14 @@ The remote delivery logger is created with name `"remote"` (Source: `remote.go` 
 
 ### MX Authentication Error Catalog
 
+**Actual test output** (from `TestRemoteDelivery_AuthMX_Fail`):
+```
+[debug] remote: trying	{"domain":"example.invalid","msg_id":"ac08d9f027f71627267fb3eae96f84d56762fa16","mx":"mx.example.invalid."}
+```
+The error propagated to the caller (visible via test mock) is: `Failed to estabilish the MX record (mx.example.invalid.) authenticity` with the outer wrapping error "No usable MXs" carrying `smtp_code:550`.
+
+> **Note on error wrapping:** The inner error from `checkPolicies()` carries enhanced code 5.7.0 as defined in `connect.go`. When no MX succeeds, `connectionForDomain()` wraps the last error into a `"No usable MXs"` envelope with a fallback enhanced code derived from `exterrors.SMTPEnchCode()` (connect.go lines 204–212). The codes documented below are the **inner policy error codes** as defined at the `checkPolicies()` call site.
+
 #### Error 1: MX Record Authenticity Failure
 
 Source: `connect.go` lines 94–99.
@@ -574,6 +634,14 @@ Source: `connect.go` lines 156–160.
 
 Source: `TestRemoteDelivery_TLSErrFallback` (remote_test.go).
 
+**Actual test output** (from `TestRemoteDelivery_TLSErrFallback`):
+```
+[debug] remote: trying	{"domain":"example.invalid","msg_id":"2176ec5872ed2b87d832b4070e88232bd94ac7d3","mx":"mx.example.invalid."}
+remote: TLS error, falling back to plaintext	{"domain":"example.invalid","msg_id":"2176ec5872ed2b87d832b4070e88232bd94ac7d3","mx":"mx.example.invalid.","reason":"smtpconn: tls: failed to verify certificate: x509: certificate signed by unknown authority"}
+[debug] remote: connected	{"domain":"example.invalid","msg_id":"2176ec5872ed2b87d832b4070e88232bd94ac7d3","mx":"mx.example.invalid."}
+[debug] remote: connected	{"msg_id":"2176ec5872ed2b87d832b4070e88232bd94ac7d3","remote_server":"mx.example.invalid."}
+```
+
 #### Fallback Log Message
 
 Source: `connect.go` lines 176–177:
@@ -625,8 +693,8 @@ When `requireTLS` is `true` (set by local policy via `rd.rt.requireTLS`, or by M
 
 ### MX Authentication Debug Messages
 
-| Message | Method | Fields | Trigger | Source |
-|---------|--------|--------|---------|--------|
+| Message | Method | Explicit Fields | Trigger | Source |
+|---------|--------|-----------------|---------|--------|
 | `trying` | `rd.Log.DebugMsg(...)` | `domain`, `mx` | Before each MX connection attempt | connect.go:163 |
 | `connected` | `rd.Log.DebugMsg(...)` | `domain`, `mx` | After successful connection and MAIL FROM | connect.go:216 |
 | `authenticated MX using DNSSEC` | `rd.Log.DebugMsg(...)` | `domain`, `mx` | DNSSEC auth enabled and `conn.dnssecOk == true` | connect.go:77 |
@@ -636,6 +704,8 @@ When `requireTLS` is `true` (set by local policy via `rd.rt.requireTLS`, or by M
 | `TLS required by local policy` | `rd.Log.DebugMsg(...)` | `domain`, `mx` | `rd.rt.requireTLS == true` | connect.go:89 |
 | `Policy fetch error, ignoring` | `rd.Log.DebugMsg(...)` | `mx`, `domain`, `err` | MTA-STS policy fetch error in non-enforce mode | connect.go:71 |
 | `skipping MX not matching MTA-STS` | `rd.Log.Msg(...)` ⚠️ | `domain`, `mx` | MTA-STS enforce mode and MX doesn't match policy | connect.go:63 |
+
+> **Note:** All messages in this table also include the persistent `msg_id` field (from `DeliveryLogger`; Source: remote.go line 190). For example, from `TestRemoteDelivery_AuthMX_DNSSEC`: `[debug] remote: trying {"domain":"example.invalid","msg_id":"0a77982df003cba016277296ba75dc0a6e063ae5","mx":"mx.example.invalid."}`.
 
 > **Note:** `skipping MX not matching MTA-STS` uses `Msg()` not `DebugMsg()` — it is **always** logged regardless of debug settings.
 
@@ -895,7 +965,7 @@ flowchart LR
 ```
 
 **Message ID enrichment flow:**
-1. SMTP endpoint creates `msg_id` via `msgpipeline.GenerateMsgID()` → 8-char hex (production) or 40-char hex (tests)
+1. SMTP endpoint creates `msg_id` via `msgpipeline.GenerateMsgID()` → 8-char hex (both production and SMTP endpoint tests, e.g., `"0e7384cf"`). Queue/remote tests use `testutils.DoTestDelivery()` → 40-char hex (e.g., `"10a443bb0a7e5de1d30121b8c14dd6c4aa957760"`)
 2. Queue's `DeliveryLogger` adds persistent `msg_id` field to all queue log messages
 3. For each delivery attempt, the queue mutates the ID: `originalID + "-" + attemptNumber` (queue.go line 439)
 
