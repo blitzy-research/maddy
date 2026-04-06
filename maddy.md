@@ -477,6 +477,7 @@ delay = initialRetryTime × retryTimeScale ^ (TriesCount - 1)
 | `failed to generate fail DSN` | `dl.Error(...)` | Error | queue.go:903 | `msg_id`, `reason` |
 | `failed to enqueue DSN` | `dl.Error(...)` | Error | queue.go:923,929 | `msg_id`, `dsn_id`, `reason` |
 | `delivery.Abort failed` | `dl.Error(...)` | Error | queue.go:479–480 | `msg_id`, `reason` |
+| `delivery.Abort failed` | `dl.Msg(...)` | Info | queue.go:520 | `err` (positional) |
 
 ---
 
@@ -589,6 +590,7 @@ JSON fields (alphabetically ordered):
 | Field | Type | Description | Source |
 |-------|------|-------------|--------|
 | `domain` | string | Target domain being delivered to | connect.go:177 |
+| `msg_id` | string | Message identifier (from DeliveryLogger) | remote.go:190 |
 | `mx` | string | MX hostname that had the TLS error | connect.go:177 |
 | `reason` | string | TLS error description (auto-added by `Logger.Error` from `err`) | log.go:99 |
 
@@ -690,6 +692,7 @@ Source: `smtpconn.go` lines 65–120.
 | Field | Type | Logged By | Source |
 |-------|------|-----------|--------|
 | `domain` | string | `trying`, `connected`, `TLS error, falling back to plaintext`, `TLS required by MTA-STS`, `TLS required by local policy`, `authenticated MX using DNSSEC`, `authenticated MX using common domain rule`, `skipping MX not matching MTA-STS` | connect.go |
+| `err` | error/string | `Policy fetch error, ignoring` | connect.go:71 |
 | `mx` | string | Same messages as `domain`, plus `authenticated MX using MTA-STS` | connect.go |
 | `remote_server` | string | `connected` (smtpconn level) | smtpconn.go:248 |
 | `reason` | string | `TLS error, falling back to plaintext`, all `Error()` calls | log.go:99 |
@@ -831,7 +834,7 @@ flowchart TD
     G -->|No, Enforce mode| I["Log: skipping MX not matching MTA-STS<br/>Return 550 / 5.7.0<br/>'Failed to estabilish the MX record authenticity (MTA-STS)'"]
     G -->|No, Non-enforce| D
     H --> D
-    Auth1 --> D
+    Auth1 --> B
     
     D -->|Yes & dnssecOk| J["authenticated = true<br/>Log: authenticated MX using DNSSEC"]
     D -->|No or !dnssecOk| K{CommonDomain enabled?}
@@ -969,7 +972,7 @@ CGO_ENABLED=0 go test -v -count=1 \
 | Test | Purpose | Expected Output |
 |------|---------|-----------------|
 | `TestRemoteDelivery_AuthMX_Fail` | MX auth failure | 550 / 5.7.0 — `"Failed to estabilish the MX record (...) authenticity"` |
-| `TestRemoteDelivery_TLSErrFallback` | TLS error with fallback | `"TLS error, falling back to plaintext"` with `domain`, `mx`, `reason` fields |
+| `TestRemoteDelivery_TLSErrFallback` | TLS error with fallback | `"TLS error, falling back to plaintext"` with `msg_id`, `domain`, `mx`, `reason` fields |
 | `TestRemoteDelivery_RequireTLS` | RequireTLS with no TLS support | 550 / 5.7.1 — `"TLS is required but unsupported or failed"` |
 | `TestRemoteDelivery_AuthMX_DNSSEC` | DNSSEC-based MX auth | `"authenticated MX using DNSSEC"` (debug) |
 | `TestRemoteDelivery_AuthMX_CommonDomain` | Common domain MX auth | `"authenticated MX using common domain rule"` (debug) |
@@ -1017,4 +1020,4 @@ CGO_ENABLED=0 go test -v -count=1 \
 
 ### What is the exact log message for TLS fallback?
 
-> `"TLS error, falling back to plaintext"` with JSON fields: `domain`, `mx`, `reason` — Source: `connect.go` lines 176–177.
+> `"TLS error, falling back to plaintext"` with JSON fields: `msg_id`, `domain`, `mx`, `reason` — Source: `connect.go` lines 176–177; `msg_id` from DeliveryLogger at `remote.go` line 190.
