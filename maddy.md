@@ -162,7 +162,7 @@ The logger is created with name `"smtp"` in tests (Source: `internal/endpoint/sm
 
 | Context | Format | Generation | Source |
 |---------|--------|------------|--------|
-| **Production** | 8-character hex string | First 4 bytes of a UUID via `google/uuid`, hex-encoded. Called via `msgpipeline.GenerateMsgID()` | smtp.go line 112 |
+| **Production** | 8-character hex string | 4 random bytes via `crypto/rand.Read()`, hex-encoded. Called via `msgpipeline.GenerateMsgID()` | `msgpipeline/msgid.go` lines 12–15; called from smtp.go line 112 |
 | **Tests** | 40-character hex string | Full SHA-1 hash of `t.Name()`, hex-encoded | `testutils/target.go` lines 239–240 |
 
 Test implementation:
@@ -476,6 +476,7 @@ delay = initialRetryTime × retryTimeScale ^ (TriesCount - 1)
 | `meta-data update` | `dl.Error(...)` | Error | queue.go:410 | `msg_id`, `reason` |
 | `failed to generate fail DSN` | `dl.Error(...)` | Error | queue.go:903 | `msg_id`, `reason` |
 | `failed to enqueue DSN` | `dl.Error(...)` | Error | queue.go:923,929 | `msg_id`, `dsn_id`, `reason` |
+| `delivery.Abort failed` | `dl.Error(...)` | Error | queue.go:479–480 | `msg_id`, `reason` |
 
 ---
 
@@ -631,6 +632,7 @@ When `requireTLS` is `true` (set by local policy via `rd.rt.requireTLS`, or by M
 | `authenticated MX using MTA-STS` | `rd.Log.DebugMsg(...)` | `mx` | MTA-STS policy exists and `stsPolicy.Match(mx)` returns true | connect.go:60 |
 | `TLS required by MTA-STS` | `rd.Log.DebugMsg(...)` | `domain`, `mx` | MTA-STS enforce mode active | connect.go:57 |
 | `TLS required by local policy` | `rd.Log.DebugMsg(...)` | `domain`, `mx` | `rd.rt.requireTLS == true` | connect.go:89 |
+| `Policy fetch error, ignoring` | `rd.Log.DebugMsg(...)` | `mx`, `domain`, `err` | MTA-STS policy fetch error in non-enforce mode | connect.go:71 |
 | `skipping MX not matching MTA-STS` | `rd.Log.Msg(...)` ⚠️ | `domain`, `mx` | MTA-STS enforce mode and MX doesn't match policy | connect.go:63 |
 
 > **Note:** `skipping MX not matching MTA-STS` uses `Msg()` not `DebugMsg()` — it is **always** logged regardless of debug settings.
