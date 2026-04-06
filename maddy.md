@@ -118,7 +118,7 @@ The RSA-2048 raw byte count of 270 arises from the PKCS#1 DER encoding: the 2048
 
 ## 3. Sample Message
 
-The following sample email was constructed for the fields-to-sign analysis. It contains exactly **3 `From` headers**, exactly **3 `List-Id` headers**, **no other headers**, and a single non-empty body line. The header object was built using the `github.com/emersion/go-message/textproto` library (`go.mod:17`: version `v0.10.9-0.20191116124005-65fd0119e899`), the same library used by the DKIM signing module (`internal/modify/dkim/dkim.go:14`).
+The following sample email was constructed for the fields-to-sign analysis. It contains exactly **3 `From` headers**, exactly **3 `List-Id` headers**, **no other headers**, and a single non-empty body line. The header object was built using the `github.com/emersion/go-message/textproto` library (`go.mod:16`: version `v0.10.9-0.20191116124005-65fd0119e899`), the same library used by the DKIM signing module (`internal/modify/dkim/dkim.go:14`).
 
 ```
 From: alice@example.com
@@ -333,4 +333,4 @@ All source files consulted during this investigation, with their purpose and key
 | `internal/endpoint/smtp/submission.go` | Message-ID generation via UUIDv4, submission preparation pipeline | Lines 16–22 (msgIDField), 27–37 (submissionPrepare Message-ID insertion) |
 | `cmd/maddy/main.go` | Binary build entrypoint — minimal launcher calling `maddy.Run()` | Lines 1–11 (entire file) |
 | `maddy.go` | Server bootstrap, `Version` variable, `BuildInfo()` function, `Run()` entry point | Line 41 (Version), 89–97 (BuildInfo), 102–164 (Run), 125–127 (version print) |
-| `go.mod` | Go module identity (`github.com/foxcpp/maddy`), minimum Go version (`go 1.13`), dependency versions | Line 3 (go 1.13), 17 (go-message), 18 (go-msgauth), 23 (google/uuid v1.1.1), 30 (x/crypto) |
+| `go.mod` | Go module identity (`github.com/foxcpp/maddy`), minimum Go version (`go 1.13`), dependency versions | Line 3 (go 1.13), 16 (go-message), 17 (go-msgauth), 23 (google/uuid v1.1.1), 30 (x/crypto) |
