@@ -313,10 +313,14 @@ TCP connections occur during `AddRcpt()`. When `deliver()` iterates each recipie
    - d. If connect error → `continue` to next MX host (line 188)
    - e. If auth error → `conn.Close()`, `continue` (lines 192–195)
    - f. If success → `break` (line 198)
-8. **All MX exhausted**: If still not connected, return "No usable MXs" error (lines 202–214) with SMTP code 451 or 550
+8. **All MX exhausted**: If still not connected, return "No usable MXs" error (lines 202–214). The error's SMTP code is determined by `exterrors.SMTPCode(err, 451, 550)`, where `err` refers to the `lookupMX()` return value (which is `nil` at this point — Go's `:=` inside the `for` loop body creates a new `err` variable scoped to the loop, leaving the outer `err` from `lookupMX` unchanged). Since `IsTemporary(nil)` returns `false`, the code is always **550** (permanent). The wrapping error's `Err` field stores `lastErr` (the actual TCP timeout error with Code 450), but the outer Code 550 takes precedence for temporality classification.
 9. **MAIL FROM**: `conn.Mail(ctx, rd.mailFrom, rd.msgMeta.SMTPOpts)` sends the MAIL FROM command (line 218)
 
-**Key implication for non-responsive destinations**: Each MX host connection attempt within `connectionForDomain()` (called from `AddRcpt()`) blocks for the full TCP timeout duration (~127 seconds on Linux). If a domain has 3 MX hosts and all are unreachable, the total time for one `AddRcpt()` call is approximately **381 seconds (~6.3 minutes)**. Because the TCP timeout error is classified as temporary by `wrapClientErr()` (SMTP 450/4.4.2), and `exterrors.IsTemporaryOrUnspec()` returns true for this error, the recipient is placed in `perr.TemporaryFailed` at `deliver()` line 463 — meaning the message **WILL be retried**.
+**Key implication for non-responsive destinations**: Each MX host connection attempt within `connectionForDomain()` (called from `AddRcpt()`) blocks for the full TCP timeout duration (~127 seconds on Linux). If a domain has 3 MX hosts and all are unreachable, the total time for one `AddRcpt()` call is approximately **381 seconds (~6.3 minutes)**.
+
+> **Critical: "No usable MXs" wrapping makes TCP timeouts permanent.** Although `wrapClientErr()` classifies a raw TCP timeout as temporary (SMTP 450/4.4.2), the `connectionForDomain()` function wraps the error in a "No usable MXs" `SMTPError` with Code **550** (permanent) when all MX hosts fail — due to a variable scoping issue where `SMTPCode(err, 451, 550)` at `connect.go` line 204 uses the `nil` `err` from `lookupMX()` rather than `lastErr`. Since `errors.As()` in `IsTemporaryOrUnspec()` finds the outer `SMTPError{Code:550}` first (which returns `Temporary() = false`), the recipient is placed in `perr.Failed` (not `perr.TemporaryFailed`) at `deliver()` lines 462–464. This means the message receives a **permanent failure** on the first attempt and no retry occurs — `emitDSN()` is called and the message is removed from disk.
+>
+> **When retries DO occur**: Temporary SMTP errors from a **successful TCP connection** — such as a 4xx response to MAIL FROM, RCPT TO, or DATA commands — flow through `wrapClientErr()` as `*smtp.SMTPError` (preserving the 4xx code) and ARE classified as temporary by `IsTemporaryOrUnspec()`. The retry timing tables in Section 2.5 apply to these scenarios. Additionally, if `Target.Start()` or `Body()` fails with a temporary error on the `remote.Target`, the same retry logic applies.
 
 ### 2.3 TCP Timeout Duration Analysis
 
@@ -398,9 +402,11 @@ flowchart TD
    - `EnhancedCode: {4, 4, 2}` ("Network I/O error")
    - `Message: "Network I/O error"`
    - `Misc: {"remote_addr": err.Addr, "io_op": err.Op}`
-4. `exterrors.SMTPError.Temporary()` (`smtp.go` lines 95–97): `450/100 == 4` → **true**
-5. `exterrors.IsTemporaryOrUnspec()` (`temporary.go` lines 15–21): finds `Temporary()` method via `errors.As()`, calls it → **true**
-6. **Result**: TCP timeouts are classified as **temporary errors** → message **WILL be retried**
+4. `exterrors.SMTPError.Temporary()` (`smtp.go` lines 95–97): `450/100 == 4` → **true** at this layer
+5. **However**: If ALL MX hosts fail, `connectionForDomain()` wraps this error in a "No usable MXs" `exterrors.SMTPError` with `Code: exterrors.SMTPCode(err, 451, 550)`. The `err` variable here is the `nil` return from `lookupMX()` (not the TCP timeout `lastErr`), so `SMTPCode(nil, 451, 550)` returns **550** (permanent). The wrapping error's `Err` field contains the inner 450 error, but `errors.As()` in `IsTemporaryOrUnspec()` finds the **outer** `SMTPError{Code:550}` first.
+6. `exterrors.IsTemporaryOrUnspec()` (`temporary.go` lines 15–21): finds the outer `SMTPError.Temporary()` method → `550/100 == 5` → **false**
+7. **Result for all-MX-fail TCP timeouts**: Classified as **permanent errors** → message receives immediate permanent failure, no retry
+8. **Result for 4xx SMTP responses** (e.g., "450 Try again later" from a connected server): The error flows through `wrapClientErr()` as `*smtp.SMTPError` with the original 4xx code preserved → `IsTemporaryOrUnspec()` returns **true** → message **WILL be retried**
 
 **The `toSMTPErr()` conversion** (`queue.go` lines 325–363):
 
@@ -410,13 +416,17 @@ When `tryDelivery()` records errors into `QueueMetadata.RcptErrs` (line 385), it
 - If `IsTemporaryOrUnspec(err)` is true: `Code: 451`, `EnhancedCode: {4, 0, 0}` (temporary)
 - Then overrides from `exterrors.Fields(err)` if `smtp_code`, `smtp_enchcode`, `smtp_msg` fields exist
 
-For a TCP timeout, the `exterrors.Fields()` call walks the error chain (`fields.go` lines 28–52) and extracts: `smtp_code: 450`, `smtp_enchcode: {4,4,2}`, `smtp_msg: "Network I/O error"`, `remote_addr`, `io_op`, `reason`. These override the defaults, so the stored error retains the specific 450/4.4.2 codes.
+For a TCP timeout that results in the "No usable MXs" wrapping error, `exterrors.Fields()` walks the entire error chain (`fields.go` lines 28–52). The outer error contributes: `smtp_code: 550`, `smtp_enchcode: {5,4,0}`, `smtp_msg: "No usable MXs, last err: ..."`, `domain`, `target: "remote"`. The inner error (from `wrapClientErr()`) contributes: `smtp_code: 450`, `smtp_enchcode: {4,4,2}`, `smtp_msg: "Network I/O error"`, `remote_addr`, `io_op`. Because `Fields()` gives **outer** error fields precedence (inner fields are skipped if the key already exists — `fields.go` line 43), the stored error retains the outer 550 code. However, `remote_addr` and `io_op` from the inner error survive because those keys don't exist on the outer error.
+
+For a 4xx SMTP response (successful connection, server returns temporary error), the error flows directly without the "No usable MXs" wrapping, so `Fields()` extracts the original 4xx code and enhanced code.
 
 **The `IsTemporaryOrUnspec()` default-to-temporary behavior** (`temporary.go` lines 15–21):
 
 A critical design choice: if an error does **not** implement the `TemporaryErr` interface (no `Temporary()` method), `IsTemporaryOrUnspec()` returns **true** — assuming errors are temporary by default. This means unknown/unclassified errors will trigger retries rather than permanent failures. As stated in the package comment: "errors are assumed to be temporary by default" (`queue.go` line 24).
 
 ### 2.5 Retry Timing Table (for max_tries = 2, 3, 8)
+
+> **Important**: These retry timing tables apply **only** when delivery failures are classified as **temporary** (e.g., 4xx SMTP responses from a reachable server). TCP timeouts where all MX hosts are unreachable result in **permanent** failure on the first attempt with no retry (see Section 2.4). The `"will retry"` log message and subsequent attempts shown below occur only for temporary failures.
 
 All timing calculations use the formula: `delay = 15min × 2^(TriesCount - 1)` where `TriesCount` is the value **after** the increment at line 407.
 
@@ -425,46 +435,46 @@ All timing calculations use the formula: `delay = 15min × 2^(TriesCount - 1)` w
 | Attempt | TriesCount at Entry | Deliver? | TriesCount After | Delay to Next Retry | Cumulative Wall Time |
 |---------|---------------------|----------|------------------|---------------------|----------------------|
 | 1 | 0 | ✅ Yes | 1 | 15min (`15×2^0`) | t=0 |
-| 2 | 1 | ✅ Yes | 2 | 30min (`15×2^1`) | ~15min + TCP timeout |
-| 3 | 2 (== maxTries) | ✅ Yes | — (exhausted) | N/A → DSN | ~45min + TCP timeouts |
+| 2 | 1 | ✅ Yes | 2 | 30min (`15×2^1`) | ~15min |
+| 3 | 2 (== maxTries) | ✅ Yes | — (exhausted) | N/A → silent drop | ~45min |
 
-**Total time span**: ~45 minutes + (TCP timeout × MX hosts × 3 attempts)
-With 1 MX host at ~127s timeout: ~45min + ~6.4min ≈ **~51 minutes**
+**Total time span**: ~45 minutes (plus delivery attempt duration per attempt, typically negligible for 4xx SMTP responses)
+
+> **Note on exhaustion**: When `TriesCount == maxTries` and all failures were temporary, the message is silently removed from disk without a DSN bounce due to the `TemporaryFailedRcpts` bug (see Section 3.4, Scenario 3).
 
 #### max_tries = 3 (4 actual delivery attempts)
 
 | Attempt | TriesCount at Entry | Deliver? | TriesCount After | Delay to Next Retry | Cumulative Wall Time |
 |---------|---------------------|----------|------------------|---------------------|----------------------|
 | 1 | 0 | ✅ Yes | 1 | 15min (`15×2^0`) | t=0 |
-| 2 | 1 | ✅ Yes | 2 | 30min (`15×2^1`) | ~15min + TCP timeout |
-| 3 | 2 | ✅ Yes | 3 | 1h (`15×2^2`) | ~45min + TCP timeouts |
-| 4 | 3 (== maxTries) | ✅ Yes | — (exhausted) | N/A → DSN | ~1h45min + TCP timeouts |
+| 2 | 1 | ✅ Yes | 2 | 30min (`15×2^1`) | ~15min |
+| 3 | 2 | ✅ Yes | 3 | 1h (`15×2^2`) | ~45min |
+| 4 | 3 (== maxTries) | ✅ Yes | — (exhausted) | N/A → silent drop | ~1h45min |
 
-**Total time span**: ~1 hour 45 minutes + (TCP timeout × MX hosts × 4 attempts)
-With 1 MX host at ~127s timeout: ~1h45min + ~8.5min ≈ **~1 hour 54 minutes**
+**Total time span**: ~1 hour 45 minutes (plus delivery attempt duration per attempt)
 
 ```mermaid
 gantt
-    title Retry Timeline for max_tries=3 (Single MX, Unreachable Host)
+    title Retry Timeline for max_tries=3 (Temporary 4xx Failure)
     dateFormat HH:mm
     axisFormat %H:%M
 
     section Attempt 1
-    TCP Timeout (~2min)       :a1, 00:00, 2m
+    Delivery Attempt          :a1, 00:00, 1m
     section Wait 1
     Backoff 15min             :w1, after a1, 15m
     section Attempt 2
-    TCP Timeout (~2min)       :a2, after w1, 2m
+    Delivery Attempt          :a2, after w1, 1m
     section Wait 2
     Backoff 30min             :w2, after a2, 30m
     section Attempt 3
-    TCP Timeout (~2min)       :a3, after w2, 2m
+    Delivery Attempt          :a3, after w2, 1m
     section Wait 3
     Backoff 1h                :w3, after a3, 60m
     section Attempt 4
-    TCP Timeout (~2min)       :a4, after w3, 2m
+    Delivery Attempt          :a4, after w3, 1m
     section Exhausted
-    DSN Generated             :milestone, after a4, 0m
+    Silent Drop               :milestone, after a4, 0m
 ```
 
 #### max_tries = 8 (default — 9 actual delivery attempts)
@@ -479,11 +489,11 @@ gantt
 | 6 | 5 | ✅ Yes | 6 | 8h (`15×2^5`) | ~7h 45min |
 | 7 | 6 | ✅ Yes | 7 | 16h (`15×2^6`) | ~15h 45min |
 | 8 | 7 | ✅ Yes | 8 | 32h (`15×2^7`) | ~31h 45min |
-| 9 | 8 (== maxTries) | ✅ Yes | — (exhausted) | N/A → DSN | ~63h 45min |
+| 9 | 8 (== maxTries) | ✅ Yes | — (exhausted) | N/A → silent drop | ~63h 45min |
 
-**Total time span**: ~63 hours 45 minutes (~2.66 days) + TCP timeout overhead per attempt
+**Total time span**: ~63 hours 45 minutes (~2.66 days) plus delivery attempt durations
 
-> **Note**: Cumulative wall times above **exclude** TCP timeout durations. Each attempt to an unreachable single-MX host adds ~2min 7s. For 9 attempts, that's an additional ~19 minutes. For a 3-MX domain, it's ~57 minutes.
+> **Note**: Cumulative wall times above represent the scheduling delays only. Each delivery attempt adds a variable amount of time depending on the failure type: 4xx SMTP responses typically complete in milliseconds; slow server responses may take longer. These tables do NOT apply to TCP timeouts where all MX hosts are unreachable, which cause **permanent** failure on the first attempt (see Section 2.4). When retries are exhausted with only temporary failures, the message is silently dropped without a DSN (see Section 3.4, Scenario 3).
 
 #### Post-Init Delay Behavior
 
@@ -506,10 +516,10 @@ if meta.TriesCount == q.maxTries || len(partialErr.TemporaryFailed) == 0 {
 ```
 
 Two conditions trigger delivery completion:
-1. **`meta.TriesCount == q.maxTries`**: Retry budget exhausted — all remaining temporarily-failed recipients are treated as permanently failed (lines 392–395)
-2. **`len(partialErr.TemporaryFailed) == 0`**: No temporary failures — either all recipients succeeded or all permanently failed
+1. **`meta.TriesCount == q.maxTries`**: Retry budget exhausted. Lines 391–394 iterate `meta.TemporaryFailedRcpts` to log `"not delivered, temporary error"`, but this field is **never assigned** in the codebase (see Section 3.4, Scenario 3 note), so this loop never executes. Lines 395–397 iterate `meta.FailedRcpts` to log `"not delivered, permanent error"`.
+2. **`len(partialErr.TemporaryFailed) == 0`**: No temporary failures on this attempt — either all recipients succeeded or all permanently failed on this attempt.
 
-When delivery is complete, `emitDSN()` is called if there are any failed recipients (`line 400–401`), then `removeFromDisk()` deletes all queue files for this message (`line 403`).
+When delivery is complete, `emitDSN()` is called at line 399 if `len(meta.FailedRcpts)+len(meta.TemporaryFailedRcpts) != 0`. **For permanent failures** (condition 2 with `perr.Failed` populated), `meta.FailedRcpts` IS populated and a DSN IS generated. **For retry exhaustion with only temporary failures** (condition 1), both `meta.FailedRcpts` and `meta.TemporaryFailedRcpts` are empty (temporary failures only populate `meta.To`, not `meta.FailedRcpts`), so **no DSN is generated** and the message is silently removed from disk. Then `removeFromDisk()` deletes all queue files for this message (line 401).
 
 ---
 
@@ -575,8 +585,10 @@ Debug message (only when `debug true` is set):
 
 Error message (always emitted):
 ```text
-2024-01-15T10:32:12.456Z queue: delivery attempt failed	{"io_op":"dial","msg_id":"abc123-def456","rcpt":"user@unreachable.example","reason":"dial tcp 192.0.2.1:25: i/o timeout","remote_addr":"192.0.2.1:25","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error"}
+2024-01-15T10:32:12.456Z queue: delivery attempt failed	{"io_op":"dial","msg_id":"abc123-def456","rcpt":"user@unreachable.example","reason":"dial tcp 192.0.2.1:25: i/o timeout","remote_addr":"192.0.2.1:25","smtp_code":550,"smtp_enchcode":"5.0.0","smtp_msg":"No usable MXs for unreachable.example","target":"remote"}
 ```
+
+> **Note on error fields**: The fields above reflect the merged result of `exterrors.Fields()` walking the full error chain for a TCP timeout when all MX hosts are unreachable: `smtp_code`, `smtp_enchcode`, `smtp_msg`, and `target` come from the outer "No usable MXs" `SMTPError` (Code 550), while `io_op` and `remote_addr` come from the inner `wrapClientErr()` error. The outer fields take precedence for duplicate keys. For a 4xx SMTP response from a reachable server, the fields would instead show the server's SMTP code (e.g., `"smtp_code":451`) without the `"target"` field.
 
 ### 3.2 Log Entries Per Retry Attempt (fields, timestamps, errors)
 
@@ -640,15 +652,18 @@ When `Logger.Error()` is called (`log.go` lines 89–104), it:
 2. Adds `reason` field from `err.Error()` unless a `reason` field already exists in the error chain.
 3. Merges any additional key-value pairs passed as arguments.
 
-For a TCP timeout flowing through `wrapClientErr()`, the error log includes these fields:
-- `smtp_code`: `450`
-- `smtp_enchcode`: `"4.4.2"` (formatted via `EnhancedCode.FormatLog()`)
-- `smtp_msg`: `"Network I/O error"`
-- `remote_addr`: the target address (e.g., `"192.0.2.1:25"`)
-- `io_op`: the I/O operation (e.g., `"dial"`)
-- `reason`: the error text (e.g., `"dial tcp 192.0.2.1:25: i/o timeout"`)
+For a TCP timeout when all MX hosts are unreachable, `connectionForDomain()` wraps the inner `wrapClientErr()` error in an outer "No usable MXs" `SMTPError`. Since `Fields()` gives outer error fields precedence (see Section 2.4), the **merged** error log fields are:
+- `smtp_code`: `550` — from outer "No usable MXs" `SMTPError` (overrides inner `450`)
+- `smtp_enchcode`: `"5.0.0"` — from outer error (overrides inner `"4.4.2"`)
+- `smtp_msg`: `"No usable MXs for unreachable.example"` — from outer error
+- `target`: `"remote"` — from outer error
+- `remote_addr`: the target address (e.g., `"192.0.2.1:25"`) — from inner `wrapClientErr()` (unique key, survives merge)
+- `io_op`: the I/O operation (e.g., `"dial"`) — from inner `wrapClientErr()` (unique key, survives merge)
+- `reason`: the error text (e.g., `"No usable MXs for unreachable.example"`) — from `err.Error()` on the outer error
 - `msg_id`: injected by `DeliveryLogger`
 - `rcpt`: the recipient address (injected by the `dl.Error()` call at line 384)
+
+> For a **4xx SMTP response** from a reachable server (e.g., `451 Try again later`), the fields would instead show the server's SMTP code directly from `wrapClientErr()` (e.g., `smtp_code: 451`) without the outer "No usable MXs" wrapping, since `connectionForDomain()` returns successfully when at least one MX host connects.
 
 ### 3.3 Debug vs Standard Log Levels
 
@@ -687,9 +702,9 @@ The maddy logging system has two log levels:
 2024-01-15T10:30:01.803Z [debug] queue: removed message from disk	{"msg_id":"abc123-def456"}
 ```
 
-#### Scenario 2: TCP Timeout with Retry (max_tries=3, Attempt 1 of 4)
+#### Scenario 2: TCP Timeout — All MX Hosts Unreachable (Permanent Failure)
 
-For `remote.Target`, TCP connections are established during `AddRcpt()` — not during `Target.Start()`. When `AddRcpt()` calls `connectionForDomain()` (`remote.go` line 230) and the destination is unreachable, the TCP timeout error propagates back through the `deliver()` function's per-recipient error handling path.
+For `remote.Target`, TCP connections are established during `AddRcpt()` — not during `Target.Start()`. When `AddRcpt()` calls `connectionForDomain()` (`connect.go` lines 113–214) and **all** MX hosts time out, `connectionForDomain()` wraps the error as a "No usable MXs" `SMTPError` with Code 550 (permanent). Despite the inner TCP timeout being wrapped as Code 450 by `wrapClientErr()`, the outer Code 550 takes precedence in error classification (see Section 2.4), causing the failure to be treated as **permanent** by `IsTemporaryOrUnspec()`. The message is **not retried** — a DSN is generated and the message is removed on the first attempt.
 
 ```text
 2024-01-15T10:30:00.100Z [debug] queue: starting delivery for abc123-def456
@@ -700,42 +715,53 @@ For `remote.Target`, TCP connections are established during `AddRcpt()` — not 
 2024-01-15T10:30:00.104Z [debug] queue: target.Start OK	{"msg_id":"abc123-def456"}
 2024-01-15T10:32:07.400Z [debug] queue: delivery.AddRcpt user@unreachable.example failed: dial tcp 192.0.2.1:25: i/o timeout	{"msg_id":"abc123-def456"}
 2024-01-15T10:32:07.401Z [debug] queue: delivery.Abort (no accepted receipients)	{"msg_id":"abc123-def456"}
-2024-01-15T10:32:07.500Z [debug] queue: failures: permanently: [], temporary: [user@unreachable.example], errors: map[user@unreachable.example:dial tcp 192.0.2.1:25: i/o timeout]	{"msg_id":"abc123-def456"}
-2024-01-15T10:32:07.501Z queue: delivery attempt failed	{"io_op":"dial","msg_id":"abc123-def456","rcpt":"user@unreachable.example","reason":"dial tcp 192.0.2.1:25: i/o timeout","remote_addr":"192.0.2.1:25","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error"}
-2024-01-15T10:32:07.502Z queue: will retry	{"attempts_count":1,"msg_id":"abc123-def456","next_try_delay":"15m0s","rcpts":["user@unreachable.example"]}
+2024-01-15T10:32:07.500Z [debug] queue: failures: permanently: [user@unreachable.example], temporary: [], errors: map[user@unreachable.example:dial tcp 192.0.2.1:25: i/o timeout]	{"msg_id":"abc123-def456"}
+2024-01-15T10:32:07.501Z queue: delivery attempt failed	{"io_op":"dial","msg_id":"abc123-def456","rcpt":"user@unreachable.example","reason":"dial tcp 192.0.2.1:25: i/o timeout","remote_addr":"192.0.2.1:25","smtp_code":550,"smtp_enchcode":"5.0.0","smtp_msg":"No usable MXs for unreachable.example","target":"remote"}
+2024-01-15T10:32:07.502Z queue: not delivered, permanent error	{"msg_id":"abc123-def456","rcpt":"user@unreachable.example"}
+2024-01-15T10:32:07.600Z [debug] queue: removed message from disk	{"msg_id":"abc123-def456"}
 ```
 
 > **Note**: The ~2-minute gap between the delivery attempt start (10:30:00) and the failure log (10:32:07) corresponds to the TCP timeout duration (~127 seconds with default `tcp_syn_retries=6`).
 
-> **Why TCP timeouts ARE retried for `remote.Target`**: The key is that `remote.Target.Start()` (`remote.go` lines 185–193) **always returns nil** — it creates an empty `remoteDelivery` struct without making any TCP connections. The `target.Start OK` debug log (emitted at `queue.go` line 456) always appears for `remote.Target`. TCP connections only occur later when `deliver()` calls `delivery.AddRcpt()` (line 461), which triggers `connectionForDomain()` in the remote module. When `AddRcpt()` fails with a TCP timeout, `deliver()` evaluates the error at lines 462–463:
->
-> ```go
-> if exterrors.IsTemporaryOrUnspec(err) {
->     perr.TemporaryFailed = append(perr.TemporaryFailed, rcpt)
-> ```
->
-> Since the TCP timeout is wrapped by `wrapClientErr()` as a 450/4.4.2 `exterrors.SMTPError` (which implements `Temporary()` returning true), `IsTemporaryOrUnspec()` returns true, and the recipient goes into `perr.TemporaryFailed`. Back in `tryDelivery()`, `meta.To = partialErr.TemporaryFailed` (line 387) sets the retry recipient list to `[user@unreachable.example]`, and `len(partialErr.TemporaryFailed) == 0` (line 390) is false, so the exhaustion branch is NOT taken. The message is scheduled for retry with exponential backoff.
+> **Why TCP timeouts cause permanent failure when all MX hosts are unreachable**: `remote.Target.Start()` (`remote.go` lines 185–193) **always returns nil**, so the `target.Start OK` debug log always appears. TCP connections only occur during `AddRcpt()` → `connectionForDomain()`. When **all** MX hosts time out, `connectionForDomain()` wraps the error at `connect.go` line 204 using `SMTPCode(err, 451, 550)`, where `err` is the return value from `lookupMX()` — which is `nil` for a successful DNS lookup, **not** the TCP timeout error stored in the separate `lastErr` variable. Since `IsTemporary(nil)` returns `false`, `SMTPCode()` returns **550** (permanent). The outer `SMTPError{Code:550}` wraps the inner `SMTPError{Code:450}` from `wrapClientErr()`, but `errors.As()` in `IsTemporaryOrUnspec()` finds the outer 550 first and returns `false`. In `deliver()` (line 464), the recipient goes to `perr.Failed`. Back in `tryDelivery()`, `meta.FailedRcpts` is populated (line 381), `meta.To = partialErr.TemporaryFailed` is empty (line 387), and `len(partialErr.TemporaryFailed) == 0` triggers the completion branch (line 390): the `"not delivered, permanent error"` log is emitted (line 396), `emitDSN()` generates a bounce (line 399), and the message is removed (line 401). **No retry is scheduled.**
 
-> **Contrast with generic `Target.Start()` failures**: If a different `DeliveryTarget` implementation returned an error from `Start()`, `deliver()` would place all recipients in `perr.Failed` (lines 448–454), NOT `perr.TemporaryFailed`. In that case, `len(partialErr.TemporaryFailed) == 0` would be true at line 390, triggering completion and DSN generation without retry. This distinction matters: the retry behavior depends on WHERE in the `deliver()` function the failure occurs — `Start()` failures go to `Failed` (permanent), while `AddRcpt()` failures are classified by `IsTemporaryOrUnspec()` and can go to `TemporaryFailed` (retried).
+> **Contrast with 4xx SMTP responses (which DO trigger retries)**: When a remote server **is reachable** but responds with a 4xx status code (e.g., `451 Try again later`), `wrapClientErr()` wraps it preserving the server's code (e.g., 451). Crucially, this error does **not** pass through `connectionForDomain()`'s "No usable MXs" wrapping because the TCP connection succeeded. `IsTemporaryOrUnspec()` finds `SMTPError{Code:451}` → `Temporary()` returns `true` (451/100 == 4) → the recipient goes to `perr.TemporaryFailed` → retry is scheduled with exponential backoff. See Scenario 3 below.
 
-#### Scenario 3: Max Retries Exhausted (Final Attempt)
+> **Contrast with `Target.Start()` failures**: If a `DeliveryTarget` implementation returned an error from `Start()`, `deliver()` would place **all** recipients in `perr.Failed` (lines 448–454), regardless of the error's temporary/permanent classification. In that case, all recipients are treated as permanently failed. This distinction matters: the retry behavior depends on WHERE in `deliver()` the failure occurs — `Start()` failures always go to `Failed`, while `AddRcpt()` failures are classified by `IsTemporaryOrUnspec()`.
 
-Assuming `max_tries=2` and this is the 3rd attempt (TriesCount=2 at entry, which equals maxTries):
+#### Scenario 3: Temporary SMTP Failure with Retry and Exhaustion (max_tries=2)
+
+When a remote server **is reachable** but responds with a 4xx status code, the error is classified as temporary and the message is retried. This scenario shows a `451` response that is retried until `max_tries` is exhausted. With `max_tries=2`, there are 3 total delivery attempts (TriesCount goes 0 → 1 → 2, with the completion check `TriesCount == maxTries` triggering on the third attempt).
+
+**Attempt 1** (TriesCount=0 at entry):
 
 ```text
-2024-01-15T11:00:00.100Z [debug] queue: starting delivery for abc123-def456
-2024-01-15T11:00:00.101Z [debug] queue: delivery semaphore acquired for abc123-def456
-2024-01-15T11:00:00.102Z [debug] queue: delivery attempt #3	{"msg_id":"abc123-def456"}
-2024-01-15T11:00:00.103Z [debug] queue: using message ID = abc123-def456-3	{"msg_id":"abc123-def456"}
-2024-01-15T11:00:00.104Z [debug] queue: target.Start OK	{"msg_id":"abc123-def456"}
-2024-01-15T11:02:07.500Z [debug] queue: delivery.AddRcpt user@unreachable.example failed: dial tcp 192.0.2.1:25: i/o timeout	{"msg_id":"abc123-def456"}
-2024-01-15T11:02:07.501Z [debug] queue: delivery.Abort (no accepted receipients)	{"msg_id":"abc123-def456"}
-2024-01-15T11:02:07.502Z [debug] queue: failures: permanently: [], temporary: [user@unreachable.example], errors: map[...]	{"msg_id":"abc123-def456"}
-2024-01-15T11:02:07.503Z queue: delivery attempt failed	{"msg_id":"abc123-def456","rcpt":"user@unreachable.example","reason":"dial tcp 192.0.2.1:25: i/o timeout","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error"}
-2024-01-15T11:02:07.600Z [debug] queue: removed message from disk	{"msg_id":"abc123-def456"}
+2024-01-15T10:30:00.100Z [debug] queue: delivery attempt #1	{"msg_id":"abc123-def456"}
+2024-01-15T10:30:00.101Z [debug] queue: using message ID = abc123-def456-1	{"msg_id":"abc123-def456"}
+2024-01-15T10:30:00.102Z [debug] queue: target.Start OK	{"msg_id":"abc123-def456"}
+2024-01-15T10:30:00.200Z [debug] queue: delivery.AddRcpt user@slow.example failed: 451 4.7.1 Try again later	{"msg_id":"abc123-def456"}
+2024-01-15T10:30:00.201Z [debug] queue: delivery.Abort (no accepted receipients)	{"msg_id":"abc123-def456"}
+2024-01-15T10:30:00.300Z [debug] queue: failures: permanently: [], temporary: [user@slow.example], errors: map[user@slow.example:451 4.7.1 Try again later]	{"msg_id":"abc123-def456"}
+2024-01-15T10:30:00.301Z queue: delivery attempt failed	{"msg_id":"abc123-def456","rcpt":"user@slow.example","reason":"451 4.7.1 Try again later","remote_server":"mx1.slow.example","smtp_code":451,"smtp_enchcode":"4.7.1","smtp_msg":"Try again later"}
+2024-01-15T10:30:00.302Z queue: will retry	{"attempts_count":1,"msg_id":"abc123-def456","next_try_delay":"15m0s","rcpts":["user@slow.example"]}
 ```
 
-> **Note on `TemporaryFailedRcpts` field**: The `QueueMetadata.TemporaryFailedRcpts` field is declared at `queue.go` line 160 but is **never assigned** anywhere in the queue codebase (confirmed by searching all references). The loop at lines 393–395 (`for _, rcpt := range meta.TemporaryFailedRcpts`) never executes because the field remains nil throughout the message lifecycle. Consequently, when max retries are exhausted and all failures were temporary (the TCP timeout case), the `"not delivered, temporary error"` log message does **not** appear, and the `"not delivered, permanent error"` log also does not appear (because `meta.FailedRcpts` is empty — temporary failures never populate it). The DSN generation condition at line 400 (`len(meta.FailedRcpts)+len(meta.TemporaryFailedRcpts) != 0`) evaluates to false, so **no DSN is generated**. The message is silently removed from disk. This appears to be an incomplete implementation in the source code where `TemporaryFailedRcpts` was intended to track recipients that exhausted retries while in temporary-failure state but was never wired up.
+**Attempt 3 — final** (TriesCount=2 at entry, equals maxTries):
+
+```text
+2024-01-15T11:00:00.100Z [debug] queue: delivery attempt #3	{"msg_id":"abc123-def456"}
+2024-01-15T11:00:00.101Z [debug] queue: using message ID = abc123-def456-3	{"msg_id":"abc123-def456"}
+2024-01-15T11:00:00.102Z [debug] queue: target.Start OK	{"msg_id":"abc123-def456"}
+2024-01-15T11:00:00.200Z [debug] queue: delivery.AddRcpt user@slow.example failed: 451 4.7.1 Try again later	{"msg_id":"abc123-def456"}
+2024-01-15T11:00:00.201Z [debug] queue: delivery.Abort (no accepted receipients)	{"msg_id":"abc123-def456"}
+2024-01-15T11:00:00.300Z [debug] queue: failures: permanently: [], temporary: [user@slow.example], errors: map[user@slow.example:451 4.7.1 Try again later]	{"msg_id":"abc123-def456"}
+2024-01-15T11:00:00.301Z queue: delivery attempt failed	{"msg_id":"abc123-def456","rcpt":"user@slow.example","reason":"451 4.7.1 Try again later","remote_server":"mx1.slow.example","smtp_code":451,"smtp_enchcode":"4.7.1","smtp_msg":"Try again later"}
+2024-01-15T11:00:00.400Z [debug] queue: removed message from disk	{"msg_id":"abc123-def456"}
+```
+
+> **Note — silent message drop, no DSN**: At line 390, `meta.TriesCount == q.maxTries` (2 == 2) is true, entering the completion branch. However, the `"not delivered, temporary error"` log at lines 391–394 iterates `meta.TemporaryFailedRcpts` — which is **always empty** (see note below). The `"not delivered, permanent error"` log at lines 395–397 iterates `meta.FailedRcpts` — which is also empty because only permanent failures populate it (line 381), and this message had only temporary failures throughout its lifecycle. The DSN condition at line 398 (`len(meta.FailedRcpts)+len(meta.TemporaryFailedRcpts) != 0`) evaluates to `0 + 0 != 0` → false, so **no DSN is generated**. The message is silently removed from disk without any `"not delivered"` log entry or bounce notification.
+
+> **Note on `TemporaryFailedRcpts` field**: The `QueueMetadata.TemporaryFailedRcpts` field is declared at `queue.go` line 160 but is **never assigned** anywhere in the queue codebase. The loop at lines 391–394 never executes because the field remains nil throughout the message lifecycle. This means that when retries are exhausted with only temporary failures (as in this scenario), the recipient is silently dropped — no log identifies it as undeliverable, and no DSN bounce is generated. This appears to be an incomplete implementation where `TemporaryFailedRcpts` was intended to track recipients that exhausted retries while in temporary-failure state but was never wired up. **This is a significant behavioral difference from permanent failures** (Scenario 2), where `meta.FailedRcpts` IS populated, the `"not delivered, permanent error"` log IS emitted, and a DSN IS generated.
 
 **DSN generation conditions** (`emitDSN`, `queue.go` lines 849–953):
 - **Suppressed** if `q.dsnPipeline == nil` (no `bounce {}` block configured) — line 851
@@ -813,7 +839,9 @@ metaCopy.MsgMeta.Conn = nil
 
 This is necessary because `ConnState` contains `net.Addr` and `future.Future` objects that cannot be JSON-serialized (noted in `readMessageMeta()` lines 781–784).
 
-**Concrete JSON example** — `.meta` file after first failed attempt to an unreachable host:
+**Concrete JSON example** — `.meta` file after first failed attempt with a 4xx SMTP response:
+
+> **Important**: A `.meta` file persists on disk between retry attempts **only** when the failure is temporary (4xx SMTP response) and retries remain. For permanent failures (e.g., TCP timeouts where all MX hosts are unreachable — see Section 3.4, Scenario 2), the message is removed from disk immediately and no `.meta` file survives.
 
 ```json
 {
@@ -833,29 +861,30 @@ This is necessary because `ConnState` contains `net.Addr` and `future.Future` ob
     "Conn": null
   },
   "From": "sender@origin.example",
-  "To": ["user@unreachable.example"],
+  "To": ["user@slow.example"],
   "FailedRcpts": [],
   "TemporaryFailedRcpts": [],
   "RcptErrs": {
-    "user@unreachable.example": {
-      "Code": 450,
+    "user@slow.example": {
+      "Code": 451,
       "EnhancedCode": [4, 0, 0],
-      "Message": "Network I/O error"
+      "Message": "Try again later"
     }
   },
   "TriesCount": 1,
   "FirstAttempt": "2024-01-15T10:30:00Z",
-  "LastAttempt": "2024-01-15T10:32:07.5Z"
+  "LastAttempt": "2024-01-15T10:30:00.3Z"
 }
 ```
 
 **Reading this metadata tells you**:
-- `TriesCount: 1` — One delivery attempt has been made
-- `To: ["user@unreachable.example"]` — This recipient will be retried on the next attempt
-- `RcptErrs` — The last error was SMTP 450/4.0.0 "Network I/O error" (TCP timeout)
-- `FirstAttempt` / `LastAttempt` — The message entered the queue at 10:30:00 and the last attempt completed at 10:32:07 (~2 minutes later, matching the TCP timeout duration)
+- `TriesCount: 1` — One delivery attempt has been made (TriesCount is incremented in the retry path at line 408)
+- `To: ["user@slow.example"]` — This recipient will be retried on the next attempt (set to `partialErr.TemporaryFailed` at line 387)
+- `FailedRcpts: []` — No recipients have permanently failed
+- `RcptErrs` — The last error was SMTP 451/4.0.0 "Try again later" (the remote server responded with a 4xx code)
+- `FirstAttempt` / `LastAttempt` — Both timestamps are close together because the 4xx response was immediate (unlike a TCP timeout which takes ~2 minutes)
 
-> **EnhancedCode discrepancy**: The stored `EnhancedCode` is `[4, 0, 0]` rather than the expected `[4, 4, 2]` from `wrapClientErr()`. This occurs because `toSMTPErr()` (`queue.go` line 346) attempts a Go type assertion `ctxInfo["smtp_enchcode"].(smtp.EnhancedCode)`, but the actual type in the error chain is `exterrors.EnhancedCode` — a distinct Go named type (`type EnhancedCode smtp.EnhancedCode` in `smtp.go`). Since Go's type assertion requires an exact type match, the comma-ok idiom returns `(zero, false)`, and the default `smtp.EnhancedCode{4, 0, 0}` (set at line 338) is preserved. Note that **log output** correctly shows `"smtp_enchcode":"4.4.2"` because `marshalOrderedJSON()` matches via the `LogFormatter` interface which `exterrors.EnhancedCode` implements.
+> **EnhancedCode discrepancy**: The stored `EnhancedCode` is `[4, 0, 0]` rather than the expected `[4, 7, 1]` from the server's response. This occurs because `toSMTPErr()` (`queue.go` line 346) attempts a Go type assertion `ctxInfo["smtp_enchcode"].(smtp.EnhancedCode)`, but the actual type in the error chain is `exterrors.EnhancedCode` — a distinct Go named type (`type EnhancedCode smtp.EnhancedCode` in `smtp.go`). Since Go's type assertion requires an exact type match, the comma-ok idiom returns `(zero, false)`, and the default enhanced code (set at line 338 with class derived from the SMTP code) is preserved. The class digit (4) is correct because `toSMTPErr()` sets `res.EnhancedCode[0] = 4` when `code/100 == 4` (line 343), but the subject and detail digits default to `0, 0`. Note that **log output** correctly shows the full enhanced code (e.g., `"smtp_enchcode":"4.7.1"`) because `marshalOrderedJSON()` formats via the `LogFormatter` interface which `exterrors.EnhancedCode` implements.
 
 > **Timestamp format**: The `.meta` JSON is produced by Go's `json.NewEncoder().Encode()`, which calls `time.Time.MarshalJSON()` using RFC 3339Nano format. Trailing fractional-second zeros are trimmed: `10:30:00.000` serializes as `"2024-01-15T10:30:00Z"` (no fractional seconds), and `10:32:07.500` serializes as `"2024-01-15T10:32:07.5Z"` (trailing zero trimmed). This differs from the log output format in Section 3.1, which uses `marshalOrderedJSON()` with a fixed `"2006-01-02T15:04:05.000"` layout (always three decimal places, no `Z` suffix).
 
@@ -1088,6 +1117,8 @@ sequenceDiagram
    - In this worst case, the semaphore is held for ~6.3 minutes per goroutine
    - Message 17 could wait up to **~6.3 minutes** for a semaphore slot
 
+5. **TCP timeout starvation is self-limiting**: Because TCP timeouts where all MX hosts fail result in **permanent** failures (see Section 2.4), the starvation described above is a one-time event. After each of the 16 deliveries completes with a permanent failure, the semaphore is released and the message is removed from disk — no retry is scheduled. This contrasts with temporary 4xx SMTP failures, which DO generate retries that re-acquire semaphore slots approximately 15 minutes later (and then 30 minutes, 60 minutes, etc. with exponential backoff), potentially causing **repeated starvation cycles** across multiple retry waves.
+
 ### 5.4 Impact of Slow Timeouts on Other Messages
 
 #### Quantified Starvation Scenarios
@@ -1125,7 +1156,7 @@ sequenceDiagram
 
 2. **Application-level connection timeout**: Currently, `smtpconn.New()` creates a zero-timeout `net.Dialer`. Adding an explicit `Timeout` to the dialer (e.g., 30 seconds) would reduce the per-MX timeout from ~127s to 30s. This would require source code modification (out of scope for this analysis).
 
-3. **Monitoring queue depth**: Watch the number of `.meta` files in the queue directory. A growing count indicates delivery failures outpacing retries.
+3. **Monitoring queue depth**: Watch the number of `.meta` files in the queue directory. For temporary 4xx failures, a growing `.meta` file count indicates retries are accumulating faster than they can be resolved. For permanent failures (TCP timeouts where all MX hosts are unreachable), queue depth actually **decreases** since messages are removed after their first failed attempt (see Section 2.2) — though DSN bounce messages may be generated, adding new entries to the queue.
 
 **Note on `deliveryWg`**: The `sync.WaitGroup` at `queue.go` line 143 is used **only** for graceful shutdown. `Queue.Close()` (line 253–258) closes the TimeWheel and then calls `q.deliveryWg.Wait()` to wait for all in-flight deliveries to complete. It does not affect scheduling or parallelism during normal operation.
 
