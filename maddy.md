@@ -122,7 +122,7 @@ The `MsgPipeline` in `internal/msgpipeline/msgpipeline.go` implements a two-leve
 
 The default configuration routes outgoing mail through the submission endpoint:
 
-```
+```text
 submission tls://0.0.0.0:465 {
     auth &local_authdb
     source $(local_domains) {
@@ -138,7 +138,7 @@ submission tls://0.0.0.0:465 {
 
 The queue itself is defined at `maddy.conf` lines 122–147:
 
-```
+```text
 queue remote_queue {
     max_tries 8
     max_parallelism 16
@@ -214,7 +214,7 @@ If the body was already stored to disk, calls `removeFromDisk()` to clean up all
 
 The retry delay is calculated using an exponential backoff formula documented in `queue.go` lines 121–122:
 
-```
+```text
 nextTryDelay = initialRetryTime × retryTimeScale ^ (TriesCount - 1)
 ```
 
@@ -540,7 +540,7 @@ if l.Name != "" {
 Each logger has a `Name` field. The queue logger is named `"queue"` (set at `queue.go` line 188).
 
 **Message body with structured fields** — `internal/log/log.go` lines 135–155 (`formatMsg`):
-```
+```text
 {message}\t{JSON fields}
 ```
 The message text and JSON fields are separated by a tab character (`\t`). If there are no fields, the tab is still written but followed by nothing.
@@ -555,7 +555,7 @@ The message text and JSON fields are separated by a tab character (`\t`). If the
   - `error` interface → `.Error()`
 
 **Complete log line format**:
-```
+```text
 {timestamp} [debug] {logger_name}: {message}\t{JSON fields}
 ```
 
@@ -564,17 +564,17 @@ Where `[debug] ` is only present for debug-level messages.
 **Concrete examples**:
 
 Standard message (always emitted):
-```
+```text
 2024-01-15T10:30:45.123Z queue: will retry	{"attempts_count":1,"msg_id":"abc123-def456","next_try_delay":"15m0s","rcpts":["user@example.com"]}
 ```
 
 Debug message (only when `debug true` is set):
-```
+```text
 2024-01-15T10:30:45.123Z [debug] queue: delivery attempt #1	{"msg_id":"abc123-def456"}
 ```
 
 Error message (always emitted):
-```
+```text
 2024-01-15T10:32:12.456Z queue: delivery attempt failed	{"io_op":"dial","msg_id":"abc123-def456","rcpt":"user@unreachable.example","reason":"dial tcp 192.0.2.1:25: i/o timeout","remote_addr":"192.0.2.1:25","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error"}
 ```
 
@@ -672,7 +672,7 @@ The maddy logging system has two log levels:
 
 #### Scenario 1: Successful First-Attempt Delivery
 
-```
+```text
 2024-01-15T10:30:00.100Z [debug] queue: starting delivery for abc123-def456
 2024-01-15T10:30:00.100Z [debug] queue: waiting on delivery semaphore for abc123-def456
 2024-01-15T10:30:00.101Z [debug] queue: delivery semaphore acquired for abc123-def456
@@ -691,7 +691,7 @@ The maddy logging system has two log levels:
 
 For `remote.Target`, TCP connections are established during `AddRcpt()` — not during `Target.Start()`. When `AddRcpt()` calls `connectionForDomain()` (`remote.go` line 230) and the destination is unreachable, the TCP timeout error propagates back through the `deliver()` function's per-recipient error handling path.
 
-```
+```text
 2024-01-15T10:30:00.100Z [debug] queue: starting delivery for abc123-def456
 2024-01-15T10:30:00.100Z [debug] queue: waiting on delivery semaphore for abc123-def456
 2024-01-15T10:30:00.101Z [debug] queue: delivery semaphore acquired for abc123-def456
@@ -722,7 +722,7 @@ For `remote.Target`, TCP connections are established during `AddRcpt()` — not 
 
 Assuming `max_tries=2` and this is the 3rd attempt (TriesCount=2 at entry, which equals maxTries):
 
-```
+```text
 2024-01-15T11:00:00.100Z [debug] queue: starting delivery for abc123-def456
 2024-01-15T11:00:00.101Z [debug] queue: delivery semaphore acquired for abc123-def456
 2024-01-15T11:00:00.102Z [debug] queue: delivery attempt #3	{"msg_id":"abc123-def456"}
@@ -776,7 +776,7 @@ Each queued message is represented by **three files** on disk, all sharing the s
 
 **Concrete example** of a queue directory with two pending messages:
 
-```
+```text
 /var/lib/maddy/remote_queue/
 ├── a1b2c3d4-e5f6.header      # MIME headers for message 1
 ├── a1b2c3d4-e5f6.body        # Body content for message 1
@@ -881,7 +881,7 @@ cat /var/lib/maddy/remote_queue/a1b2c3d4-e5f6.header
 ```
 
 Example output:
-```
+```text
 From: sender@origin.example
 To: user@unreachable.example
 Subject: Test Message
@@ -1137,7 +1137,7 @@ sequenceDiagram
 
 To observe queue retry behavior without modifying the maddy source code, create a test configuration outside the repository. This configuration uses minimal settings and a destination that will always timeout:
 
-```
+```text
 # /tmp/maddy-test/maddy.conf
 # Test configuration for observing queue retry behavior
 
@@ -1300,7 +1300,7 @@ watch -n 5 'echo "Files: $(ls /tmp/maddy-test/state/test_queue/ 2>/dev/null | wc
 | `internal/target/remote/remote.go` | 1–100, 185–241 | `Target`, `New()`, `Init()`, `Start()`, `remoteDelivery.AddRcpt()` | Remote delivery target: Start() always returns nil, AddRcpt() calls connectionForDomain(), dialer configuration |
 | `internal/target/remote/connect.go` | 100–225 | `connectionForDomain()`, `lookupMX()`, `checkPolicies()` | MX host connection: TLS attempt, policy verification, failover iteration |
 | `internal/smtpconn/smtpconn.go` | 1–140 | `C`, `New()`, `Connect()`, `wrapClientErr()` | SMTP connection wrapper: zero-timeout dialer, error classification |
-| `internal/log/log.go` | 1–208 | `Logger`, `Msg()`, `Error()`, `Debugf()`, `Debugln()`, `formatMsg()`, `fieldsToMap()` | Structured logging: message formatting, JSON field assembly |
+| `internal/log/log.go` | 1–207 | `Logger`, `Msg()`, `Error()`, `Debugf()`, `Debugln()`, `formatMsg()`, `fieldsToMap()` | Structured logging: message formatting, JSON field assembly |
 | `internal/log/writer.go` | 1–77 | `wcOutput.Write()`, `WriterOutput()`, `WriteCloserOutput()` | Log output: timestamp formatting, debug prefix, newline termination |
 | `internal/log/orderedjson.go` | 1–62 | `marshalOrderedJSON()` | Deterministic JSON serialization: sorted keys, type-specific formatting |
 | `internal/exterrors/smtp.go` | 1–128 | `SMTPError`, `EnhancedCode`, `Fields()`, `Temporary()`, `Error()` | SMTP error type: structured fields, temporality determination |
@@ -1312,7 +1312,7 @@ watch -n 5 'echo "Files: $(ls /tmp/maddy-test/state/test_queue/ 2>/dev/null | wc
 | `internal/module/partial_delivery.go` | 1–40 | `PartialDelivery`, `StatusCollector` interfaces | Partial delivery: per-recipient failure reporting via `BodyNonAtomic` |
 | `internal/buffer/file.go` | — | `FileBuffer` | Disk-backed message body storage |
 | `internal/config/directories.go` | — | `StateDirectory`, `RuntimeDirectory` | Default directory paths for queue storage |
-| `maddy.conf` | 1–153 (full file) | Queue configuration block, submission routing | Default server configuration: `max_tries 8`, `max_parallelism 16`, bounce routing |
+| `maddy.conf` | 1–152 (full file) | Queue configuration block, submission routing | Default server configuration: `max_tries 8`, `max_parallelism 16`, bounce routing |
 | `HACKING.md` | — | Module architecture, error handling conventions | Contributor design guide: module contracts, exterrors usage |
 
 ---
