@@ -32,8 +32,8 @@ A message entering the maddy mail server traverses a well-defined chain of compo
 5. **Disk Persistence** — `queueDelivery.Body()` (line 547) calls `storeNewMessage()` (line 690), which writes `.header`, `.body`, and `.meta` files to the queue directory.
 6. **Schedule Dispatch** — `queueDelivery.Commit()` (line 571) calls `wheel.Add(time.Time{}, queueSlot{...})` — the zero-value `time.Time{}` means the dispatch is immediate.
 7. **Dispatch** — The `TimeWheel` fires and calls `dispatch()` (line 275), which launches a goroutine.
-8. **Delivery Attempt** — Within the goroutine, `tryDelivery()` (line 365) calls `deliver()` (line 431), which invokes `q.Target.Start()` on the remote delivery target.
-9. **Remote Connection** — `internal/target/remote/remote.go` `Target` performs DNS MX resolution and establishes an SMTP connection via `internal/smtpconn/smtpconn.go`.
+8. **Delivery Attempt** — Within the goroutine, `tryDelivery()` (line 365) calls `deliver()` (line 431), which invokes `q.Target.Start()` on the remote delivery target. For `remote.Target`, `Start()` always succeeds immediately (returns nil error), creating a `remoteDelivery` struct with an empty connections map (`remote.go` lines 185–193).
+9. **Remote Connection** — `deliver()` then calls `delivery.AddRcpt()` for each recipient, which in `remote.Target` triggers `connectionForDomain()` (`remote.go` line 230, `connect.go` lines 113–225). This is where DNS MX resolution and TCP connection via `internal/smtpconn/smtpconn.go` actually occur.
 10. **Final Disposition** — The message is either successfully delivered, scheduled for retry (temporary failure), or generates a DSN (permanent failure or retry exhaustion).
 
 ```mermaid
@@ -48,6 +48,7 @@ sequenceDiagram
     participant TD as tryDelivery()
     participant DL as deliver()
     participant RT as remote.Target
+    participant RD as remoteDelivery
     participant SC as smtpconn.C
     participant MTA as Remote MTA
 
@@ -69,11 +70,17 @@ sequenceDiagram
     D->>TD: tryDelivery(meta, header, body)
     TD->>DL: deliver(meta, header, body)
     DL->>RT: Target.Start(ctx, msgMeta, mailFrom)
-    RT->>SC: smtpconn.New() + Connect()
+    RT-->>DL: return (&remoteDelivery{}, nil)
+    Note over DL: Start() always succeeds for remote.Target<br/>(remote.go:185-193) — no TCP connections yet
+    DL->>RD: AddRcpt(ctx, rcptTo)
+    RD->>RD: connectionForDomain(ctx, domain)<br/>(remote.go:230, connect.go:113-225)
+    RD->>SC: smtpconn.New() + Connect()
     SC->>MTA: TCP connect + EHLO + STARTTLS
-    RT->>MTA: MAIL FROM / RCPT TO / DATA
-    MTA-->>RT: 250 OK
-    RT-->>DL: return partialError
+    RD->>MTA: conn.Rcpt(ctx, rcptTo)
+    MTA-->>RD: 250 OK
+    DL->>RD: Body / BodyNonAtomic
+    DL->>RD: Commit
+    RD-->>DL: return partialError
     DL-->>TD: return partialError
     Note over TD: Evaluate: retry, DSN, or success
 ```
@@ -289,9 +296,11 @@ For the timing tables below, we use the **actual code behavior** where `max_trie
 
 ### 2.2 Connection Attempt Sequence for Non-Responsive Destinations
 
-When `deliver()` calls `q.Target.Start()`, the remote target's `connectionForDomain()` in `connect.go` (lines 113–225) executes the following sequence:
+When `deliver()` (`queue.go` line 431) processes a message, it first calls `q.Target.Start()` (line 446). For `remote.Target`, `Start()` (`remote.go` lines 185–193) **always returns nil** — it merely creates a `remoteDelivery` struct with an empty `connections` map. No TCP connections are established during `Start()`.
 
-1. **Create SMTP connection object**: `smtpconn.New()` (line 121) — initializes a zero-timeout `net.Dialer`
+TCP connections occur during `AddRcpt()`. When `deliver()` iterates each recipient and calls `delivery.AddRcpt()` (line 461), the `remoteDelivery.AddRcpt()` method (`remote.go` line 195) calls `connectionForDomain()` (`remote.go` line 230, `connect.go` lines 113–225). This is the actual connection initiation point, and it executes the following sequence:
+
+1. **Create SMTP connection object**: `smtpconn.New()` (`connect.go` line 121) — initializes a zero-timeout `net.Dialer`
 2. **Set dialer**: `conn.Dialer = rd.rt.dialer` (line 125) — uses the remote Target's dialer, which is also a zero-timeout `(&net.Dialer{}).DialContext` (set in `remote.go` line 81)
 3. **MTA-STS policy fetch** (if enabled): Launches an async goroutine to fetch the MTA-STS policy (lines 131–142)
 4. **DNS MX lookup**: `rd.lookupMX(ctx, domain)` (line 145)
@@ -307,7 +316,7 @@ When `deliver()` calls `q.Target.Start()`, the remote target's `connectionForDom
 8. **All MX exhausted**: If still not connected, return "No usable MXs" error (lines 202–214) with SMTP code 451 or 550
 9. **MAIL FROM**: `conn.Mail(ctx, rd.mailFrom, rd.msgMeta.SMTPOpts)` sends the MAIL FROM command (line 218)
 
-**Key implication for non-responsive destinations**: Each MX host connection attempt blocks for the full TCP timeout duration (~127 seconds on Linux). If a domain has 3 MX hosts and all are unreachable, the total time for one delivery attempt is approximately **381 seconds (~6.3 minutes)**.
+**Key implication for non-responsive destinations**: Each MX host connection attempt within `connectionForDomain()` (called from `AddRcpt()`) blocks for the full TCP timeout duration (~127 seconds on Linux). If a domain has 3 MX hosts and all are unreachable, the total time for one `AddRcpt()` call is approximately **381 seconds (~6.3 minutes)**. Because the TCP timeout error is classified as temporary by `wrapClientErr()` (SMTP 450/4.4.2), and `exterrors.IsTemporaryOrUnspec()` returns true for this error, the recipient is placed in `perr.TemporaryFailed` at `deliver()` line 463 — meaning the message **WILL be retried**.
 
 ### 2.3 TCP Timeout Duration Analysis
 
@@ -680,27 +689,34 @@ The maddy logging system has two log levels:
 
 #### Scenario 2: TCP Timeout with Retry (max_tries=3, Attempt 1 of 4)
 
+For `remote.Target`, TCP connections are established during `AddRcpt()` — not during `Target.Start()`. When `AddRcpt()` calls `connectionForDomain()` (`remote.go` line 230) and the destination is unreachable, the TCP timeout error propagates back through the `deliver()` function's per-recipient error handling path.
+
 ```
 2024-01-15T10:30:00.100Z [debug] queue: starting delivery for abc123-def456
 2024-01-15T10:30:00.100Z [debug] queue: waiting on delivery semaphore for abc123-def456
 2024-01-15T10:30:00.101Z [debug] queue: delivery semaphore acquired for abc123-def456
 2024-01-15T10:30:00.102Z [debug] queue: delivery attempt #1	{"msg_id":"abc123-def456"}
 2024-01-15T10:30:00.103Z [debug] queue: using message ID = abc123-def456-1	{"msg_id":"abc123-def456"}
-2024-01-15T10:30:00.104Z [debug] queue: target.Start failed: dial tcp 192.0.2.1:25: i/o timeout	{"msg_id":"abc123-def456"}
-2024-01-15T10:32:07.500Z [debug] queue: failures: permanently: [user@unreachable.example], temporary: [], errors: map[user@unreachable.example:dial tcp 192.0.2.1:25: i/o timeout]	{"msg_id":"abc123-def456"}
+2024-01-15T10:30:00.104Z [debug] queue: target.Start OK	{"msg_id":"abc123-def456"}
+2024-01-15T10:32:07.400Z [debug] queue: delivery.AddRcpt user@unreachable.example failed: dial tcp 192.0.2.1:25: i/o timeout	{"msg_id":"abc123-def456"}
+2024-01-15T10:32:07.401Z [debug] queue: delivery.Abort (no accepted receipients)	{"msg_id":"abc123-def456"}
+2024-01-15T10:32:07.500Z [debug] queue: failures: permanently: [], temporary: [user@unreachable.example], errors: map[user@unreachable.example:dial tcp 192.0.2.1:25: i/o timeout]	{"msg_id":"abc123-def456"}
 2024-01-15T10:32:07.501Z queue: delivery attempt failed	{"io_op":"dial","msg_id":"abc123-def456","rcpt":"user@unreachable.example","reason":"dial tcp 192.0.2.1:25: i/o timeout","remote_addr":"192.0.2.1:25","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error"}
 2024-01-15T10:32:07.502Z queue: will retry	{"attempts_count":1,"msg_id":"abc123-def456","next_try_delay":"15m0s","rcpts":["user@unreachable.example"]}
 ```
 
-> **Note**: The ~2-minute gap between the delivery attempt start (10:30:00) and the failure log (10:32:07) corresponds to the TCP timeout duration.
+> **Note**: The ~2-minute gap between the delivery attempt start (10:30:00) and the failure log (10:32:07) corresponds to the TCP timeout duration (~127 seconds with default `tcp_syn_retries=6`).
 
-> **Important**: When `Target.Start()` fails at `deliver()` line 448, all recipients are added to `perr.Failed` (line 450), not `perr.TemporaryFailed`. However, `IsTemporaryOrUnspec()` is **not** called within `deliver()` for the Start-failure path — the raw error is placed in `perr.Errs`. The classification into temporary vs permanent happens later in `tryDelivery()` when `toSMTPErr()` is called at line 385 to convert the error for storage. The `meta.To = partialErr.TemporaryFailed` assignment at line 387 determines retry recipients. Since Start-failure puts recipients in `perr.Failed` (not TemporaryFailed), these are treated as **permanent failures** for this attempt — meaning no retry occurs for Start failures.
+> **Why TCP timeouts ARE retried for `remote.Target`**: The key is that `remote.Target.Start()` (`remote.go` lines 185–193) **always returns nil** — it creates an empty `remoteDelivery` struct without making any TCP connections. The `target.Start OK` debug log (emitted at `queue.go` line 456) always appears for `remote.Target`. TCP connections only occur later when `deliver()` calls `delivery.AddRcpt()` (line 461), which triggers `connectionForDomain()` in the remote module. When `AddRcpt()` fails with a TCP timeout, `deliver()` evaluates the error at lines 462–463:
+>
+> ```go
+> if exterrors.IsTemporaryOrUnspec(err) {
+>     perr.TemporaryFailed = append(perr.TemporaryFailed, rcpt)
+> ```
+>
+> Since the TCP timeout is wrapped by `wrapClientErr()` as a 450/4.4.2 `exterrors.SMTPError` (which implements `Temporary()` returning true), `IsTemporaryOrUnspec()` returns true, and the recipient goes into `perr.TemporaryFailed`. Back in `tryDelivery()`, `meta.To = partialErr.TemporaryFailed` (line 387) sets the retry recipient list to `[user@unreachable.example]`, and `len(partialErr.TemporaryFailed) == 0` (line 390) is false, so the exhaustion branch is NOT taken. The message is scheduled for retry with exponential backoff.
 
-> **Correction**: Looking more carefully at `deliver()` lines 448–454, when `Target.Start()` fails, all recipients go to `perr.Failed` (permanent). This means TCP timeouts during `Target.Start()` (which calls `connectionForDomain()`) would be treated as permanent failures and **not retried**. However, the `wrapClientErr()` in smtpconn wraps the error as a temporary 450 error, and `toSMTPErr()` at queue.go line 336 does check `IsTemporaryOrUnspec()` — but this only affects the error code stored in `meta.RcptErrs`, not the retry decision. The retry decision is based on `partialErr.TemporaryFailed`, which is empty when Start fails.
-
-> This analysis reveals that **a Target.Start() failure (which includes connection timeout) causes all recipients to be classified as permanently failed for that attempt, but the error is stored with a temporary SMTP code**. The key question is whether `tryDelivery()` re-evaluates this. Looking at line 387: `meta.To = partialErr.TemporaryFailed` — this sets the next retry's recipient list. If TemporaryFailed is empty, the condition at line 390 `len(partialErr.TemporaryFailed) == 0` is true, triggering completion without retry.
-
-> **Conclusion from code analysis**: When `Target.Start()` fails (including TCP timeouts during initial connection), the message is **not retried** — it goes directly to DSN generation. Retries only occur when individual `AddRcpt()` failures (line 462–463) or `BodyNonAtomic()`/`Body()` failures (lines 485–486, 503–505) are classified as temporary. This is a significant behavioral finding.
+> **Contrast with generic `Target.Start()` failures**: If a different `DeliveryTarget` implementation returned an error from `Start()`, `deliver()` would place all recipients in `perr.Failed` (lines 448–454), NOT `perr.TemporaryFailed`. In that case, `len(partialErr.TemporaryFailed) == 0` would be true at line 390, triggering completion and DSN generation without retry. This distinction matters: the retry behavior depends on WHERE in the `deliver()` function the failure occurs — `Start()` failures go to `Failed` (permanent), while `AddRcpt()` failures are classified by `IsTemporaryOrUnspec()` and can go to `TemporaryFailed` (retried).
 
 #### Scenario 3: Max Retries Exhausted (Final Attempt)
 
@@ -711,14 +727,15 @@ Assuming `max_tries=2` and this is the 3rd attempt (TriesCount=2 at entry, which
 2024-01-15T11:00:00.101Z [debug] queue: delivery semaphore acquired for abc123-def456
 2024-01-15T11:00:00.102Z [debug] queue: delivery attempt #3	{"msg_id":"abc123-def456"}
 2024-01-15T11:00:00.103Z [debug] queue: using message ID = abc123-def456-3	{"msg_id":"abc123-def456"}
-2024-01-15T11:02:07.500Z [debug] queue: delivery.AddRcpt user@unreachable.example failed: <timeout error>	{"msg_id":"abc123-def456"}
+2024-01-15T11:00:00.104Z [debug] queue: target.Start OK	{"msg_id":"abc123-def456"}
+2024-01-15T11:02:07.500Z [debug] queue: delivery.AddRcpt user@unreachable.example failed: dial tcp 192.0.2.1:25: i/o timeout	{"msg_id":"abc123-def456"}
 2024-01-15T11:02:07.501Z [debug] queue: delivery.Abort (no accepted receipients)	{"msg_id":"abc123-def456"}
 2024-01-15T11:02:07.502Z [debug] queue: failures: permanently: [], temporary: [user@unreachable.example], errors: map[...]	{"msg_id":"abc123-def456"}
-2024-01-15T11:02:07.503Z queue: delivery attempt failed	{"msg_id":"abc123-def456","rcpt":"user@unreachable.example","reason":"...","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error"}
-2024-01-15T11:02:07.504Z queue: not delivered, temporary error	{"msg_id":"abc123-def456","rcpt":"user@unreachable.example"}
-2024-01-15T11:02:07.505Z queue: generated failed DSN	{"dsn_id":"dsn-xyz789","msg_id":"abc123-def456"}
+2024-01-15T11:02:07.503Z queue: delivery attempt failed	{"msg_id":"abc123-def456","rcpt":"user@unreachable.example","reason":"dial tcp 192.0.2.1:25: i/o timeout","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error"}
 2024-01-15T11:02:07.600Z [debug] queue: removed message from disk	{"msg_id":"abc123-def456"}
 ```
+
+> **Note on `TemporaryFailedRcpts` field**: The `QueueMetadata.TemporaryFailedRcpts` field is declared at `queue.go` line 160 but is **never assigned** anywhere in the queue codebase (confirmed by searching all references). The loop at lines 393–395 (`for _, rcpt := range meta.TemporaryFailedRcpts`) never executes because the field remains nil throughout the message lifecycle. Consequently, when max retries are exhausted and all failures were temporary (the TCP timeout case), the `"not delivered, temporary error"` log message does **not** appear, and the `"not delivered, permanent error"` log also does not appear (because `meta.FailedRcpts` is empty — temporary failures never populate it). The DSN generation condition at line 400 (`len(meta.FailedRcpts)+len(meta.TemporaryFailedRcpts) != 0`) evaluates to false, so **no DSN is generated**. The message is silently removed from disk. This appears to be an incomplete implementation in the source code where `TemporaryFailedRcpts` was intended to track recipients that exhausted retries while in temporary-failure state but was never wired up.
 
 **DSN generation conditions** (`emitDSN`, `queue.go` lines 849–953):
 - **Suppressed** if `q.dsnPipeline == nil` (no `bounce {}` block configured) — line 851
@@ -802,7 +819,10 @@ This is necessary because `ConnState` contains `net.Addr` and `future.Future` ob
 {
   "MsgMeta": {
     "ID": "a1b2c3d4-e5f6",
+    "OriginalFrom": "sender@origin.example",
+    "DontTraceSender": false,
     "Quarantine": false,
+    "OriginalRcpts": null,
     "SMTPOpts": {
       "Auth": null,
       "Body": "",
@@ -810,10 +830,7 @@ This is necessary because `ConnState` contains `net.Addr` and `future.Future` ob
       "RequireTLS": false,
       "UTF8": false
     },
-    "OriginalFrom": "sender@origin.example",
-    "DontTraceSender": false,
-    "Conn": null,
-    "OriginalRcpts": null
+    "Conn": null
   },
   "From": "sender@origin.example",
   "To": ["user@unreachable.example"],
@@ -822,21 +839,25 @@ This is necessary because `ConnState` contains `net.Addr` and `future.Future` ob
   "RcptErrs": {
     "user@unreachable.example": {
       "Code": 450,
-      "EnhancedCode": [4, 4, 2],
+      "EnhancedCode": [4, 0, 0],
       "Message": "Network I/O error"
     }
   },
   "TriesCount": 1,
-  "FirstAttempt": "2024-01-15T10:30:00.000Z",
-  "LastAttempt": "2024-01-15T10:32:07.500Z"
+  "FirstAttempt": "2024-01-15T10:30:00Z",
+  "LastAttempt": "2024-01-15T10:32:07.5Z"
 }
 ```
 
 **Reading this metadata tells you**:
 - `TriesCount: 1` — One delivery attempt has been made
 - `To: ["user@unreachable.example"]` — This recipient will be retried on the next attempt
-- `RcptErrs` — The last error was SMTP 450/4.4.2 "Network I/O error" (TCP timeout)
+- `RcptErrs` — The last error was SMTP 450/4.0.0 "Network I/O error" (TCP timeout)
 - `FirstAttempt` / `LastAttempt` — The message entered the queue at 10:30:00 and the last attempt completed at 10:32:07 (~2 minutes later, matching the TCP timeout duration)
+
+> **EnhancedCode discrepancy**: The stored `EnhancedCode` is `[4, 0, 0]` rather than the expected `[4, 4, 2]` from `wrapClientErr()`. This occurs because `toSMTPErr()` (`queue.go` line 346) attempts a Go type assertion `ctxInfo["smtp_enchcode"].(smtp.EnhancedCode)`, but the actual type in the error chain is `exterrors.EnhancedCode` — a distinct Go named type (`type EnhancedCode smtp.EnhancedCode` in `smtp.go`). Since Go's type assertion requires an exact type match, the comma-ok idiom returns `(zero, false)`, and the default `smtp.EnhancedCode{4, 0, 0}` (set at line 338) is preserved. Note that **log output** correctly shows `"smtp_enchcode":"4.4.2"` because `marshalOrderedJSON()` matches via the `LogFormatter` interface which `exterrors.EnhancedCode` implements.
+
+> **Timestamp format**: The `.meta` JSON is produced by Go's `json.NewEncoder().Encode()`, which calls `time.Time.MarshalJSON()` using RFC 3339Nano format. Trailing fractional-second zeros are trimmed: `10:30:00.000` serializes as `"2024-01-15T10:30:00Z"` (no fractional seconds), and `10:32:07.500` serializes as `"2024-01-15T10:32:07.5Z"` (trailing zero trimmed). This differs from the log output format in Section 3.1, which uses `marshalOrderedJSON()` with a fixed `"2006-01-02T15:04:05.000"` layout (always three decimal places, no `Z` suffix).
 
 ### 4.4 Inspecting Queue State Between Failures
 
@@ -1275,7 +1296,8 @@ watch -n 5 'echo "Files: $(ls /tmp/maddy-test/state/test_queue/ 2>/dev/null | wc
 | `internal/target/queue/queue.go` | 1–957 (full file) | `Queue`, `QueueMetadata`, `queueSlot`, `partialError`, `NewQueue()`, `Init()`, `Start()`, `dispatch()`, `tryDelivery()`, `deliver()`, `storeNewMessage()`, `updateMetadataOnDisk()`, `readDiskQueue()`, `readMessageMeta()`, `openMessage()`, `removeFromDisk()`, `emitDSN()`, `toSMTPErr()`, `discardBroken()`, `queueDelivery` | Core queue implementation: delivery lifecycle, retry logic, persistence, DSN generation |
 | `internal/target/queue/timewheel.go` | 1–128 (full file) | `TimeWheel`, `TimeSlot`, `NewTimeWheel()`, `Add()`, `Close()`, `tick()` | Time-based delivery scheduler: nearest-deadline scan, single-goroutine dispatch |
 | `internal/target/queue/queue_test.go` | — | Test patterns for retry, serialization, cleanup | Behavioral test suite demonstrating expected retry and persistence behavior |
-| `internal/target/remote/remote.go` | 1–100 | `Target`, `New()`, `Init()` | Remote delivery target: MX resolution, dialer configuration |
+| `internal/msgpipeline/msgpipeline.go` | — | `MsgPipeline`, `New()`, `Start()`, source/destination block routing | Pipeline orchestrator: two-level routing engine (source block → destination block matching) |
+| `internal/target/remote/remote.go` | 1–100, 185–241 | `Target`, `New()`, `Init()`, `Start()`, `remoteDelivery.AddRcpt()` | Remote delivery target: Start() always returns nil, AddRcpt() calls connectionForDomain(), dialer configuration |
 | `internal/target/remote/connect.go` | 100–225 | `connectionForDomain()`, `lookupMX()`, `checkPolicies()` | MX host connection: TLS attempt, policy verification, failover iteration |
 | `internal/smtpconn/smtpconn.go` | 1–140 | `C`, `New()`, `Connect()`, `wrapClientErr()` | SMTP connection wrapper: zero-timeout dialer, error classification |
 | `internal/log/log.go` | 1–208 | `Logger`, `Msg()`, `Error()`, `Debugf()`, `Debugln()`, `formatMsg()`, `fieldsToMap()` | Structured logging: message formatting, JSON field assembly |
