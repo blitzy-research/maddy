@@ -104,6 +104,8 @@ submission tcp://127.0.0.1:1587 {
 }
 ```
 
+> ⚠️ **WARNING — LOCAL TESTING ONLY:** This test configuration enables `insecure_auth`, which permits plaintext password transmission over unencrypted connections. This directive must **NEVER** be used in production. In production deployments, use TLS-secured submission (`tls://0.0.0.0:465`) so that authentication credentials are always transmitted over an encrypted channel. See `docs/tutorials/setting-up.md` for production configuration guidance.
+
 **Critical design choice:** The `source $(local_domains)` routing and `default_source { reject ... }` directives are kept **unchanged** from the default `maddy.conf` (lines 93–120) to test default behavior accurately.
 
 ### DKIM Key Generation
@@ -340,7 +342,7 @@ The following headers were extracted **verbatim** from the delivered message in 
 ```
 Delivered-To: user2@test.local
 Return-Path: <user1@test.local>
-Dkim-Signature: a=rsa-sha256;
+DKIM-Signature: a=rsa-sha256;
  bh=xOThv44E5AUZmBooSTUZ7+R91PnSt8HpEnty+kU/AuE=; c=relaxed/relaxed;
  d=test.local;
  h=Subject:Subject:Sender:To:To:Cc:From:From:Date:Date:MIME-Version:Content-Type:Content-Transfer-Encoding:Reply-To:In-Reply-To:Message-Id:Message-Id:References:Autocrypt:Openpgp; i=user1@test.local; s=default; t=1775762116; v=1; x=1776194116; b=EQBvPQx5a9TpKnxi1Xnxbq8BAL2JzUMZ/NZHpZ7t78GVOKVKmAyZVKLR9Ck/Ae/Q+0eh1n857WwV19iqTBHkG+WmXY8YwX2VedJpaV7n7qHR9m2HJbu/iazkctHZ9IrEte1QsBjuBWlAG9XDohJ1FFu89KTU9DGGOHcrcL3Kvoh+f0oKpQwu9LT7+ob4eSKLPCK4+04lofW6rS64LQf3KSkmNTqEd0/CoE9d3SpyBrBt7DV5lEYhSXqwp4ozc4cLExC8hbVUKVdKwr/eTxumTvsjccknXloSX5KF+t8VbDnkJfyeZ6kF7Gh+rWUWEkmgG7CYCXWQbBWJgTFHRJg3nA==;
@@ -459,7 +461,7 @@ Date: Wed, 09 Apr 2025 10:00:00 +0000
 
 **Critical observation: There is NO `DKIM-Signature` header.** The message was delivered but **NOT signed**.
 
-Compare with Test 3's headers, which include the full `Dkim-Signature` header — Test 4's headers have no such field.
+Compare with Test 3's headers, which include the full `DKIM-Signature` header — Test 4's headers have no such field.
 
 ### Debug Log Evidence
 
@@ -505,7 +507,9 @@ cfg.EnumList("require_sender_match", false, false,
 
 The valid enum values are `"envelope"`, `"auth_domain"`, `"auth_user"`, and `"off"`. The default list `["envelope", "auth"]` is stored into a `map[string]struct{}` at lines 166–169, where `senderMatch["envelope"]` and `senderMatch["auth"]` are both set.
 
-**Note on the "auth" value:** The string `"auth"` in the default is distinct from `"auth_domain"` and `"auth_user"` in the enum list. The `shouldSign()` function at line 299 explicitly checks for `m.senderMatch["auth"]`. This means the default activates a match method that requires the From header's local part to equal the authenticated identity (with NFC normalization and case-insensitive comparison).
+**Note on unused enum values:** The `"auth_domain"` and `"auth_user"` enum values are defined as valid configurable options in the `EnumList` declaration at line 151, but they have **no corresponding logic** in the `shouldSign()` function. The function only checks for `senderMatch["envelope"]` (line 293) and `senderMatch["auth"]` (line 299). If an administrator were to configure `require_sender_match auth_domain`, the value would be accepted by the config parser but would have no effect on the signing decision — effectively acting as if that check were disabled. Only `"envelope"`, `"auth"`, and `"off"` have functional code paths.
+
+**Note on the "auth" value:** The string `"auth"` in the default is distinct from `"auth_domain"` and `"auth_user"` in the enum list. The `shouldSign()` function at line 299 explicitly checks for `m.senderMatch["auth"]`. When the authenticated identity (`authName`) contains `@` — which is always the case with Maddy's SQL backend where users are stored as `user@domain` — the comparison uses the **full From address** (normalized via `address.ForLookup()`) compared against the full authenticated identity (with NFC normalization and case-insensitive comparison). The local-part-only comparison is a fallback path that only activates when `authName` does NOT contain `@` (e.g., with non-email-style auth backends). Source: `dkim.go:299-310`.
 
 ### Complete `shouldSign()` Decision Tree (Confirmed by Runtime)
 
@@ -528,10 +532,12 @@ flowchart TD
     M -->|No| N["❌ SKIP<br>'From address is not<br>envelope address'"]
     M -->|Yes| O{"'auth' in<br>senderMatch?"}
     L -->|No| O
-    O -->|Yes| P{"From user ==<br>AuthUser?<br>(NFC, case-insensitive)"}
+    O -->|Yes| P{"From addr ==<br>AuthIdentity?<br>(full address when @ present,<br>NFC, case-insensitive)"}
     P -->|No| Q["❌ SKIP<br>'From address is not<br>authenticated identity'"]
-    P -->|Yes| R["✅ SIGN"]
-    O -->|No| R
+    P -->|Yes| S{"Non-EAI msg?<br>IDNA conversion<br>needed?"}
+    O -->|No| S
+    S -->|"EAI or ASCII domain"| R["✅ SIGN"]
+    S -->|"IDNA conversion fails"| T["❌ SKIP<br>'cannot convert From<br>domain into A-labels'"]
 
     style C fill:#2d6a2e,color:#fff
     style R fill:#2d6a2e,color:#fff
@@ -541,7 +547,10 @@ flowchart TD
     style K fill:#8b1a1a,color:#fff
     style N fill:#8b1a1a,color:#fff
     style Q fill:#8b1a1a,color:#fff
+    style T fill:#8b1a1a,color:#fff
 ```
+
+> **Note on IDNA edge case:** After all sender match checks pass, `shouldSign()` performs a final IDNA conversion step for non-EAI messages (lines 314–326). If the From domain cannot be converted to ASCII A-labels via `idna.ToASCII()`, signing is skipped. For standard ASCII domains like `test.local`, this step always succeeds and has no observable effect. It would only trigger for internationalized domain names in non-EAI SMTP sessions.
 
 **Runtime confirmation:**
 
@@ -598,7 +607,9 @@ flowchart TD
     style F fill:#8b1a1a,color:#fff
 ```
 
-This is a **domain-only** check: line 174 calls `address.Split(cleanFrom)` to extract the domain, then line 190 looks up `dd.d.perSource[domain]`. If the domain matches any `source` block, the message proceeds — regardless of which user authenticated.
+This is a **domain-only** check in the default configuration: line 174 calls `address.Split(cleanFrom)` to extract the domain, then line 190 looks up `dd.d.perSource[domain]`. If the domain matches any `source` block, the message proceeds — regardless of which user authenticated.
+
+> **Note:** `srcBlockForAddr()` actually supports full-address matching as well — it first attempts a complete address lookup at `dd.d.perSource[cleanFrom]` (line 171) before falling back to domain-only matching. However, in the default `maddy.conf`, the `source $(local_domains)` directive only populates the `perSource` map with domain entries, so the full-address match path is never triggered. Administrators could configure per-address source blocks for finer-grained control if needed.
 
 **Runtime evidence:** Test 1 shows `user2@test.local` accepted when authenticated as `user1@test.local` because the domain `test.local` matches. Test 2 shows `user1@external.com` rejected because `external.com` has no matching source block.
 
