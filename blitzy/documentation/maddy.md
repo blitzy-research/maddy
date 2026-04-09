@@ -7,7 +7,7 @@
 A colleague described how the maddy mail server tracks recipient address rewrites during message delivery. Their explanation contained four specific claims:
 
 1. **"When aliases rewrite addresses, the system maintains a 'forward mapping' that stores what each original address was transformed into."**
-2. **"You can look up `user@domain.com` and find it became `alias@domain.com`."**
+2. **"You can look up `user@example.com` and find it became `alias@example.com`."**
 3. **"This mapping is built incrementally by each modifier as it runs, creating a chain of all intermediate transformations."**
 4. **"Something about using this for bounces."**
 
@@ -57,14 +57,14 @@ The comment at lines 80–88 defines the field's purpose and direction unambiguo
 
 This means the direction is:
 
-```
+```go
 OriginalRcpts[finalAddress] = originalAddress
 ```
 
-For example, if a client sends to `user@domain.com` and modifiers rewrite it to `alias@domain.com`, the map entry is:
+For example, if a client sends to `user@example.com` and modifiers rewrite it to `alias@example.com`, the map entry is:
 
-```
-OriginalRcpts["alias@domain.com"] = "user@domain.com"
+```go
+OriginalRcpts["alias@example.com"] = "user@example.com"
 ```
 
 You look up the **final** address and get back the **original**. This is a **reverse mapping** — the opposite of what the colleague described.
@@ -76,7 +76,7 @@ The `MsgMetadata` struct (line 55) is the shared message metadata object that fl
 - The pipeline orchestrator (`internal/msgpipeline/`) can populate it after running modifiers
 - The queue (`internal/target/queue/`) can read it when generating DSN bounce messages
 - The LMTP status reporting layer can read it when reverse-translating addresses for per-recipient status reports
-- The `DeepCopy` method at line 112 ensures the map is properly handled when metadata is duplicated
+- The `DeepCopy` method at line 112 copies the metadata struct (note: the map reference is shared, not independently deep-copied)
 
 **Source:** `internal/module/msgmetadata.go`, lines 55, 112
 
@@ -276,11 +276,12 @@ Critically, by the time the DSN serializer receives `RecipientInfo`, the address
 
 ### Codebase-Wide Evidence
 
-A grep for `OriginalRcpts` across all `.go` files yields exactly **18 occurrences** across **5 files**:
+A grep for `OriginalRcpts` across all `.go` files yields exactly **18 occurrences** across **6 files**:
 
 | File | Occurrences | Role |
 |------|-------------|------|
 | `internal/module/msgmetadata.go` | 2 | Field definition and comment |
+| `internal/module/modifier.go` | 1 | Interface contract comment |
 | `internal/msgpipeline/msgpipeline.go` | 4 | Initialization, population, and statusCollector usage |
 | `internal/msgpipeline/modifier_test.go` | 8 | Test assertions verifying the mapping |
 | `internal/target/queue/queue.go` | 2 | DSN emission reverse-translation |
@@ -294,7 +295,7 @@ A grep for `OriginalRcpts` across all `.go` files yields exactly **18 occurrence
 
 ### Rationale: The Bounce Problem
 
-When a message is forwarded through an alias (e.g., `user@domain.com` → `alias@internal.com`) and delivery fails, the bounce message (DSN) must be sent back to the original sender. The bounce must reference the address the sender originally used (`user@domain.com`), not the internal alias (`alias@internal.com`). Disclosing internal aliases in bounce messages is a privacy violation.
+When a message is forwarded through an alias (e.g., `user@example.com` → `alias@internal.example.com`) and delivery fails, the bounce message (DSN) must be sent back to the original sender. The bounce must reference the address the sender originally used (`user@example.com`), not the internal alias (`alias@internal.example.com`). Disclosing internal aliases in bounce messages is a privacy violation.
 
 `OriginalRcpts` solves this problem by providing a reverse lookup: given the final (internal) address, recover the original (external) address.
 
@@ -406,11 +407,11 @@ flowchart TD
 - The assignment at `internal/msgpipeline/msgpipeline.go`, line 289, writes `OriginalRcpts[to] = originalTo` where `to` is the final address after all rewrites.
 - The lookup at `internal/target/queue/queue.go`, line 885, reads `originalRcpt := meta.MsgMeta.OriginalRcpts[rcpt]` where `rcpt` is the final address.
 
-### Claim 2: "Look Up `user@domain.com` and Find It Became `alias@domain.com`"
+### Claim 2: "Look Up `user@example.com` and Find It Became `alias@example.com`"
 
 **What was claimed:** You supply the original address as the key and retrieve the alias it was transformed into.
 
-**What the code actually does:** The lookup is inverted. You supply `alias@domain.com` (the final address) as the key and retrieve `user@domain.com` (the original) as the value.
+**What the code actually does:** The lookup is inverted. You supply `alias@example.com` (the final address) as the key and retrieve `user@example.com` (the original) as the value.
 
 **Evidence:**
 - `internal/target/queue/queue.go`, line 885: `originalRcpt := meta.MsgMeta.OriginalRcpts[rcpt]` — `rcpt` is the final address, `originalRcpt` is the original.
@@ -563,7 +564,7 @@ All tests pass, confirming every behavior documented above.
 | `internal/msgpipeline/modifier_test.go` | 253–297, 299–352 | Tests for single and chained modifier `OriginalRcpts` mapping |
 | `internal/msgpipeline/bodynonatomic_test.go` | 50–90 | Test for LMTP status reverse-translation via `statusCollector` |
 | `internal/target/queue/queue_test.go` | 746–818 | Test for DSN bounce address reverse-translation |
-| `internal/testutils/modifier.go` | 12–105 | Mock modifier with configurable `RcptTo` map |
+| `internal/testutils/modifier.go` | 12–104 | Mock modifier with configurable `RcptTo` map |
 | `internal/testutils/target.go` | (full file) | Mock delivery target with partial delivery support |
 | `HACKING.md` | (full file) | Developer guide with module architecture overview |
 | `internal/README.md` | (full file) | Package directory structure guide |
