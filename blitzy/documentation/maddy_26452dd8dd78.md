@@ -9,7 +9,7 @@
 This review examines two adversarial SMTP scenarios against the maddy mail server and renders a definitive security verdict for each.
 
 **Question 1 — Dot-Stuffing / Message Boundary Behavior:**
-Maddy correctly handles a bare `.\r\n` appearing mid-message-body. Go's `net/textproto.DotReader()` implements the RFC 5321 §4.5.2 transparency procedure as a state machine that treats any `.\r\n` on a line by itself as the end-of-data marker, returning `io.EOF`. If a non-compliant sending client places a bare `.\r\n` in the body without proper dot-stuffing (i.e., without doubling the dot to `..`), `DotReader` interprets it as the end-of-data signal and the message is truncated at that point. After `Session.Data()` returns, `go-smtp`'s `handleData()` drains any remaining data via `io.Copy(ioutil.Discard, r)` (Source: go-smtp conn.go:521) and then calls `c.reset()` via a deferred call (Source: go-smtp conn.go:513), ensuring the TCP connection returns cleanly to command mode. **The system fails safely** — the message is either accepted complete (if properly dot-stuffed) or accepted truncated (if not), and the connection is never left in a corrupted state.
+Maddy correctly handles a bare `.\r\n` appearing mid-message-body. Go's `net/textproto.DotReader()` implements the RFC 5321 §4.5.2 transparency procedure as a state machine that treats any `.\r\n` on a line by itself as the end-of-data marker, returning `io.EOF`. If a non-compliant sending client places a bare `.\r\n` in the body without proper dot-stuffing (i.e., without doubling the dot to `..`), `DotReader` interprets it as the end-of-data signal and the message is truncated at that point. After `Session.Data()` returns, `go-smtp`'s `handleData()` calls `io.Copy(ioutil.Discard, r)` (Source: go-smtp conn.go:521) — however, because `DotReader` has already returned `io.EOF` at the early `.\r\n`, this drain is a **no-op** (it reads zero bytes). Any residual body data between the early dot and the client's intended terminator remains in the TCP read buffer and will be parsed as SMTP commands by the next `ReadLine()` call. In practice, these residual lines are not valid SMTP commands, so `go-smtp`'s `unrecognizedCommand()` handler (Source: go-smtp conn.go:77-84) responds with `500` errors and closes the connection after 4 unrecognized commands (`nbrErrors > 3`). The deferred `c.reset()` (Source: go-smtp conn.go:512) clears per-transaction state. **The system fails safely** — the message is either accepted complete (if properly dot-stuffed) or accepted truncated (if not), and the residual data injection is self-inflicted by the sender on their own connection, mitigated by error-counting connection closure.
 
 **Question 2 — Authentication State Persistence Across RSET:**
 Authentication state persists immutably across RSET. When a client authenticates, `newSession()` creates a `ConnState` with `AuthUser` set to the authenticated username (Source: internal/endpoint/smtp/smtp.go:680). This field is set **once** and never modified. `go-smtp`'s `Conn.reset()` (Source: go-smtp conn.go:694-703) preserves the session object — it only clears per-transaction flags (`fromReceived`, `recipients`) and calls `session.Reset()`, which in maddy only aborts any in-progress delivery and clears per-message state (Source: internal/endpoint/smtp/smtp.go:60-65). After RSET, a new `MAIL FROM` reuses the same session, and `startDelivery()` creates a new `MsgMetadata` with `Conn: &s.connState` (Source: internal/endpoint/smtp/smtp.go:86), binding the **original** authenticated identity to the new message. The submission endpoint's pipeline configuration additionally rejects non-local sender domains (Source: maddy.conf:117-119). **The system fails safely** — identity confusion is not possible.
@@ -44,11 +44,13 @@ This is a **pinned pre-release commit**, not a stable tagged release. The versio
 
 The `DotReader()` behavior described in this document is stable across Go versions from 1.0 onward. The state machine semantics have not changed since the initial Go release.
 
+> **Note on stdlib line number citations:** Go standard library source line numbers cited in this document (e.g., for `DotReader()`, `closeDot()`) are approximate references based on Go 1.13 and may vary across Go releases. All stdlib references in this document cite by **function name** as the stable identifier; line numbers are provided only as navigational aids.
+
 ---
 
 ## 3. Question 1: SMTP Message Boundary Behavior (Dot-Stuffing Edge Case)
 
-**Plain-language summary:** When a client sends message data containing a line with only a single period, does the server truncate the message, continue reading, or leave the connection in a broken state? The answer: the message is truncated at that point (correct per RFC 5321), any residual data is safely drained, and the connection remains clean.
+**Plain-language summary:** When a client sends message data containing a line with only a single period, does the server truncate the message, continue reading, or leave the connection in a broken state? The answer: the message is truncated at that point (correct per RFC 5321). Any residual data after the early dot remains in the TCP buffer and is parsed as (invalid) SMTP commands, triggering `500` error responses. The connection is terminated by `go-smtp`'s error-counting mechanism after 4 unrecognized commands. Because the sender controls their own connection, this is a self-inflicted condition with no cross-session security impact.
 
 ### 3.1 The Scenario
 
@@ -106,10 +108,11 @@ sequenceDiagram
     MaddyData->>Delivery: delivery.Body(ctx, header, buf)
     MaddyData->>Delivery: delivery.Commit(ctx)
     MaddyData-->>GoSMTP: return nil (success)
-    GoSMTP->>DotReader: io.Copy(ioutil.Discard, r) — DRAIN residual data
-    Note over GoSMTP: Consumes everything up to real .\r\n<br/>Prevents command injection
+    GoSMTP->>DotReader: io.Copy(ioutil.Discard, r) — drain attempt
+    Note over GoSMTP: DotReader already returned EOF → drain is a NO-OP<br/>Residual data remains in TCP buffer
     GoSMTP->>GoSMTP: c.reset() — clear transaction state
     GoSMTP->>Client: WriteResponse(250, "OK")
+    Note over GoSMTP,Client: Residual body lines parsed as SMTP commands<br/>→ 500 errors → nbrErrors > 3 → connection closed
 ```
 
 #### Layer 1: go-smtp `handleData()` — Connection-Level DATA Handler
@@ -123,26 +126,26 @@ func (c *Conn) handleData(arg string) {
     defer c.reset()                          // ← Deferred: clears transaction state AFTER everything
     r := newDataReader(c)                    // ← Creates DotReader-backed reader
     code, enhancedCode, msg := toSMTPStatus(c.Session().Data(r))  // ← Passes reader to maddy
-    io.Copy(ioutil.Discard, r)               // ← DRAIN: consumes ALL remaining dot-encoded data
+    io.Copy(ioutil.Discard, r)               // ← DRAIN: effective only if DotReader has NOT yet reached .\r\n
     c.WriteResponse(code, enhancedCode, msg) // ← Sends response to client
 }
 ```
 
-**Source:** go-smtp conn.go:498-525
+**Source:** go-smtp conn.go:498-524
 
-The critical safety mechanism is on line 521: `io.Copy(ioutil.Discard, r)`. After `Session.Data()` returns (whether it consumed all the data or not), this call reads and discards everything remaining in the dot-encoded stream up to the actual `.\r\n` terminator. This guarantees that no residual message data leaks into the SMTP command stream.
+Line 521 calls `io.Copy(ioutil.Discard, r)` after `Session.Data()` returns. The comment says "Make sure all the data has been consumed." This drain is effective **only when `Session.Data()` returns early** (e.g., due to an error or size limit) **before `DotReader` reaches `.\r\n`** — in that case, the drain reads and discards the remaining dot-encoded data up to the terminator. However, in the early-dot scenario analyzed in this document, `DotReader` has already encountered `.\r\n` and returned `io.EOF`, entering its terminal `stateEOF` state. Subsequent reads from the `dataReader` (which wraps `DotReader`) immediately return `(0, io.EOF)` — the drain reads **zero bytes** and is a no-op. Any residual body data after the early dot remains in the underlying `bufio.Reader` of the `textproto.Conn` and will be read by the next `ReadLine()` call as if it were SMTP commands.
 
-The `defer c.reset()` on line 513 ensures that per-transaction state (`fromReceived`, `recipients`) is cleared after the DATA command completes, regardless of success or failure.
+The `defer c.reset()` on line 512 ensures that per-transaction state (`fromReceived`, `recipients`) is cleared after the DATA command completes, regardless of success or failure. This means any residual data that happens to parse as a valid SMTP command (e.g., `MAIL FROM:...`) executes in a fresh, reset context.
 
 #### Layer 2: Go stdlib `net/textproto.DotReader()` — RFC 5321 §4.5.2 State Machine
 
-The `newDataReader()` function in go-smtp (Source: go-smtp data.go:51-61) creates a reader that wraps `c.text.DotReader()`. This `DotReader()` is Go's standard library implementation of the dot-decoding state machine.
+The `newDataReader()` function in go-smtp (Source: go-smtp data.go:51-62) creates a reader that wraps `c.text.DotReader()`. This `DotReader()` is Go's standard library implementation of the dot-decoding state machine.
 
 **DotReader behavior:**
 - Reads the incoming TCP byte stream line by line
 - If a line starts with a period and has additional content, the leading period is stripped (un-stuffing)
 - If a line contains **only** a period (`.\r\n`), `DotReader` returns `io.EOF` — signaling end-of-data
-- The internal `closeDot()` method (invoked when the `textproto.Reader` moves to a new reader) drains any remaining dot-encoded data, ensuring the underlying connection is left in a clean state
+- The internal `closeDot()` method (invoked when the `textproto.Reader` moves to a new reader) drains remaining dot-encoded data **only when the `DotReader` was abandoned before reaching `.\r\n`** — for example, if a caller reads partway through the data and then switches to a new reader. In the early-dot scenario where `DotReader` already reached `.\r\n` and returned `io.EOF` normally, `closeDot()` finds `r.dot == nil` and returns immediately — no draining occurs
 
 **Key insight:** `DotReader` makes no distinction between a "legitimate" end-of-data marker and an "early" one. Every `.\r\n` on a line by itself is treated as EOF. This is correct behavior per RFC 5321 — the dot-stuffing protocol makes the sender responsible for escaping periods.
 
@@ -175,8 +178,23 @@ The client doubles the leading dot on any line starting with a period. For examp
 **Scenario B — Bare `.\r\n` mid-body (non-compliant client):**
 The client sends a bare `.\r\n` without doubling the dot. `DotReader` interprets this as the end-of-data marker and returns `io.EOF`. `ioutil.ReadAll()` in `BufferInMemory()` captures only the bytes before this point. **Result:** The message is accepted but **truncated** at the bare dot-line. The content after the dot is not included in the stored message.
 
-**Scenario C — Data after the early dot (command injection risk):**
-After `DotReader` signals EOF at the early `.\r\n`, any remaining data between that point and the client's intended end-of-data marker is still sitting in the TCP buffer. The `io.Copy(ioutil.Discard, r)` drain in `handleData()` (Source: go-smtp conn.go:521) consumes all of this residual data. The drain reads through the `dataReader`, which is still backed by the original `DotReader` — but since `DotReader` already returned EOF, the drain completes immediately. The subsequent `c.reset()` (deferred at line 513) clears transaction state. **Result:** No command injection is possible. The connection returns cleanly to command mode.
+**Scenario C — Data after the early dot (residual data behavior):**
+After `DotReader` signals EOF at the early `.\r\n`, any remaining data between that point and the client's intended end-of-data marker is still sitting in the underlying `bufio.Reader` of the `textproto.Conn`. The `io.Copy(ioutil.Discard, r)` call in `handleData()` (Source: go-smtp conn.go:521) attempts to drain this data, but it reads through the `dataReader` which wraps the `DotReader`. Since `DotReader` has already entered `stateEOF` and returned `io.EOF`, the drain immediately returns `(0, io.EOF)` — **zero bytes are consumed**. The drain is a no-op in this scenario.
+
+After the drain and the `250 OK` response, `go-smtp` calls `c.text.ReadLine()` to read the next SMTP command. This reads from the same `bufio.Reader` that still contains the residual body data. Each residual line is dispatched to `c.handle()` as if it were an SMTP command:
+
+- Residual body text (e.g., `This text appears after the early dot...`) → not a valid SMTP verb → dispatched to `c.unrecognizedCommand()` → `500 5.5.2 Syntax error` response, `nbrErrors` incremented
+- The client's intended `.\r\n` terminator → parsed as literal `.` → also unrecognized → `500` response, `nbrErrors` incremented
+
+**Mitigation mechanisms:**
+
+1. **Error-counting connection closure** (Source: go-smtp conn.go:77-84): `unrecognizedCommand()` increments `c.nbrErrors` on each unrecognized command. When `nbrErrors > 3` (i.e., after 4 unrecognized commands), go-smtp sends `500 Too many unrecognized commands` and calls `c.Close()`, terminating the connection. This limits the window during which residual data is parsed.
+
+2. **Self-inflicted condition:** The sender controls their own connection. The residual data was sent by the same client — this is not a cross-session or cross-user attack vector. An attacker cannot inject commands into another user's session through this mechanism.
+
+3. **Transaction state cleared by `reset()`:** The deferred `c.reset()` (Source: go-smtp conn.go:512) clears `fromReceived` and `recipients` before the residual data is parsed. Even if a residual line happens to parse as a valid SMTP command (e.g., a body line beginning with `MAIL FROM:`), it executes in a clean, reset transaction context — not in the context of the just-completed delivery.
+
+**Result:** There is a brief window where residual body data is parsed as SMTP commands, but the practical security risk is low. The residual lines are overwhelmingly unlikely to be valid SMTP command sequences, the error-counting mechanism closes the connection after at most 4 unrecognized commands, and the sender can only affect their own connection.
 
 ### 3.5 What Ends Up Stored or Queued
 
@@ -201,24 +219,29 @@ To determine which code path was taken on a running instance, examine the follow
 | SMTP response code | `250 2.0.0 OK` | Message was accepted (even if truncated) |
 | Structured log entry | `"msg": "accepted", "msg_id": "<id>"` (Source: smtp.go:334) | Delivery completed successfully |
 | Queue `.body` file size | Smaller than expected full body | Body was truncated at the early `.\r\n` |
-| Subsequent SMTP commands | Succeed normally (e.g., new MAIL FROM) | Connection was not corrupted by residual data |
+| `500` error responses after `250 OK` | `500 5.5.2 Syntax error, <word> command unrecognized` for each residual line | Residual body data was parsed as invalid SMTP commands (drain was a no-op) |
+| Subsequent client SMTP commands | Succeed normally (e.g., new MAIL FROM) if connection was not closed by `nbrErrors > 3` | Connection returned to usable state after residual lines were consumed |
 | No error log entries | Absence of `"DATA error"` log messages | `prepareBody()` and delivery succeeded without error |
 
 **Testing approach:** Use `openssl s_client` or raw TCP (`nc`) to connect to the SMTP port and manually send a DATA payload containing a bare `.\r\n` mid-body. Observe that the server responds `250 OK` after the first dot-line and that the stored message body is truncated. Verify that subsequent SMTP commands on the same connection work normally.
 
 ### 3.7 Security Assessment
 
-**Verdict: The system fails safely.**
+**Verdict: The system fails safely, with caveats.**
 
-Three independent safety mechanisms prevent security compromise:
+Four independent safety mechanisms limit the impact of the early-dot scenario:
 
-1. **DotReader returns EOF at `.\r\n`** — This is correct RFC 5321 behavior. The dot-stuffing protocol places the responsibility for escaping on the sender. A bare `.\r\n` is defined as end-of-data by the standard.
+1. **DotReader returns EOF at `.\r\n`** — This is correct RFC 5321 behavior. The dot-stuffing protocol places the responsibility for escaping on the sender. A bare `.\r\n` is defined as end-of-data by the standard. Message truncation at this point is the correct server behavior.
 
-2. **`handleData()` drains unconsumed data** — The `io.Copy(ioutil.Discard, r)` call (Source: go-smtp conn.go:521) ensures that all remaining dot-encoded content is consumed before the connection returns to command mode. This prevents SMTP command injection.
+2. **Error-counting connection closure** (Source: go-smtp conn.go:77-84) — When residual body data is parsed as SMTP commands, `go-smtp`'s `unrecognizedCommand()` handler increments `c.nbrErrors` for each invalid command. After 4 unrecognized commands (`nbrErrors > 3`), the server sends `500 Too many unrecognized commands` and closes the connection via `c.Close()`. This limits the window during which residual data is interpreted as commands.
 
-3. **`reset()` clears transaction state** — The deferred `c.reset()` (Source: go-smtp conn.go:513) clears `fromReceived` and `recipients`, ensuring a clean slate for the next SMTP transaction.
+3. **`reset()` clears transaction state** — The deferred `c.reset()` (Source: go-smtp conn.go:512) clears `fromReceived` and `recipients` before any residual data is parsed as commands, ensuring that even if a residual line coincidentally matches a valid SMTP command, it executes in a clean context.
 
-**Risk:** Message truncation may occur with non-compliant clients that fail to dot-stuff their output. This is a correctness issue for the client, not a security vulnerability in the server. The server's behavior is fully compliant with RFC 5321 §4.5.2.
+4. **Self-inflicted condition** — The sender controls their own connection. The residual data originates from the same client that sent the early dot. This is not a cross-session attack vector — an attacker cannot use this mechanism to inject commands into another user's SMTP session.
+
+**Important clarification on the `io.Copy(ioutil.Discard, r)` drain:** The drain at go-smtp conn.go:521 is designed to consume remaining dot-encoded data when `Session.Data()` returns early (e.g., due to an error or message size limit) **before** `DotReader` reaches `.\r\n`. In that case, the drain is effective and prevents residual data from leaking into the command stream. However, in the specific early-dot scenario analyzed here, `DotReader` has already returned `io.EOF`, so the drain is a no-op — it reads zero bytes.
+
+**Risk:** Message truncation occurs with non-compliant clients that fail to dot-stuff their output — this is a correctness issue for the client, not a security vulnerability in the server. There is a brief window where residual body data is parsed as SMTP commands, but the practical risk is low: the residual lines are unlikely to form valid SMTP command sequences, the error-counting mechanism closes the connection quickly, and the sender can only affect their own session.
 
 ---
 
@@ -292,7 +315,7 @@ The `ConnState.AuthUser` field (Source: internal/module/msgmetadata.go:37) is se
 
 **Step 4: go-smtp binds the session to the connection**
 
-After `Login()` returns, `go-smtp`'s `handleAuth()` calls `c.SetSession(session)` (Source: go-smtp conn.go:163-167), binding the maddy `Session` object to the `Conn`. This session persists for the lifetime of the connection (or until `Logout()` is called).
+After `Login()` returns, the SASL PLAIN callback function — registered in `go-smtp`'s `NewServer()` (Source: go-smtp server.go:95) — calls `conn.SetSession(session)` (Source: go-smtp conn.go:162-167), binding the maddy `Session` object to the `Conn`. This callback is invoked during `handleAuth()`'s SASL negotiation flow (Source: go-smtp conn.go:393-467), but `SetSession()` is called from the callback, not directly from `handleAuth()` itself. The session persists for the lifetime of the connection (or until `Logout()` is called).
 
 ```mermaid
 sequenceDiagram
@@ -401,7 +424,7 @@ When the client issues `MAIL FROM:<admin@example.org>` after RSET, the following
 
 **Step 1: go-smtp `handleMail()` checks for an existing session**
 
-Source: go-smtp conn.go:257-349
+Source: go-smtp conn.go:257-360
 
 ```
 func (c *Conn) handleMail(arg string) {
@@ -560,10 +583,13 @@ stateDiagram-v2
 | Layer | Mechanism | What It Prevents |
 |-------|-----------|-----------------|
 | 1. `DotReader` EOF | Returns `io.EOF` at `.\r\n` (RFC 5321 behavior) | Ensures deterministic message boundary detection |
-| 2. `handleData()` drain | `io.Copy(ioutil.Discard, r)` after `Session.Data()` returns | Prevents residual message data from being interpreted as SMTP commands |
-| 3. `reset()` cleanup | Deferred `c.reset()` clears transaction state | Ensures clean slate for next SMTP transaction |
+| 2. Error-counting closure | `unrecognizedCommand()` closes connection after 4 invalid commands (`nbrErrors > 3`, Source: go-smtp conn.go:77-84) | Limits the window during which residual body data is parsed as SMTP commands |
+| 3. `reset()` cleanup | Deferred `c.reset()` clears transaction state before residual data is parsed | Ensures any accidentally-valid commands execute in a clean, reset context |
+| 4. Self-infliction | Sender controls their own connection; residual data comes from the same client | Prevents cross-session or cross-user command injection |
 
-**Worst case:** A non-compliant client's message is truncated. This is correct server behavior — the dot-stuffing protocol makes the sender responsible for escaping. No data corruption, no command injection, no connection state pollution.
+**Note on the `io.Copy(ioutil.Discard, r)` drain:** The drain (Source: go-smtp conn.go:521) is effective when `Session.Data()` returns early before `DotReader` reaches `.\r\n` (e.g., due to a processing error or size limit). In the early-dot scenario, `DotReader` has already returned EOF, so the drain is a no-op.
+
+**Worst case:** A non-compliant client's message is truncated (correct server behavior per RFC 5321). Residual body data after the early dot is briefly parsed as SMTP commands, generating `500` error responses. After at most 4 unrecognized commands, the connection is closed. The sender can only affect their own session.
 
 ### 5.2 Authentication State: Does the System Fail Safely?
 
@@ -614,18 +640,33 @@ This is the first part of the body.
 .
 This text appears after the early dot and should be discarded.
 .
-250 2.0.0 OK
 ```
+
+**Expected output after the first `.\r\n`:**
+
+The server processes the data up to the first bare dot-line and responds. Because the `io.Copy(Discard, r)` drain is a no-op (DotReader already returned EOF), the residual lines are parsed as SMTP commands. You should see output similar to:
+
+```
+250 2.0.0 OK
+500 5.5.2 Syntax error, This command unrecognized
+500 5.5.2 Syntax error, . command unrecognized
+```
+
+The `250 OK` confirms the truncated message was accepted. The `500` errors are generated by `go-smtp`'s `unrecognizedCommand()` handler (Source: go-smtp conn.go:77-84) as it parses the residual body lines as invalid SMTP commands. In this example, only 2 residual lines exist, so `nbrErrors` reaches 2 — below the threshold of `> 3` needed to close the connection. The connection remains open for further commands.
+
+> **Note:** If the residual data contains more than 3 lines, the 4th unrecognized command triggers `500 Too many unrecognized commands` followed by connection closure.
 
 **Expected observations:**
 
-1. **Server responds `250 OK` after the FIRST `.\r\n`** — The `DotReader` treats the first bare dot-line as end-of-data. The text `This text appears after the early dot...` followed by the second `.\r\n` is consumed by the `io.Copy(Discard, r)` drain.
+1. **Server responds `250 OK` after the FIRST `.\r\n`** — The `DotReader` treats the first bare dot-line as end-of-data. The truncated message is accepted and delivered.
 
-2. **Stored message body is truncated** — Inspect the queue `.body` file or the delivered message in the mailbox. The body should contain only `This is the first part of the body.\r\n` — nothing after the early dot.
+2. **`500` error responses follow the `250 OK`** — Residual body lines after the early dot are parsed as SMTP commands. Each unrecognized line produces a `500 Syntax error` response. This is the observable evidence that the drain did **not** consume the residual data.
 
-3. **Connection remains valid** — After the `250 OK` response, issue another `MAIL FROM` command. It should succeed, confirming no connection corruption.
+3. **Stored message body is truncated** — Inspect the queue `.body` file or the delivered message in the mailbox. The body should contain only `This is the first part of the body.\r\n` — nothing after the early dot.
 
-4. **Log output** — Look for a JSON log entry with `"msg": "accepted"` and a `"msg_id"`. No error entries should appear.
+4. **Connection may or may not remain usable** — If fewer than 4 residual lines were parsed, the connection is still open and subsequent SMTP commands succeed. If 4 or more residual lines were parsed, the connection was closed by the `nbrErrors > 3` check.
+
+5. **Log output** — Look for a JSON log entry with `"msg": "accepted"` and a `"msg_id"` (confirming the truncated message was delivered). No `"DATA error"` entries should appear — the delivery itself succeeded.
 
 ### 6.3 Observing Authentication State Persistence
 
@@ -696,10 +737,11 @@ The following table lists every source file cited in this document, with the pur
 | `internal/msgpipeline/msgpipeline.go` | Pipeline orchestration — source/destination routing, Start() | Start(), RunEarlyChecks(), source/destination block routing |
 | `maddy.conf` | Default configuration — SMTP and submission endpoint definitions | 53-91 (SMTP port 25), 93-120 (submission port 465), 95 (auth directive), 97-113 (local source block), 117-119 (default_source reject) |
 | `go.mod` | Go module definition — dependency versions | 1 (module path), 3 (Go 1.13), 19 (go-smtp version) |
-| `go-smtp conn.go` | go-smtp connection handler — handleData, handleAuth, handleMail, reset, SetSession (version: v0.12.1-0.20191206174923-1f576e0ec85c) | 131-133 (RSET handler), 156-167 (Session/SetSession), 257-349 (handleMail, nil check at 263), 393-467 (handleAuth), 498-525 (handleData, drain at 521, defer reset at 513), 694-703 (reset — preserves session) |
-| `go-smtp data.go` | Data reader wrapper — DotReader delegation with size limiting | 51-61 (newDataReader wrapping c.text.DotReader()) |
-| `go-smtp backend.go` | Session interface definition — Reset, Logout, Mail, Rcpt, Data contracts | 45-57 (Session interface) |
-| `net/textproto reader.go` | Go stdlib DotReader — RFC 5321 §4.5.2 state machine (Go >= 1.13) | DotReader() factory, closeDot() drain behavior |
+| `go-smtp conn.go` | go-smtp connection handler — handleData, handleAuth, handleMail, reset, SetSession, unrecognizedCommand (version: v0.12.1-0.20191206174923-1f576e0ec85c) | 77-84 (unrecognizedCommand, nbrErrors>3 closure), 131-133 (RSET handler), 156-160 (Session), 162-167 (SetSession), 257-360 (handleMail, nil check at 263), 393-467 (handleAuth), 498-524 (handleData, drain at 521, defer reset at 512), 694-703 (reset — preserves session) |
+| `go-smtp data.go` | Data reader wrapper — DotReader delegation with size limiting | 51-62 (newDataReader wrapping c.text.DotReader()) |
+| `go-smtp backend.go` | Session interface definition — Reset, Logout, Mail, Rcpt, Data contracts | 41-54 (Session interface) |
+| `go-smtp server.go` | Server initialization — SASL PLAIN callback with SetSession() call | 95 (conn.SetSession(session) in SASL PLAIN callback) |
+| `net/textproto reader.go` | Go stdlib DotReader — RFC 5321 §4.5.2 state machine (Go >= 1.13; line numbers approximate, see Section 2.3 note) | DotReader() factory function, closeDot() drain behavior |
 
 ---
 
