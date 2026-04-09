@@ -94,8 +94,8 @@ The `TimeWheel` (Source: `internal/target/queue/timewheel.go:15-25`) is a concur
 The complete flow from message submission to delivery attempt is:
 
 1. `Commit()` is called on a new message delivery
-2. `TimeWheel.Add(time.Now(), slot)` schedules the message for immediate dispatch
-3. The `tick()` goroutine in TimeWheel fires immediately (target time is now or in the past)
+2. `TimeWheel.Add(time.Time{}, slot)` schedules the message for immediate dispatch (Source: `queue.go:578`). The zero-value `time.Time{}` represents the Go time epoch (year 0001), which is always in the distant past, so the TimeWheel's timer fires immediately.
+3. The `tick()` goroutine in TimeWheel fires immediately (the target time is the zero-value epoch, which is always in the past)
 4. `dispatch()` is called, which launches a new goroutine
 5. The goroutine blocks on the semaphore channel if ≥16 deliveries are already in progress
 6. Once a semaphore slot is acquired, `tryDelivery()` executes the actual delivery
@@ -329,6 +329,7 @@ ok  github.com/foxcpp/maddy/internal/target/queue    1.507s
 | `TestQueueDelivery_PermanentRcptReject` | PASS | Permanent recipient rejection at `AddRcpt` stage |
 | `TestQueueDelivery_TemporaryRcptReject` | PASS | Temporary recipient rejection → retry for rejected recipient |
 | `TestQueueDelivery_SerializationRoundtrip` | PASS | Disk persistence and restart recovery (queue restart loads from disk) |
+| `TestQueueDelivery_DeserlizationCleanUp/NoMeta` | SKIP | Not implemented (skipped via `t.Skip` at `queue_test.go:547`) |
 | `TestQueueDelivery_DeserlizationCleanUp/NoBody` | PASS | Cleanup when body file is missing from disk |
 | `TestQueueDelivery_DeserlizationCleanUp/NoHeader` | PASS | Cleanup when header file is missing from disk |
 | `TestQueueDelivery_AbortIfNoRecipients` | PASS | Abort delivery when all recipients are rejected |
@@ -375,6 +376,6 @@ The following table summarizes the actionable timing numbers derived from this a
 
 ### For End-Users
 
-If you sent a message and the destination server is temporarily refusing delivery, **your bounce notification will arrive approximately 2 days and 16 hours after the first delivery attempt** in the worst case. This is because the queue makes 9 delivery attempts with exponentially increasing delays (15 min, 30 min, 1 hour, 2 hours, 4 hours, 8 hours, 16 hours, 32 hours) before giving up and generating a bounce.
+If you sent a message and the destination server is temporarily refusing delivery, **your bounce notification will arrive approximately 2 days, 15 hours, and 45 minutes (63 hours 45 minutes) after the first delivery attempt** in the worst case. This is because the queue makes 9 delivery attempts with exponentially increasing delays (15 min, 30 min, 1 hour, 2 hours, 4 hours, 8 hours, 16 hours, 32 hours) before giving up and generating a bounce.
 
 The majority of this wait time is concentrated in the final retries — the last retry delay alone is 32 hours. If delivery is going to succeed, it most likely will during the earlier attempts (within the first few hours).
