@@ -91,7 +91,7 @@ The DKIM key lifecycle begins in the `Init()` method of the `Modifier` struct (S
      - `EC PRIVATE KEY` — SEC 1/RFC 5915 (`x509.ParseECPrivateKey`, keys.go:53)
 
 3. **`generateAndWrite`** at `keys.go:77-133` supports three algorithms:
-   - `"rsa4096"` → `rsa.GenerateKey(rand.Reader, 4096)` (keys.go:92-93)
+   - `"rsa4096"` → `rsa.GenerateKey(rand.Reader, 4096)` (keys.go:90-92)
    - `"rsa2048"` → `rsa.GenerateKey(rand.Reader, 2048)` (keys.go:94-95)
    - `"ed25519"` → `ed25519.GenerateKey(rand.Reader)` (keys.go:97)
 
@@ -106,7 +106,7 @@ The DKIM key lifecycle begins in the `Init()` method of the `Modifier` struct (S
    - Written with file permission `0600` (keys.go:121)
 
 6. **Directory creation** (Source: keys.go:112):
-   - Parent directories are created with permission `0777` because they may contain public DNS record files that need wider access
+   - Parent directories are created with permission `0777` because they also contain public keys that don't need protection (as the code comment at keys.go:110-111 states); individual private key files use `0600` permissions
 
 7. **DNS record generation** via `writeDNSRecord` at `keys.go:136-163`
 
@@ -132,7 +132,7 @@ v=DKIM1; k=rsa; p=MIIBCgKCAQEAl43B3fSqm6qEi+IQuH93B3AWHBIclFyU6iuu32xdx6+RBOdhLT
 
 **Rationale:** RSA-2048 public keys have a 256-byte modulus and a 3-byte exponent (65537 = `0x010001`). The PKCS#1 DER encoding (`x509.MarshalPKCS1PublicKey` at `keys.go:143`) wraps these in ASN.1 SEQUENCE + INTEGER structures, producing exactly 270 bytes. Since 270 is evenly divisible by 3 (270 ÷ 3 = 90), the base64 encoding produces exactly 360 characters with **no padding**.
 
-The public key extraction for RSA is performed at `keys.go:141-143`:
+The public key extraction for RSA is performed at `keys.go:142-143`:
 
 ```go
 case *rsa.PublicKey:
@@ -171,7 +171,7 @@ The `ed25519.PublicKey` type in Go is simply `[]byte` of length 32 — no ASN.1 
 keyRecord := fmt.Sprintf("v=DKIM1; k=%s; p=%s", dkimAlgoName, base64.StdEncoding.EncodeToString(keyBlob))
 ```
 
-The `dkimAlgoName` variable is set to `"rsa"` for both `rsa2048` and `rsa4096` algorithms (keys.go:91,94), and remains `"ed25519"` for the Ed25519 algorithm (keys.go:86).
+The `dkimName` variable is set to `"rsa"` for both `rsa2048` and `rsa4096` algorithms (keys.go:91,94), and remains `"ed25519"` for the Ed25519 algorithm (keys.go:86).
 
 ### Key Algorithm Comparison
 
@@ -326,7 +326,7 @@ func (m *Modifier) fieldsToSign(h *textproto.Header) []string {
 - **Loop 2 — Sign-only (lines 221-231):** For each header in `m.signHeader`:
   1. Skip if already seen (same deduplication)
   2. Count occurrences (N) of this header in the message
-  3. Add **exactly N entries** — no extra entry (note the comment at line 231: no oversigning here)
+  3. Add **exactly N entries** — no extra entry (note the absence of an additional `res = append(res, key)` after the inner loop — no oversigning is applied)
   4. If N = 0, **nothing is added** — absent sign-only headers are completely omitted from the signature
 
 Both loops use case-insensitive deduplication via the `seen` map to prevent duplicate entries that would cause a panic in the `go-msgauth` library internals (as noted in the code comment at lines 203-204).
