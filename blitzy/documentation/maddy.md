@@ -110,9 +110,9 @@ When `tryDelivery()` calls `deliver()` (line 431), the queue delegates to the co
    - Creates a new `smtpconn.C` via `smtpconn.New()` (connect.go:121)
    - Sets the dialer from `rt.dialer` (connect.go:125)
    - Performs MX lookup via `lookupMX()` (connect.go:145) which queries DNS, sorts by preference (`records[i].Pref < records[j].Pref`), and falls back to A/AAAA records if no MX records exist (connect.go:240-276)
-   - Iterates MX records by preference (connect.go:154-199), calling `conn.Connect()` for each until one succeeds
+   - Iterates MX records by preference (`internal/target/remote/connect.go:154-199`), calling `conn.Connect()` for each until one succeeds
    - **Per-domain connection caching:** The `rd.connections` map (line 182) means multiple recipients at the same domain share a single SMTP connection
-   - If ALL MX records fail: returns `SMTPError{Code: SMTPCode(err, 451, 550), Message: "No usable MXs, last err: ..."}` (connect.go:204-213)
+   - If ALL MX records fail: returns `SMTPError{Code: SMTPCode(err, 451, 550), Message: "No usable MXs, last err: ..."}` (`internal/target/remote/connect.go:204-213`)
    - Source: `internal/target/remote/connect.go:113-225`
 
 3. **BodyNonAtomic()** (line 400) sends the DATA command to all connections concurrently via goroutines — one goroutine per domain connection.
@@ -240,9 +240,9 @@ Source: `internal/smtpconn/smtpconn.go:57-63`, `internal/target/remote/connect.g
 When all MX connections fail, the error chain is:
 
 1. OS returns a `*net.OpError` (e.g., `dial tcp 192.0.2.1:25: i/o timeout`)
-2. `wrapClientErr()` wraps it as `SMTPError{Code: 450, EnhancedCode: {4,4,2}, Message: "Network I/O error"}` — Source: `smtpconn.go:105-114`
-3. `connectionForDomain()` wraps the last error as `SMTPError{Code: 451, Message: "No usable MXs, last err: ..."}` — Source: `connect.go:204-213`
-4. `deliver()` receives this error from `AddRcpt()`, marks the recipient via `partialErr.SetStatus()` — Source: `queue.go:461-468`
+2. `wrapClientErr()` wraps it as `SMTPError{Code: 450, EnhancedCode: {4,4,2}, Message: "Network I/O error"}` — Source: `internal/smtpconn/smtpconn.go:105-114`
+3. `connectionForDomain()` wraps the last error as `SMTPError{Code: 451, Message: "No usable MXs, last err: ..."}` — Source: `internal/target/remote/connect.go:204-213`
+4. `deliver()` receives this error from `AddRcpt()`, classifies the recipient using inline `exterrors.IsTemporaryOrUnspec(err)` checks and appends to `perr.TemporaryFailed` or `perr.Failed` — Source: `internal/target/queue/queue.go:461-468`
 
 ### 2.3 Error Classification Chain
 
@@ -258,10 +258,12 @@ The error classification determines whether a failed delivery gets retried (temp
 
 3. **`toSMTPErr()`** (queue.go:325-363) converts the error for metadata storage:
    - If `IsTemporaryOrUnspec()` returns true: sets SMTP code 451, enhanced code {4,0,0}
-   - If permanent: sets SMTP code 550, enhanced code {5,0,0}
+   - If permanent: sets SMTP code 554, enhanced code {5,0,0}
    - Source: `internal/target/queue/queue.go:325-363`
 
 **Key design principle:** Errors without an explicit `Temporary()` method are assumed temporary by `IsTemporaryOrUnspec()`, ensuring that unknown errors trigger retries rather than premature message abandonment.
+
+> **Observed codebase behavior — `SMTPEnchCode()` bug:** The function `SMTPEnchCode()` at `internal/exterrors/smtp.go:122-128` contains a bug where `code[0] = 5` (line 126) unconditionally overwrites the conditional `code[0] = 4` (line 124) that was set for temporary errors. This makes the temporary-code branch dead code, so the first digit of the enhanced code is always `5` regardless of whether the error is temporary or permanent. As a result, the `connectionForDomain()` outer error (which passes enhanced code `{0,4,0}`) always produces `{5,4,0}` (formatted as `"5.4.0"` in logs), even when the SMTP code is 451 (temporary). This mismatch between the SMTP code class (4xx = temporary) and the enhanced code prefix (5 = permanent) is visible in structured log output.
 
 ### 2.4 Backoff Calculation
 
@@ -319,10 +321,12 @@ With `max_tries = 2`, the complete sequence is:
 
 On the final attempt (TriesCount == maxTries at line 390):
 
-1. Recipients remaining in `meta.To` (temporarily failed) are logged
-2. Recipients in `meta.FailedRcpts` (permanently failed) are logged as `"not delivered, permanent error"` (line 398)
-3. **`emitDSN()`** is called to generate an RFC 3464 bounce message if there are failed recipients (line 401) — see the DSN/Bounce Generation section
+1. Recipients remaining in `meta.To` (temporarily failed) are logged as `"not delivered, temporary error"` (lines 393-395)
+2. Recipients in `meta.FailedRcpts` (permanently failed) are logged as `"not delivered, permanent error"` (lines 396-398) — however, in the all-timeout scenario, `meta.FailedRcpts` is empty because all failures were temporary, so **no permanent-error log entries are emitted**
+3. The DSN condition at line 400 checks `len(meta.FailedRcpts) + len(meta.TemporaryFailedRcpts) != 0`. In the all-timeout scenario, `meta.FailedRcpts` is empty (only temporary errors occurred) and `meta.TemporaryFailedRcpts` is **always empty** (the field is declared at `queue.go:160` but never populated anywhere in the codebase). Therefore, the condition evaluates to **false** and **no DSN/bounce message is generated** — the message is silently discarded
 4. **`removeFromDisk()`** deletes the `.header`, `.body`, and `.meta` files (line 403)
+
+> **Observed codebase gap:** The `TemporaryFailedRcpts` field in `QueueMetadata` (line 160) appears intended to track recipients that failed with temporary errors for DSN reporting on retry exhaustion. However, it is never assigned anywhere in the codebase (`grep -rn "TemporaryFailedRcpts" --include="*.go"` confirms only declaration and read-site references). As a result, messages that exhaust all retries with only temporary failures are removed from disk without generating a bounce notification to the sender. This is likely an unfinished implementation detail.
 
 Source: `internal/target/queue/queue.go:390-403`
 
@@ -345,7 +349,7 @@ sequenceDiagram
     R->>MX: TCP SYN (net.Dialer, no timeout)
     Note over MX: ~75-130s OS TCP timeout
     MX-->>R: *net.OpError (timeout)
-    R-->>D: SMTPError{450, "Network I/O error"}
+    R-->>D: SMTPError{451, "No usable MXs, last err: ..."}
     Note over D: TriesCount: 0→1, classify as temporary
     D->>D: nextTryTime = now + 15min
     D->>TW: wheel.Add(now+15min, slot{Meta:nil})
@@ -360,7 +364,7 @@ sequenceDiagram
     R->>MX: TCP SYN
     Note over MX: ~75-130s OS TCP timeout
     MX-->>R: *net.OpError (timeout)
-    R-->>D: SMTPError{451, "No usable MXs"}
+    R-->>D: SMTPError{451, "No usable MXs, last err: ..."}
     Note over D: TriesCount: 1→2, classify as temporary
     D->>D: nextTryTime = now + 30min
     D->>TW: wheel.Add(now+30min, slot{Meta:nil})
@@ -375,9 +379,10 @@ sequenceDiagram
     R->>MX: TCP SYN
     Note over MX: ~75-130s OS TCP timeout
     MX-->>R: *net.OpError (timeout)
-    R-->>D: SMTPError{451, "No usable MXs"}
+    R-->>D: SMTPError{451, "No usable MXs, last err: ..."}
     Note over D: TriesCount(2) == maxTries(2) → FINAL FAILURE
-    D->>D: emitDSN() — generate bounce
+    D->>D: Log "not delivered, temporary error"
+    D->>D: No DSN (FailedRcpts + TemporaryFailedRcpts == 0)
     D->>D: removeFromDisk() — delete .header, .body, .meta
     D->>D: Release deliverySemaphore
 ```
@@ -603,32 +608,33 @@ The following shows a realistic complete log output for a message to `user@unrea
 2025-01-15T10:30:00.100Z [debug] queue: waiting on delivery semaphore for a1b2c3d4
 2025-01-15T10:30:00.101Z [debug] queue: delivery semaphore acquired for a1b2c3d4
 2025-01-15T10:30:00.101Z [debug] queue: delivery attempt #1	{"msg_id":"a1b2c3d4"}
-2025-01-15T10:32:10.500Z queue: delivery attempt failed	{"io_op":"dial","msg_id":"a1b2c3d4","rcpt":"user@unreachable.example.com","reason":"dial tcp 192.0.2.1:25: i/o timeout","remote_addr":"192.0.2.1:25","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error"}
+2025-01-15T10:32:10.500Z queue: delivery attempt failed	{"domain":"unreachable.example.com","io_op":"dial","msg_id":"a1b2c3d4","rcpt":"user@unreachable.example.com","reason":"dial tcp 192.0.2.1:25: i/o timeout","remote_addr":"192.0.2.1:25","smtp_code":451,"smtp_enchcode":"5.4.0","smtp_msg":"No usable MXs, last err: dial tcp 192.0.2.1:25: i/o timeout","target":"remote"}
 2025-01-15T10:32:10.510Z queue: will retry	{"attempts_count":1,"msg_id":"a1b2c3d4","next_try_delay":"14m49.49s","rcpts":["user@unreachable.example.com"]}
 
 2025-01-15T10:47:00.000Z [debug] queue: starting delivery for a1b2c3d4
 2025-01-15T10:47:00.001Z [debug] queue: waiting on delivery semaphore for a1b2c3d4
 2025-01-15T10:47:00.001Z [debug] queue: delivery semaphore acquired for a1b2c3d4
 2025-01-15T10:47:00.002Z [debug] queue: delivery attempt #2	{"msg_id":"a1b2c3d4"}
-2025-01-15T10:49:10.300Z queue: delivery attempt failed	{"io_op":"dial","msg_id":"a1b2c3d4","rcpt":"user@unreachable.example.com","reason":"dial tcp 192.0.2.1:25: i/o timeout","remote_addr":"192.0.2.1:25","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error"}
+2025-01-15T10:49:10.300Z queue: delivery attempt failed	{"domain":"unreachable.example.com","io_op":"dial","msg_id":"a1b2c3d4","rcpt":"user@unreachable.example.com","reason":"dial tcp 192.0.2.1:25: i/o timeout","remote_addr":"192.0.2.1:25","smtp_code":451,"smtp_enchcode":"5.4.0","smtp_msg":"No usable MXs, last err: dial tcp 192.0.2.1:25: i/o timeout","target":"remote"}
 2025-01-15T10:49:10.310Z queue: will retry	{"attempts_count":2,"msg_id":"a1b2c3d4","next_try_delay":"29m49.69s","rcpts":["user@unreachable.example.com"]}
 
 2025-01-15T11:19:00.000Z [debug] queue: starting delivery for a1b2c3d4
 2025-01-15T11:19:00.001Z [debug] queue: waiting on delivery semaphore for a1b2c3d4
 2025-01-15T11:19:00.001Z [debug] queue: delivery semaphore acquired for a1b2c3d4
 2025-01-15T11:19:00.002Z [debug] queue: delivery attempt #3	{"msg_id":"a1b2c3d4"}
-2025-01-15T11:21:10.200Z queue: delivery attempt failed	{"io_op":"dial","msg_id":"a1b2c3d4","rcpt":"user@unreachable.example.com","reason":"dial tcp 192.0.2.1:25: i/o timeout","remote_addr":"192.0.2.1:25","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error"}
-2025-01-15T11:21:10.250Z queue: not delivered, permanent error	{"msg_id":"a1b2c3d4","rcpt":"user@unreachable.example.com"}
-2025-01-15T11:21:10.300Z queue: generated failed DSN	{"dsn_id":"e5f6g7h8","msg_id":"a1b2c3d4"}
+2025-01-15T11:21:10.200Z queue: delivery attempt failed	{"domain":"unreachable.example.com","io_op":"dial","msg_id":"a1b2c3d4","rcpt":"user@unreachable.example.com","reason":"dial tcp 192.0.2.1:25: i/o timeout","remote_addr":"192.0.2.1:25","smtp_code":451,"smtp_enchcode":"5.4.0","smtp_msg":"No usable MXs, last err: dial tcp 192.0.2.1:25: i/o timeout","target":"remote"}
+2025-01-15T11:21:10.250Z queue: not delivered, temporary error	{"msg_id":"a1b2c3d4","rcpt":"user@unreachable.example.com"}
 ```
 
 **Notes on the example:**
-- The `"delivery attempt failed"` entry at attempt #3 uses `Logger.Error()`, so it includes all fields from the `SMTPError` (obtained via `exterrors.Fields(err)`) merged with the `"rcpt"` field passed by `tryDelivery()`. All JSON keys are alphabetically sorted.
+- Each `"delivery attempt failed"` entry uses `Logger.Error()` (Source: `internal/log/log.go:89-104`), which merges fields from `exterrors.Fields(err)` (the error chain), adds a `"reason"` field from `err.Error()` if not already present (line 98-100), and merges the `"rcpt"` field passed by `tryDelivery()`. All JSON keys are alphabetically sorted by `marshalOrderedJSON`.
+- The fields shown are from the **outer** `connectionForDomain()` error (Source: `internal/target/remote/connect.go:204-213`), which wraps the inner `wrapClientErr()` error. `exterrors.Fields()` walks the error chain with outer-first-wins semantics (Source: `internal/exterrors/fields.go:37`): the outer error contributes `smtp_code`, `smtp_enchcode`, `smtp_msg`, `target`, and `domain`; the inner error contributes only non-overlapping fields `remote_addr` and `io_op`.
+- The `"smtp_enchcode"` field appears as `"5.4.0"` rather than the expected `"4.4.0"` for a temporary error due to the `SMTPEnchCode()` bug documented in Q2.3 — the enhanced code's first digit is always 5 regardless of the SMTP code class.
 - The `"will retry"` entry shows `"next_try_delay"` as a `time.Duration` formatted via `.String()` (e.g., `"14m49.49s"`).
 - The `~2 minutes` gap between "delivery attempt #N" and "delivery attempt failed" represents the TCP SYN timeout to the unreachable host.
 - Debug entries (`[debug]` prefix) from `dispatch()` use `q.Log` directly (not `DeliveryLogger`) and therefore do **not** include a JSON payload when the logger has no base `Fields`.
 - Entries from `tryDelivery()` use `DeliveryLogger` and always include `{"msg_id":"..."}`.
-- The `"smtp_enchcode"` field appears as `"4.4.2"` (a string) because `EnhancedCode.FormatLog()` returns `fmt.Sprintf("%d.%d.%d", ...)`.
+- On the final attempt (attempt #3), retries are exhausted (TriesCount == maxTries). The recipient in `meta.To` is logged as `"not delivered, temporary error"` (Source: `internal/target/queue/queue.go:393-395`). No DSN/bounce is generated because both `meta.FailedRcpts` and `meta.TemporaryFailedRcpts` are empty (see Q2.6 for details). The message is then silently removed from disk via `removeFromDisk()`.
 
 ---
 
@@ -718,8 +724,8 @@ The `.meta` file contains a JSON-encoded `QueueMetadata` struct (`queue.go:149-1
   "RcptErrs": {
     "user@unreachable.example.com": {
       "Code": 451,
-      "EnhancedCode": [4, 0, 0],
-      "Message": "dial tcp 192.0.2.1:25: i/o timeout"
+      "EnhancedCode": [5, 4, 0],
+      "Message": "No usable MXs, last err: dial tcp 192.0.2.1:25: i/o timeout"
     }
   },
   "TriesCount": 1,
@@ -736,7 +742,7 @@ The `.meta` file contains a JSON-encoded `QueueMetadata` struct (`queue.go:149-1
 | `From` | `string` | Envelope sender (MAIL FROM address) |
 | `To` | `[]string` | Remaining recipients for the next delivery attempt |
 | `FailedRcpts` | `[]string` | Recipients that permanently failed (accumulated across retries) |
-| `TemporaryFailedRcpts` | `[]string` | Recipients that temporarily failed (for DSN reporting) |
+| `TemporaryFailedRcpts` | `[]string` | Recipients that temporarily failed (for DSN reporting). **(Note: this field is declared at `queue.go:160` but never populated anywhere in the current codebase — it is always empty on disk. See Q2.6 for the impact on DSN generation.)** |
 | `RcptErrs` | `map[string]*smtp.SMTPError` | Per-recipient error details as serialized `SMTPError` objects |
 | `TriesCount` | `int` | Number of delivery attempts already completed |
 | `FirstAttempt` | `time.Time` | Timestamp of the first delivery attempt (RFC 3339 JSON encoding) |
@@ -771,7 +777,7 @@ On server restart, `readDiskQueue()` (`queue.go:622-688`) scans the queue direct
        q.initialRetryTime * time.Duration(math.Pow(q.retryTimeScale, float64(meta.TriesCount-1)))
    )
    ```
-5. Applies `postInitDelay` (default 10 seconds): if the calculated retry time is in the past, it is clamped to `now + postInitDelay` (lines 672-674). This prevents a thundering herd of immediate deliveries after a restart.
+5. Applies `postInitDelay` (default 10 seconds): if the calculated retry time is less than `postInitDelay` (default 10 seconds) away from now — i.e., `time.Until(nextTryTime) < q.postInitDelay` — it is clamped to `now + postInitDelay` (lines 672-674). This covers both past retry times and near-future retry times, preventing a thundering herd of immediate deliveries after a restart.
 6. Adds each recovered message to the TimeWheel with `Meta: nil` (data will be re-read from disk on dispatch)
 
 Source: `internal/target/queue/queue.go:622-688`
@@ -821,12 +827,12 @@ type TimeSlot struct {
 }
 
 type TimeWheel struct {
+    stopped      uint32               // Checked via atomic.LoadUint32(); 1 = stopped
     slots        *list.List           // Linked list of TimeSlot elements
-    slotsLk      sync.Mutex
+    slotsLock    sync.Mutex           // Protects slots list during Add()
     updateNotify chan time.Time        // Wakes tick() when new slot is added
     stopNotify   chan struct{}         // Signals tick() to exit
-    dispatch     func(slot TimeSlot)  // Callback invoked for each due message
-    stopped      bool
+    dispatch     func(TimeSlot)       // Callback invoked for each due message
 }
 ```
 
@@ -1245,9 +1251,11 @@ stateDiagram-v2
 
     Success --> [*]: removeFromDisk()<br/>.header, .body, .meta deleted
 
-    PermanentFailure --> DSNGeneration: emitDSN() if configured
+    PermanentFailure --> DSNGeneration: emitDSN() if<br/>FailedRcpts non-empty
 
-    Exhausted --> DSNGeneration: emitDSN() if configured
+    Exhausted --> DSNGeneration: emitDSN() if<br/>FailedRcpts + TemporaryFailedRcpts non-empty
+
+    Exhausted --> [*]: Silent discard via removeFromDisk()<br/>when FailedRcpts + TemporaryFailedRcpts == 0<br/>(all-temporary exhaustion, no DSN)
 
     DSNGeneration --> [*]: removeFromDisk()<br/>.header, .body, .meta deleted
 
@@ -1302,13 +1310,13 @@ All source code references in this document point to files within the maddy repo
 
 | File | Lines | Key Contents |
 |------|-------|-------------|
-| `internal/msgpipeline/msgpipeline.go` | ~100 | MsgPipeline struct (26-32), Start method with checks and routing (79-100) |
+| `internal/msgpipeline/msgpipeline.go` | ~545 | MsgPipeline struct (26-32), Start method with checks and routing (79-100) |
 
 ### SMTP Endpoint
 
 | File | Lines | Key Contents |
 |------|-------|-------------|
-| `internal/endpoint/smtp/smtp.go` | ~350 | Session struct (35-58), startDelivery with GenerateMsgID (83-160), Mail (162-179), Rcpt (208-245), Data with Body+Commit (312-344) |
+| `internal/endpoint/smtp/smtp.go` | ~720 | Session struct (35-58), startDelivery with GenerateMsgID (83-160), Mail (162-179), Rcpt (208-245), Data with Body+Commit (312-344) |
 
 ### Logging Subsystem
 
