@@ -172,10 +172,10 @@ This is where the heavy lifting happens:
 1. **Wrap in buffered reader:** `bufr := bufio.NewReader(r)` — wraps the `dataReader` in a `bufio.Reader` for efficient reading.
    > Source: `internal/endpoint/smtp/smtp.go:284`
 
-2. **Parse MIME headers:** `hdr, err := textproto.ReadHeader(bufr)` — reads RFC 822 headers from the stream until the blank line separator.
+2. **Parse MIME headers:** `header, err := textproto.ReadHeader(bufr)` — reads RFC 822 headers from the stream until the blank line separator.
    > Source: `internal/endpoint/smtp/smtp.go:285`
 
-3. **Submission mode processing (if applicable):** If this is a submission endpoint, `s.submissionPrepare(hdr, ...)` validates and potentially adds headers (Message-ID, Date, From/Sender validation).
+3. **Submission mode processing (if applicable):** If this is a submission endpoint, `s.submissionPrepare(s.msgMeta, &header)` validates and potentially adds headers (Message-ID, Date, From/Sender validation).
    > Source: `internal/endpoint/smtp/smtp.go:290-295` and `internal/endpoint/smtp/submission.go:27-130`
 
 4. **Buffer entire body in memory:** `buf, err := buffer.BufferInMemory(bufr)` — calls `ioutil.ReadAll(r)` to read the **entire remaining stream** into a `[]byte` in memory.
@@ -504,8 +504,11 @@ The `wrapErr()` function at `internal/endpoint/smtp/smtp.go:389-455` translates 
 | Temporary error flag set | `451` | (not set) | `Internal server error` |
 | `context.DeadlineExceeded` | `451` | `4.4.5` | `High load, try again later` |
 | `exterrors` with `smtp_code` field | *(from field)* | *(from field)* | *(from field)* |
+| `*smtp.SMTPError` (deprecated) | *(from error)* | *(from error)* | *(from error)* |
 
 > Source: `internal/endpoint/smtp/smtp.go:389-455`
+
+**Note on the deprecated `*smtp.SMTPError` case:** At lines 429-434, `wrapErr()` includes a type-switch case for `*smtp.SMTPError`. If the error is of this type, the Code, EnhancedCode, and Message are copied directly from the error object. This is accompanied by a deprecation log: `endp.Log.Printf("plain SMTP error returned, this is deprecated")`. The preferred approach is to use `exterrors.SMTPError` with annotated fields, but the legacy path remains functional.
 
 Additional `wrapErr()` behaviors:
 - Appends `(msg ID = <id>)` to the response message for traceability (lines 436-438)
@@ -556,7 +559,7 @@ func BufferInMemory(r io.Reader) (Buffer, error) {
     if err != nil {
         return nil, err
     }
-    return &MemoryBuffer{slice: blob}, nil
+    return MemoryBuffer{Slice: blob}, nil
 }
 ```
 
@@ -595,39 +598,41 @@ On go-smtp's side, after `Session.Data()` returns and the response is sent, go-s
 The test suite explicitly verifies multi-message behavior:
 
 ```go
-// First message
-c.Mail("sender1@example.org", nil)
-c.Rcpt("rcpt1@example.com", nil)
-c.Rcpt("rcpt2@example.com", nil)
-wc, _ := c.Data()
-io.WriteString(wc, testMsg)
-wc.Close()
+// First message — uses the submitMsg helper function
+err = submitMsg(t, cl, "sender1@example.org",
+    []string{"rcpt1@example.com", "rcpt2@example.com"}, testMsg)
+if err != nil {
+    t.Fatal(err)
+}
 
-// Second message (same connection)
-c.Mail("sender2@example.org", nil)
-c.Rcpt("rcpt3@example.com", nil)
-c.Rcpt("rcpt4@example.com", nil)
-wc, _ = c.Data()
-io.WriteString(wc, testMsg)
-wc.Close()
+// Second message (same connection, same cl client)
+err = submitMsg(t, cl, "sender2@example.org",
+    []string{"rcpt3@example.com", "rcpt4@example.com"}, testMsg)
+if err != nil {
+    t.Fatal(err)
+}
 
 // Verify both messages delivered independently
-assert.Equal(t, 2, len(tgt.Messages))
+if len(tgt.Messages) != 2 {
+    t.Fatal("Expected two messages, got", len(tgt.Messages))
+}
 ```
 
 > Source: `internal/endpoint/smtp/smtp_test.go:322-358`
 
+The `submitMsg(t, cl, from, rcpts, msg)` helper (defined at line 90) wraps the full EHLO → MAIL FROM → RCPT TO → DATA → write → close sequence into a single call. The test uses `t.Fatal` (standard library testing) for assertions, not testify's `assert.Equal`.
+
 The test asserts:
-- Both messages are delivered (`len(tgt.Messages) == 2`)
-- Each message has the correct envelope sender and recipients
-- Each message has a Received header with the correct message ID
+- Both messages are delivered (`len(tgt.Messages) != 2` triggers `t.Fatal`)
+- Each message has the correct envelope sender and recipients (verified via `testutils.CheckMsgID`)
+- Each message has a Received header with the correct message ID (verified via `strings.HasPrefix`)
 - Message metadata (IDs, senders) does not leak between transactions
 
 ### 4.5 Semaphore and Delivery Lifecycle
 
 Maddy uses a semaphore to limit concurrent message processing. The lifecycle per transaction is:
 
-1. **Acquire:** `s.endp.semaphore.TakeContext(deliveryCtx)` in `startDelivery()` (line 123)
+1. **Acquire:** `s.endp.semaphore.TakeContext(limitersCtx)` in `startDelivery()` (line 123)
 2. **Release (success):** `s.endp.semaphore.Release()` in `Data()` (line 341)
 3. **Release (failure):** `s.endp.semaphore.Release()` in `abort()` (line 68)
 
@@ -705,12 +710,27 @@ A proxy that rejects connections sending bare `\n` (analogous to Postfix's `smtp
 When Maddy acts as a relay (forwarding messages to downstream servers), it uses `smtpconn.C.Data()`:
 
 ```go
-func (c *C) Data(ctx context.Context, hdr textproto.Header, body io.Reader, ...) error {
-    wc, err := c.cl.Data()   // go-smtp client's dot-stuffing writer
-    ...
-    textproto.WriteHeader(wc, hdr)   // write headers
-    io.Copy(wc, body)                // write body
-    wc.Close()                       // sends CRLF.CRLF
+func (c *C) Data(ctx context.Context, hdr textproto.Header, body io.Reader) error {
+    defer trace.StartRegion(ctx, "smtpconn/DATA").End()
+
+    wc, err := c.cl.Data()                  // go-smtp client's dot-stuffing writer
+    if err != nil {
+        return c.wrapClientErr(err, c.serverName)
+    }
+
+    if err := textproto.WriteHeader(wc, hdr); err != nil {  // write headers
+        return c.wrapClientErr(err, c.serverName)
+    }
+
+    if _, err := io.Copy(wc, body); err != nil {            // write body
+        return c.wrapClientErr(err, c.serverName)
+    }
+
+    if err := wc.Close(); err != nil {                      // sends CRLF.CRLF
+        return c.wrapClientErr(err, c.serverName)
+    }
+
+    return nil
 }
 ```
 
@@ -777,12 +797,20 @@ func (s *Session) abort(ctx context.Context) {
 
 > Source: `internal/endpoint/smtp/smtp.go:67-81`
 
+**Important contract details about `abort()`:**
+
+1. **Takes a `context.Context` parameter:** The caller must provide the appropriate context — `Reset()` passes `s.msgCtx` (line 62), and `Logout()` also passes `s.msgCtx` (line 271). This context is forwarded to `s.delivery.Abort(ctx)`.
+
+2. **No nil-guard on `s.delivery`:** The method assumes `s.delivery` is non-nil. Callers are responsible for checking `s.delivery != nil` before calling `abort()` — both `Reset()` (line 61) and `Logout()` (line 270) perform this check. Calling `abort()` with a nil delivery would panic.
+
+3. **Does NOT reset `repeatedMailErrs`:** The `repeatedMailErrs` counter is only logged in `Logout()` (line 273-275) and is not touched by `abort()`. It accumulates across the session lifetime, not per-message.
+
 **The abort is thorough.** Every piece of per-message state is zeroed:
 - `semaphore` → released (prevents deadlock on future messages)
-- `delivery` → `Abort()` called (tells the delivery pipeline to roll back)
+- `delivery` → `Abort(ctx)` called (tells the delivery pipeline to roll back), then set to `nil`
 - `mailFrom`, `opts` → cleared (no sender leak)
 - `msgMeta` → nil (no metadata leak)
-- `delivery`, `deliveryErr` → nil (no pipeline leak)
+- `deliveryErr` → nil (no stale error leak)
 - `msgCtx` → nil (no context leak)
 - `msgTask` → `End()` (trace task closed)
 
@@ -812,13 +840,17 @@ This test verifies behavior when the client disconnects mid-DATA:
 // Send EHLO, MAIL FROM, RCPT TO
 // Begin DATA and send message bytes
 // Close connection WITHOUT sending CRLF.CRLF
-conn.Close()
+cl.Close()
 time.Sleep(250 * time.Millisecond)
 // Verify: no messages delivered
-assert.Equal(t, 0, len(tgt.Messages))
+if len(tgt.Messages) != 0 {
+    t.Fatal("Expected no messages, got", len(tgt.Messages))
+}
 ```
 
 > Source: `internal/endpoint/smtp/smtp_test.go:360-396`
+
+Note: The test uses the variable `cl` (of type `*smtp.Client`) for the SMTP client connection, and `t.Fatal` for assertions.
 
 **Conclusion: Incomplete DATA results in zero delivered messages.** The connection close causes `dataReader.Read()` to return `io.ErrUnexpectedEOF`, which propagates through `ioutil.ReadAll` → `BufferInMemory` → `prepareBody` → `Data` as an error. Since `delivery.Body()` was never called, there is nothing to deliver.
 
@@ -829,10 +861,12 @@ This test verifies behavior when the client disconnects *before* DATA:
 ```go
 // Send EHLO, MAIL FROM, RCPT TO
 // Close connection (no DATA command sent)
-conn.Close()
+cl.Close()
 time.Sleep(250 * time.Millisecond)
 // Verify: no messages delivered
-assert.Equal(t, 0, len(tgt.Messages))
+if len(tgt.Messages) != 0 {
+    t.Fatal("Expected no messages, got", len(tgt.Messages))
+}
 ```
 
 > Source: `internal/endpoint/smtp/smtp_test.go:398-427`
@@ -842,15 +876,29 @@ assert.Equal(t, 0, len(tgt.Messages))
 ```go
 func (s *Session) Logout() error {
     if s.delivery != nil {
-        s.abort(s.sessCtx)
+        s.abort(s.msgCtx)                    // line 271: note msgCtx, not sessionCtx
+
+        if s.repeatedMailErrs > s.endp.maxLoggedRcptErrors {
+            s.log.Msg("MAIL FROM repeated error a lot of times, possible dictonary attack",
+                "count", s.repeatedMailErrs,
+                "src_ip", s.connState.RemoteAddr)  // lines 273-275
+        }
     }
-    ...
+    if s.cancelRDNS != nil {
+        s.cancelRDNS()                       // lines 277-279: cancel rDNS lookup goroutine
+    }
+    return nil
 }
 ```
 
-> Source: `internal/endpoint/smtp/smtp.go:269-280`
+> Source: `internal/endpoint/smtp/smtp.go:269-281`
 
-If a delivery was in progress (post-`MAIL FROM`/`RCPT TO`), `abort()` cleans everything up.
+Key details about `Logout()`:
+- **Uses `s.msgCtx`** (the per-message context), not `s.sessionCtx` (the per-session context). This is semantically significant: `msgCtx` is scoped to the current message transaction and is the correct context to pass to `delivery.Abort()`, because it carries the per-message tracing information.
+- **Logs `repeatedMailErrs`** if the count exceeds `maxLoggedRcptErrors` — this detects possible dictionary attacks where a client repeatedly sends `MAIL FROM` that fails.
+- **Cancels rDNS lookup** via `s.cancelRDNS()` — cleans up the background goroutine that resolves the client's reverse DNS name.
+
+If a delivery was in progress (post-`MAIL FROM`/`RCPT TO`), `abort()` cleans everything up. The additional `repeatedMailErrs` logging and `cancelRDNS` cleanup ensure the session is fully torn down.
 
 ### 6.6 Timeout Scenarios (go-smtp Issue #196)
 
@@ -927,10 +975,13 @@ While the SMTP path offers all-or-nothing delivery semantics, the LMTP path (RFC
 ```go
 func (s *Session) LMTPData(r io.Reader, sc smtp.StatusCollector) error {
     ...
-    s.delivery.BodyNonAtomic(bodyCtx, sc, header, buf)  // line 369
+    s.delivery.(module.PartialDelivery).BodyNonAtomic(
+        bodyCtx, statusWrapper{sc, s}, header, buf)     // line 369
     // We can't really tell whether it is failed completely
-    // or succeeded so always commit.
-    s.delivery.Commit(bodyCtx)                          // line 374
+    // or succeeded so always commit. Should be harmless, anyway.
+    if err := s.delivery.Commit(bodyCtx); err != nil {  // line 373
+        return wrapErr(err)
+    }
     ...
 }
 ```
@@ -938,9 +989,9 @@ func (s *Session) LMTPData(r io.Reader, sc smtp.StatusCollector) error {
 > Source: `internal/endpoint/smtp/smtp.go:355-387`
 
 Key differences:
-- **`BodyNonAtomic`** (line 369) allows individual recipients to succeed or fail independently, with per-recipient status reported via the `StatusCollector`
-- **Always commits** (line 374): Because the delivery result is mixed (some recipients may succeed, others may fail), LMTP always commits rather than aborting
-- The comment at lines 371-372 acknowledges the ambiguity: "We can't really tell whether it is failed completely or succeeded so always commit."
+- **`BodyNonAtomic`** (line 369) allows individual recipients to succeed or fail independently, with per-recipient status reported via a `statusWrapper` that wraps the `StatusCollector` with `wrapErr`-based error translation
+- **Always commits** (line 373): Because the delivery result is mixed (some recipients may succeed, others may fail), LMTP always commits rather than aborting
+- The comment at lines 371-372 acknowledges the ambiguity: "We can't really tell whether it is failed completely or succeeded so always commit. Should be harmless, anyway."
 
 This contrast highlights that the SMTP path's clean all-or-nothing semantics (where abort/cleanup is straightforward) do not extend to LMTP. LMTP's partial delivery model means that failure residuals are more complex — some recipients may have received the message even if others failed.
 
