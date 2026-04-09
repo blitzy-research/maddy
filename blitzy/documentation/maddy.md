@@ -25,13 +25,7 @@ The fundamental data structure is the `Node` struct, defined at `pkg/cfgparser/p
 
 ```go
 type Node struct {
-    Name     string
-    Args     []string
-    Children []Node
-    Snippet  bool
-    Macro    bool
-    File     string
-    Line     int
+    Name string; Args []string; Children []Node // + Snippet, Macro, File, Line
 }
 ```
 
@@ -44,11 +38,8 @@ This is a recursive tree structure. Each `Node` represents a configuration direc
 The entry point is the `Read()` function at `pkg/cfgparser/parse.go:294-298`:
 
 ```go
-func Read(r io.Reader, location string) (nodes []Node, err error) {
-    nodes, _, _, err = readTree(r, location, 0)
-    nodes = expandEnvironment(nodes)
-    return
-}
+nodes, _, _, err = readTree(r, location, 0) // lex → parse → expand snippets/macros
+nodes = expandEnvironment(nodes)             // final pass: replace {$VAR} placeholders
 ```
 
 Source: `pkg/cfgparser/parse.go:294-298`
@@ -76,11 +67,8 @@ flowchart LR
 **Snippets** use the `(name) { ... }` syntax. The parser detects them via `isSnippet()` at `pkg/cfgparser/parse.go:131-136`:
 
 ```go
-func (ctx *parseContext) isSnippet(name string) (bool, string) {
-    if strings.HasPrefix(name, "(") && strings.HasSuffix(name, ")") {
-        return true, name[1 : len(name)-1]
-    }
-    return false, ""
+if strings.HasPrefix(name, "(") && strings.HasSuffix(name, ")") {
+    return true, name[1 : len(name)-1] // "(local_delivery_actions)" → "local_delivery_actions"
 }
 ```
 
@@ -137,40 +125,34 @@ Before `main()` runs and before any configuration is read, all module packages e
 The bootstrap file `maddy.go` contains a block of blank imports at lines 20–38:
 
 ```go
-// Import packages for side-effect of module registration.
 _ "github.com/foxcpp/maddy/internal/auth/external"
-_ "github.com/foxcpp/maddy/internal/check/dns"
 _ "github.com/foxcpp/maddy/internal/endpoint/smtp"
-// ... (18 total packages)
+// ... (17 total packages)
 ```
 
 Source: `maddy.go:20-38`
 
 Go's `init()` functions run automatically when a package is imported, even via a blank import (`_`). These side-effect imports ensure all module packages' `init()` functions execute at process start, BEFORE `main()` runs.
 
-**Concrete example — regular module:** `internal/module/dummy.go:56-59`:
+**Concrete example — regular module:** `internal/module/dummy.go:56-60`:
 
 ```go
 func init() {
-    Register("dummy", func(_, instName string, _, _ []string) (Module, error) {
-        return &Dummy{instName: instName}, nil
-    })
+    Register("dummy", func(_, instName string, _, _ []string) (Module, error) { ... })
 }
 ```
 
-Source: `internal/module/dummy.go:56-59`
+Source: `internal/module/dummy.go:56-60`
 
 **Concrete example — endpoint module:** `internal/endpoint/smtp/smtp.go:714-720`:
 
 ```go
-func init() {
-    module.RegisterEndpoint("smtp", New)
-    module.RegisterEndpoint("submission", New)
-    module.RegisterEndpoint("lmtp", New)
-}
+module.RegisterEndpoint("smtp", New)
+module.RegisterEndpoint("submission", New)
+module.RegisterEndpoint("lmtp", New)
 ```
 
-Source: `internal/endpoint/smtp/smtp.go:714-717`
+Source: `internal/endpoint/smtp/smtp.go:714-720` (full `init()` also includes `rand.Seed` at line 718)
 
 Note that the same `New` factory is registered under three names (`smtp`, `submission`, `lmtp`) — the factory uses the `modName` argument to determine behavioral differences (e.g., `submission` requires authentication, `lmtp` uses the LMTP protocol variant).
 
@@ -179,11 +161,9 @@ Note that the same `New` factory is registered under three names (`smtp`, `submi
 The registries are defined at `internal/module/registry.go:7-11`:
 
 ```go
-var (
-    modules     = make(map[string]FuncNewModule)
-    endpoints   = make(map[string]FuncNewEndpoint)
-    modulesLock sync.RWMutex
-)
+modules   = make(map[string]FuncNewModule)   // regular module factories
+endpoints = make(map[string]FuncNewEndpoint)  // endpoint module factories
+// ... protected by modulesLock sync.RWMutex
 ```
 
 Source: `internal/module/registry.go:7-11`
@@ -222,7 +202,7 @@ The following modules are registered via side-effect imports in `maddy.go:20-38`
 | Import Package | Module Type | Registered Names |
 |---------------|-------------|-----------------|
 | `internal/endpoint/smtp` | Endpoint | `smtp`, `submission`, `lmtp` |
-| `internal/endpoint/imap` | Endpoint | `imap`, `imaps` |
+| `internal/endpoint/imap` | Endpoint | `imap` |
 | `internal/storage/sql` | Storage + Auth | `sql` |
 | `internal/auth/external` | Auth | `extauth` |
 | `internal/auth/pam` | Auth | `pam` |
@@ -269,10 +249,8 @@ Source: `maddy.go:243-267`
 `Process()` at `internal/config/map.go:562-564` delegates to `ProcessWith()` (lines 567–597), which iterates over `block.Children`. For each child node, it checks if a matcher exists in `m.entries` (line 579). If a matcher is found, it executes the mapper function and stores the result. If no matcher exists and `m.allowUnknown` is true, the node is appended to the `unknown` slice (line 584). Otherwise, an error is returned.
 
 ```go
-if !m.allowUnknown {
-    return nil, m.MatchErr("unexpected directive: %s", subnode.Name)
-}
-unknown = append(unknown, subnode)
+if !m.allowUnknown { return nil, m.MatchErr("unexpected directive: %s", subnode.Name) }
+unknown = append(unknown, subnode) // unmatched nodes collected here
 ```
 
 Source: `internal/config/map.go:581-584`
@@ -296,9 +274,7 @@ At lines 348–356, all endpoints are initialized eagerly:
 
 ```go
 for _, endp := range endpoints {
-    if err := endp.instance.Init(config.NewMap(globals, &endp.cfg)); err != nil {
-        return nil, err
-    }
+    if err := endp.instance.Init(config.NewMap(globals, &endp.cfg)); err != nil { return nil, err }
 }
 ```
 
@@ -311,12 +287,8 @@ This is **eager initialization** — endpoints are initialized immediately, in t
 After all endpoints have been initialized (and their transitive lazy initialization chains have completed), lines 358–365 verify every regular module:
 
 ```go
-for _, inst := range mods {
-    if module.Initialized[inst.instance.InstanceName()] {
-        continue
-    }
-    return nil, fmt.Errorf("Unused configuration block at %s:%d - %s (%s)",
-        inst.cfg.File, inst.cfg.Line, inst.instance.InstanceName(), inst.instance.Name())
+for _, inst := range mods { // maddy.go:358-365
+    if !module.Initialized[inst.instance.InstanceName()] { return nil, fmt.Errorf("Unused configuration block at %s:%d ...", ...) }
 }
 ```
 
@@ -347,7 +319,7 @@ flowchart TD
 
 The same `AllowUnknown()` + `Process()` pattern recurs inside the SMTP endpoint's `setConfig()` method at `internal/endpoint/smtp/smtp.go:551-586`:
 
-1. Lines 557–574: Register known SMTP directives (`auth`, `hostname`, `write_timeout`, `read_timeout`, `max_message_size`, `tls`, `insecure_auth`, `io_debug`, `debug`, `defer_sender_reject`, `ratelimit`, `concurrency`).
+1. Lines 557–574: Register known SMTP directives (`auth`, `hostname`, `write_timeout`, `read_timeout`, `max_message_size`, `max_recipients`, `tls`, `insecure_auth`, `io_debug`, `debug`, `defer_sender_reject`, `max_logged_rcpt_errors`, `ratelimit`, `concurrency`).
 2. Line 575: `cfg.AllowUnknown()`.
 3. Line 576: `unknown, err := cfg.Process()` — collects pipeline directives (`source`, `destination`, `check`, `modify`, `deliver_to`, `reject`, `reroute`, `default_source`, `default_destination`, `dmarc`) as unknown nodes.
 4. Line 580: `endp.pipeline, err = msgpipeline.New(cfg.Globals, unknown)` — constructs the message pipeline from those directives.
@@ -406,10 +378,8 @@ The `GetInstance` function at `internal/module/instances.go:53-75` is where lazy
 4. **Initialize** (lines 69–72): Set `Initialized[name] = true` **before** calling `Init()`. Then call `mod.mod.Init(mod.cfg)`.
 
 ```go
-Initialized[name] = true
-if err := mod.mod.Init(mod.cfg); err != nil {
-    return mod.mod, err
-}
+Initialized[name] = true                        // set BEFORE Init — breaks circular deps
+if err := mod.mod.Init(mod.cfg); err != nil { return mod.mod, err }
 ```
 
 Source: `internal/module/instances.go:69-72`
@@ -421,11 +391,9 @@ Source: `internal/module/instances.go:69-72`
 Defined at `internal/module/instances.go:9-17`:
 
 ```go
-var (
-    instances   = make(map[string]struct{ mod Module; cfg *config.Map })
-    aliases     = make(map[string]string)
-    Initialized = make(map[string]bool)
-)
+instances   = make(map[string]struct{ mod Module; cfg *config.Map }) // name → module+config
+aliases     = make(map[string]string)                                // alias → canonical name
+Initialized = make(map[string]bool)                                  // name → init-done flag
 ```
 
 Source: `internal/module/instances.go:9-17`
@@ -554,18 +522,7 @@ Defined at `internal/msgpipeline/check_runner.go:17-37`:
 
 ```go
 type checkRunner struct {
-    msgMeta  *module.MsgMetadata
-    mailFrom string
-    checkedRcpts         []string
-    checkedRcptsPerCheck map[module.CheckState]map[string]struct{}
-    checkedRcptsLock     sync.Mutex
-    resolver      dns.Resolver
-    doDMARC       bool
-    didDMARCFetch bool
-    dmarcVerify   *dmarc.Verifier
-    log log.Logger
-    states    map[module.Check]module.CheckState
-    mergedRes module.CheckResult
+    states map[module.Check]module.CheckState; mergedRes module.CheckResult // + 10 more fields
 }
 ```
 
@@ -680,12 +637,12 @@ Source: `internal/msgpipeline/check_runner.go:301-303`
 The `Group` struct at `internal/modify/group.go:11-15` wraps `[]module.Modifier`:
 
 ```go
-type Group struct {
-    Modifiers []module.Modifier
-}
+type ( // grouped type declaration; also defines groupState
+    Group struct { Modifiers []module.Modifier }
+)
 ```
 
-Source: `internal/modify/group.go:13-15`
+Source: `internal/modify/group.go:11-20`
 
 All operations execute **serially** — the output of one modifier becomes the input of the next:
 
@@ -752,9 +709,7 @@ After all endpoints have been eagerly initialized and their lazy initialization 
 At `maddy.go:358-365`, after endpoint initialization completes, the loop checks every regular module:
 
 ```go
-if module.Initialized[inst.instance.InstanceName()] {
-    continue
-}
+if module.Initialized[inst.instance.InstanceName()] { continue }
 return nil, fmt.Errorf("Unused configuration block at %s:%d - %s (%s)", ...)
 ```
 
@@ -790,11 +745,7 @@ The `Future` type at `internal/future/future.go:12-19` provides async value prop
 
 ```go
 type Future struct {
-    mu     sync.RWMutex
-    set    bool
-    val    interface{}
-    err    error
-    notify chan struct{}
+    set bool; val interface{}; err error; notify chan struct{} // + mu sync.RWMutex
 }
 ```
 
@@ -804,7 +755,7 @@ Source: `internal/future/future.go:12-19`
 - `Set()` (lines 27–40) resolves the future. Panics if called twice — enforcing the at-most-once guarantee.
 - `GetContext()` (lines 46–69) blocks until resolved or context is cancelled.
 
-This is used in SMTP sessions for reverse-DNS lookups (`internal/endpoint/smtp/smtp.go:699-702`): `s.connState.RDNSName = future.New()` creates a future at session start, and `go s.fetchRDNSName(rdnsCtx)` resolves it asynchronously. Checks that need the rDNS name (like `require_matching_rdns`) call `ctx.MsgMeta.Conn.RDNSName.Get()` which blocks only if the lookup hasn't completed yet. This allows SMTP commands to proceed without blocking on DNS — a form of runtime evidence that module coordination occurs through data-flow dependencies rather than explicit initialization ordering.
+This is used in SMTP sessions for reverse-DNS lookups (`internal/endpoint/smtp/smtp.go:699-703`): `s.connState.RDNSName = future.New()` creates a future at session start, and `go s.fetchRDNSName(rdnsCtx)` resolves it asynchronously. Checks that need the rDNS name (like `require_matching_rdns`) call `ctx.MsgMeta.Conn.RDNSName.Get()` which blocks only if the lookup hasn't completed yet. This allows SMTP commands to proceed without blocking on DNS — a form of runtime evidence that module coordination occurs through data-flow dependencies rather than explicit initialization ordering.
 
 ---
 
