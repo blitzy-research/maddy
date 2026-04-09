@@ -9,7 +9,7 @@
 This review examines two adversarial SMTP scenarios against the maddy mail server and renders a definitive security verdict for each.
 
 **Question 1 — Dot-Stuffing / Message Boundary Behavior:**
-Maddy correctly handles a bare `.\r\n` appearing mid-message-body. Go's `net/textproto.DotReader()` implements the RFC 5321 §4.5.2 transparency procedure as a state machine that treats any `.\r\n` on a line by itself as the end-of-data marker, returning `io.EOF`. If a non-compliant sending client places a bare `.\r\n` in the body without proper dot-stuffing (i.e., without doubling the dot to `..`), `DotReader` interprets it as the end-of-data signal and the message is truncated at that point. After `Session.Data()` returns, `go-smtp`'s `handleData()` calls `io.Copy(ioutil.Discard, r)` (Source: go-smtp conn.go:521) — however, because `DotReader` has already returned `io.EOF` at the early `.\r\n`, this drain is a **no-op** (it reads zero bytes). Any residual body data between the early dot and the client's intended terminator remains in the TCP read buffer and will be parsed as SMTP commands by the next `ReadLine()` call. In practice, these residual lines are not valid SMTP commands, so `go-smtp`'s `unrecognizedCommand()` handler (Source: go-smtp conn.go:77-84) responds with `500` errors and closes the connection after 4 unrecognized commands (`nbrErrors > 3`). The deferred `c.reset()` (Source: go-smtp conn.go:512) clears per-transaction state. **The system fails safely** — the message is either accepted complete (if properly dot-stuffed) or accepted truncated (if not), and the residual data injection is self-inflicted by the sender on their own connection, mitigated by error-counting connection closure.
+Maddy correctly handles a bare `.\r\n` appearing mid-message-body. Go's `net/textproto.DotReader()` implements the [RFC 5321](https://www.rfc-editor.org/rfc/rfc5321) §4.5.2 transparency procedure as a state machine that treats any `.\r\n` on a line by itself as the end-of-data marker, returning `io.EOF`. If a non-compliant sending client places a bare `.\r\n` in the body without proper dot-stuffing (i.e., without doubling the dot to `..`), `DotReader` interprets it as the end-of-data signal and the message is truncated at that point. After `Session.Data()` returns, `go-smtp`'s `handleData()` calls `io.Copy(ioutil.Discard, r)` (Source: go-smtp conn.go:521) — however, because `DotReader` has already returned `io.EOF` at the early `.\r\n`, this drain is a **no-op** (it reads zero bytes). Any residual body data between the early dot and the client's intended terminator remains in the TCP read buffer and will be parsed as SMTP commands by the next `ReadLine()` call. In practice, these residual lines are not valid SMTP commands, so `go-smtp`'s `unrecognizedCommand()` handler (Source: go-smtp conn.go:77-84) responds with `500` errors and closes the connection after 4 unrecognized commands (`nbrErrors > 3`). The deferred `c.reset()` (Source: go-smtp conn.go:512) clears per-transaction state. **The system fails safely** — the message is either accepted complete (if properly dot-stuffed) or accepted truncated (if not), and the residual data injection is self-inflicted by the sender on their own connection, mitigated by error-counting connection closure.
 
 **Question 2 — Authentication State Persistence Across RSET:**
 Authentication state persists immutably across RSET. When a client authenticates, `newSession()` creates a `ConnState` with `AuthUser` set to the authenticated username (Source: internal/endpoint/smtp/smtp.go:680). This field is set **once** and never modified. `go-smtp`'s `Conn.reset()` (Source: go-smtp conn.go:694-703) preserves the session object — it only clears per-transaction flags (`fromReceived`, `recipients`) and calls `session.Reset()`, which in maddy only aborts any in-progress delivery and clears per-message state (Source: internal/endpoint/smtp/smtp.go:60-65). After RSET, a new `MAIL FROM` reuses the same session, and `startDelivery()` creates a new `MsgMetadata` with `Conn: &s.connState` (Source: internal/endpoint/smtp/smtp.go:86), binding the **original** authenticated identity to the new message. The submission endpoint's pipeline configuration additionally rejects non-local sender domains (Source: maddy.conf:117-119). **The system fails safely** — identity confusion is not possible.
@@ -24,7 +24,7 @@ All behavioral claims in this document are scoped to the specific software versi
 
 - **Go module path:** `github.com/foxcpp/maddy`
 - **Go minimum version:** 1.13
-- **Source:** go.mod:1-3
+- Source: go.mod:1-3
 
 The analysis targets the maddy codebase at the HEAD of the repository. Maddy is pre-1.0 (no release tags with semantic versioning guarantees), so behavior may change between commits.
 
@@ -32,15 +32,16 @@ The analysis targets the maddy codebase at the HEAD of the repository. Maddy is 
 
 - **Package:** `github.com/emersion/go-smtp`
 - **Pinned version:** `v0.12.1-0.20191206174923-1f576e0ec85c`
-- **Source:** go.mod:19
+- Source: go.mod:19
 
 This is a **pinned pre-release commit**, not a stable tagged release. The version string includes a commit hash (`1f576e0ec85c`) that locks the exact source code analyzed in this document. Newer versions of `go-smtp` may have different session lifecycle behavior, different `handleData()` implementations, or different `reset()` semantics.
 
 ### 2.3 Go Standard Library (net/textproto)
 
-- **Package:** `net/textproto`
+- **Package:** [`net/textproto`](https://pkg.go.dev/net/textproto)
 - **Go version:** >= 1.13
-- **Key function:** `DotReader()` — implements the RFC 5321 §4.5.2 dot-encoding state machine
+- **Key function:** `DotReader()` — implements the [RFC 5321](https://www.rfc-editor.org/rfc/rfc5321) §4.5.2 dot-encoding state machine
+- **Source:** [`net/textproto/reader.go`](https://go.dev/src/net/textproto/reader.go)
 
 The `DotReader()` behavior described in this document is stable across Go versions from 1.0 onward. The state machine semantics have not changed since the initial Go release.
 
@@ -73,7 +74,7 @@ The line containing only `.` (followed by `\r\n`) appears **mid-body**, before t
 
 ### 3.2 RFC 5321 §4.5.2 — The Transparency Procedure
 
-RFC 5321 Section 4.5.2 defines the **dot-stuffing** (transparency) procedure that governs how message data is framed on the wire:
+[RFC 5321 Section 4.5.2](https://www.rfc-editor.org/rfc/rfc5321#section-4.5.2) defines the **dot-stuffing** (transparency) procedure that governs how message data is framed on the wire. This procedure was originally specified in [RFC 821](https://www.rfc-editor.org/rfc/rfc821) Section 4.5.2 and has remained unchanged through RFC 2821 into RFC 5321:
 
 - **Sending side:** Before transmitting each line of the message body, the client checks if the line starts with a period (`.`). If it does, the client prepends an additional period. A line that is only a period becomes `..`.
 - **Receiving side:** The server examines each line. If a line starts with a period and contains additional characters, the server strips the leading period. If a line contains **only** a single period (i.e., `.\r\n`), the server treats it as the **end-of-data marker** and stops reading message content.
@@ -131,7 +132,7 @@ func (c *Conn) handleData(arg string) {
 }
 ```
 
-**Source:** go-smtp conn.go:498-524
+Source: go-smtp conn.go:498-524
 
 Line 521 calls `io.Copy(ioutil.Discard, r)` after `Session.Data()` returns. The comment says "Make sure all the data has been consumed." This drain is effective **only when `Session.Data()` returns early** (e.g., due to an error or size limit) **before `DotReader` reaches `.\r\n`** — in that case, the drain reads and discards the remaining dot-encoded data up to the terminator. However, in the early-dot scenario analyzed in this document, `DotReader` has already encountered `.\r\n` and returned `io.EOF`, entering its terminal `stateEOF` state. Subsequent reads from the `dataReader` (which wraps `DotReader`) immediately return `(0, io.EOF)` — the drain reads **zero bytes** and is a no-op. Any residual body data after the early dot remains in the underlying `bufio.Reader` of the `textproto.Conn` and will be read by the next `ReadLine()` call as if it were SMTP commands.
 
@@ -217,7 +218,7 @@ To determine which code path was taken on a running instance, examine the follow
 | Observable | Expected Value | What It Reveals |
 |------------|----------------|-----------------|
 | SMTP response code | `250 2.0.0 OK` | Message was accepted (even if truncated) |
-| Structured log entry | `"msg": "accepted", "msg_id": "<id>"` (Source: smtp.go:334) | Delivery completed successfully |
+| Structured log entry | `"msg": "accepted", "msg_id": "<id>"` (Source: internal/endpoint/smtp/smtp.go:334) | Delivery completed successfully |
 | Queue `.body` file size | Smaller than expected full body | Body was truncated at the early `.\r\n` |
 | `500` error responses after `250 OK` | `500 5.5.2 Syntax error, <word> command unrecognized` for each residual line | Residual body data was parsed as invalid SMTP commands (drain was a no-op) |
 | Subsequent client SMTP commands | Succeed normally (e.g., new MAIL FROM) if connection was not closed by `nbrErrors > 3` | Connection returned to usable state after residual lines were consumed |
@@ -534,9 +535,9 @@ This is visible in `Session.Mail()` (Source: internal/endpoint/smtp/smtp.go:162-
 
 | Observable | Where to Find It | What It Shows |
 |------------|-------------------|---------------|
-| Structured log `"username"` field | Server JSON log output (Source: smtp.go:127-134) | Always shows the **original** authenticated username, never the MAIL FROM argument |
-| Queue `.meta` file | `QueueMetadata.MsgMeta.Conn.AuthUser` (Source: queue.go:149-150) | Contains the original authenticated username |
-| `Received` header | Stored message headers | On submission endpoints, `DontTraceSender = true` (Source: submission.go:28) causes `GenerateReceived()` to **omit** source hostname/IP (Source: received.go:30-58). Header contains `by <hostname>` but not `from <client>` |
+| Structured log `"username"` field | Server JSON log output (Source: internal/endpoint/smtp/smtp.go:127-134) | Always shows the **original** authenticated username, never the MAIL FROM argument |
+| Queue `.meta` file | `QueueMetadata.MsgMeta.Conn.AuthUser` (Source: internal/target/queue/queue.go:149-150) | Contains the original authenticated username |
+| `Received` header | Stored message headers | On submission endpoints, `DontTraceSender = true` (Source: internal/endpoint/smtp/submission.go:28) causes `GenerateReceived()` to **omit** source hostname/IP (Source: internal/target/received.go:30-58). Header contains `by <hostname>` but not `from <client>` |
 | SMTP response code | Client-visible response at RCPT TO time | `501 5.1.8 "Non-local sender domain"` if sender domain is not local |
 | Structured log `"sender"` field | Server JSON log output | Shows the MAIL FROM argument — useful for comparing against `"username"` to detect mismatch attempts |
 
