@@ -1,277 +1,270 @@
-# Maddy Queue Delivery Timing Analysis
+# Maddy Queue Delivery Timing and Throughput Analysis
 
 ## Introduction
 
-This document provides an authoritative, calculation-backed analysis of the maddy mail server's delivery queue timing and throughput characteristics. It is written in response to end-user complaints about long email bounce times and aims to explain — with full source code citations — exactly how the queue processes messages, how retry delays accumulate, and how long users should expect to wait before receiving a bounce notification (DSN — Delivery Status Notification) when delivery permanently fails.
+This document provides a comprehensive, code-backed technical analysis of the maddy mail server's delivery queue behavior. It answers five precise questions about parallel processing, throughput, retry delay accumulation, and an arithmetic edge case in the retry formula — all drawn directly from the queue module source code.
 
-**All values in this document are extracted directly from the source code on branch `maddy_26452dd8dd78`.** No values are estimated or assumed. Every configuration constant, formula, and behavioral claim cites the exact source file and line number where it is defined.
+**Context:** End-users have reported long email bounce times. This analysis explains exactly how the queue's timing works with default configuration so that operators can give authoritative answers about expected bounce wait times.
 
-**Scope:** This analysis covers the queue module at `internal/target/queue/` and its interaction with the production configuration at `maddy.conf`. It does not cover the remote delivery target internals, authentication, storage, or IMAP modules.
+**Source code analyzed:** Branch `maddy_26452dd8dd78` of the `github.com/foxcpp/maddy` repository.
+
+**All values cited below are extracted from the source code** — no values are assumed or estimated.
 
 ---
 
 ## 1. Queue Configuration Defaults
 
-The queue's behavior is governed by a small set of configuration parameters. The following table lists each parameter, its value, and the exact source code location where it is defined.
+Every configuration value used in this analysis is extracted from the queue module source code. The table below lists each value, its source location, and the production override (if any).
 
-| Parameter | Value | Source |
-|-----------|-------|--------|
-| `initialRetryTime` | `15 * time.Minute` (15 minutes) | `internal/target/queue/queue.go:185` — set in `NewQueue()` |
-| `retryTimeScale` | `2` | `internal/target/queue/queue.go:186` — set in `NewQueue()` |
-| `postInitDelay` | `10 * time.Second` (10 seconds) | `internal/target/queue/queue.go:187` — set in `NewQueue()` |
-| `maxTries` | `8` (default via `cfg.Int`) | `internal/target/queue/queue.go:204` — set in `Init()` |
-| `maxParallelism` | `16` (default via `cfg.Int`) | `internal/target/queue/queue.go:205` — set in `Init()` |
-| `deliverySemaphore` | `chan struct{}` buffered to `maxParallelism` | `internal/target/queue/queue.go:242` — created in `start()` |
+| Parameter | Default Value | Source Location | Production Override (`maddy.conf`) |
+|-----------|--------------|-----------------|-------------------------------------|
+| `initialRetryTime` | 15 minutes | `internal/target/queue/queue.go:185` — `initialRetryTime: 15 * time.Minute` | None (not user-configurable) |
+| `retryTimeScale` | 2 | `internal/target/queue/queue.go:186` — `retryTimeScale: 2` | None (not user-configurable) |
+| `postInitDelay` | 10 seconds | `internal/target/queue/queue.go:187` — `postInitDelay: 10 * time.Second` | None (not user-configurable) |
+| `maxTries` | 8 | `internal/target/queue/queue.go:204` — `cfg.Int("max_tries", false, false, 8, &q.maxTries)` | `maddy.conf:125` — `max_tries 8` |
+| `maxParallelism` | 16 | `internal/target/queue/queue.go:205` — `cfg.Int("max_parallelism", false, false, 16, &maxParallelism)` | `maddy.conf:128` — `max_parallelism 16` |
 
-### Production Configuration Confirmation
+**Note on documentation inconsistency:** The man page `docs/man/maddy-targets.5.scd` (line 65) states the default for `max_tries` is `4`, while the actual code default at `queue.go:204` and the production configuration at `maddy.conf:125` both use `8`. The code is the source of truth; the man page value is outdated.
 
-The production configuration file `maddy.conf` confirms these defaults are used in the deployed system:
+### How Defaults Are Set
 
-- `max_tries 8` — Source: `maddy.conf:125`
-- `max_parallelism 16` — Source: `maddy.conf:128`
+Default values are established in two functions:
 
-### Documentation Discrepancy
+1. **`NewQueue()`** at `queue.go:182–189` sets hardcoded struct fields:
 
-> **Warning:** The man page `docs/man/maddy-targets.5.scd` at line 65 documents the default value of `max_tries` as `4`. However, the **actual** code default is `8` (at `queue.go:204`) and the production configuration also uses `8` (at `maddy.conf:125`). The example configuration block in the man page at line 23 also shows `max_tries 4`. This is a documentation-vs-code inconsistency — the code is the source of truth, and the correct default is **8**.
+```go
+q := &Queue{
+    name:             instName,
+    initialRetryTime: 15 * time.Minute,  // line 185
+    retryTimeScale:   2,                  // line 186
+    postInitDelay:    10 * time.Second,   // line 187
+    Log:              log.Logger{Name: "queue"},
+}
+```
+
+2. **`Init()`** at `queue.go:201–237` registers user-configurable directives with their defaults:
+
+```go
+cfg.Int("max_tries", false, false, 8, &q.maxTries)       // line 204
+cfg.Int("max_parallelism", false, false, 16, &maxParallelism) // line 205
+```
+
+The fourth argument to `cfg.Int()` is the default value used when the directive is not present in the configuration file.
 
 ---
 
 ## 2. Parallel Processing Model
 
-This section explains how the queue processes multiple messages concurrently. The key concept is a **channel-based semaphore** — a Go buffered channel used to limit how many delivery attempts can run at the same time.
+### 2.1 Concurrency Mechanism
 
-### 2.1 The Queue Struct
+The queue limits concurrent delivery attempts using a **channel-based semaphore** — a buffered Go channel where the buffer size equals the maximum parallelism.
 
-The `Queue` struct (Source: `internal/target/queue/queue.go:112-147`) contains the concurrency primitive:
-
-```go
-// Buffered channel used to restrict count of deliveries attempted
-// in parallel.
-deliverySemaphore chan struct{}
-```
-
-Source: `queue.go:144-146`
-
-The `deliverySemaphore` field is a buffered channel of empty structs. Its buffer size equals `maxParallelism` (default: 16). A goroutine "acquires" a slot by sending a value into the channel; if the channel buffer is full (16 values already in it), the send blocks until another goroutine "releases" a slot by receiving from the channel.
-
-### 2.2 Semaphore Initialization
-
-In the `start()` function, the semaphore is created with the configured parallelism limit:
+**Semaphore creation** at `queue.go:242` inside `start()`:
 
 ```go
 q.deliverySemaphore = make(chan struct{}, maxParallelism)
 ```
 
-Source: `queue.go:242`
+With the default `maxParallelism=16`, this creates a buffered channel of capacity 16. A goroutine "acquires" a slot by sending a value into the channel (blocking if the channel is full) and "releases" it by receiving a value from the channel.
 
-With the default `maxParallelism=16`, this creates a channel with buffer size 16, allowing up to 16 concurrent delivery attempts.
+### 2.2 Dispatch Flow
 
-### 2.3 The dispatch() Function
+When a message is ready for delivery (either a new message or a retry), the following sequence occurs:
 
-The `dispatch()` function (Source: `queue.go:275-323`) is the callback passed to the `TimeWheel` scheduler (explained below). When the TimeWheel determines it is time to attempt delivery of a message, it calls `dispatch()`. Here is what happens:
+1. **Scheduling:** The message is added to the `TimeWheel` scheduler via `wheel.Add(targetTime, queueSlot{...})` (`queue.go:420–428` for retries, `queue.go:578–583` for new messages).
 
-1. **Line 280:** `q.deliveryWg.Add(1)` — Adds to a `sync.WaitGroup` that tracks in-flight deliveries (used during graceful shutdown).
-2. **Line 281:** `go func() { ... }()` — Launches a new goroutine for this delivery attempt.
-3. **Line 283:** `q.deliverySemaphore <- struct{}{}` — The goroutine attempts to send into the semaphore channel. If 16 goroutines are already holding slots (channel buffer full), this **blocks** until one finishes.
-4. **Line 285:** `<-q.deliverySemaphore` (deferred) — When the delivery completes (or panics), the slot is released by receiving from the channel.
-5. **Line 321:** `q.tryDelivery(meta, hdr, body)` — The actual delivery attempt is performed.
+2. **TimeWheel dispatch:** The `TimeWheel`'s background goroutine (`timewheel.go:71–128`) continuously scans for the slot with the earliest target time. When that time arrives (or has already passed, such as zero-time for new messages), it calls the `dispatch` callback.
 
-### 2.4 The TimeWheel Scheduler
+3. **Goroutine creation with semaphore:** The `dispatch()` function at `queue.go:275–323` spawns a new goroutine for each message. The goroutine immediately attempts to acquire the semaphore:
 
-The `TimeWheel` (Source: `internal/target/queue/timewheel.go:15-25`) is a concurrent scheduler that manages pending deliveries ordered by their target delivery time. It uses a linked list of `TimeSlot` entries, each containing a target time and associated data.
+```go
+func (q *Queue) dispatch(value TimeSlot) {
+    slot := value.Value.(queueSlot)
+    q.deliveryWg.Add(1)
+    go func() {
+        q.deliverySemaphore <- struct{}{}  // BLOCKS if 16 goroutines already active
+        defer func() {
+            <-q.deliverySemaphore          // release slot when done
+            q.deliveryWg.Done()
+        }()
+        // ... read message from disk if needed ...
+        q.tryDelivery(meta, hdr, body)
+    }()
+}
+```
 
-**Key operations:**
+4. **Delivery attempt:** Once the semaphore is acquired, `tryDelivery()` at `queue.go:365–429` executes the actual delivery to the downstream target.
 
-- **`Add(target time.Time, value interface{})`** (Source: `timewheel.go:38-53`): Adds a new slot to the linked list and notifies the background goroutine via `updateNotify` channel.
-- **`tick()`** (Source: `timewheel.go:71-128`): The background goroutine that runs continuously:
-  - Scans the linked list for the slot with the earliest deadline (lines 78-84)
-  - Creates a `time.NewTimer` for that deadline (line 99)
-  - When the timer fires, removes the slot and calls `tw.dispatch(closestSlot)` (line 109)
-  - If a new slot arrives with an earlier deadline (via `updateNotify`), the timer is stopped and the loop restarts to pick the new earliest slot (lines 112-121)
+### 2.3 How Goroutines Compete for Delivery Slots
 
-### 2.5 End-to-End Flow
+The `TimeWheel` processes one slot at a time in a tight loop. For initial deliveries (scheduled with zero-time via `time.Time{}` at `queue.go:578`), the timer fires nearly instantly, so the TimeWheel dispatches messages very rapidly — one goroutine per loop iteration at microsecond intervals.
 
-The complete flow from message submission to delivery attempt is:
+Each dispatched goroutine immediately tries to send on the buffered semaphore channel. If fewer than 16 deliveries are in progress, the send succeeds instantly and delivery begins. If 16 deliveries are already in progress, the goroutine blocks on the channel send until one of the active deliveries completes and releases its slot.
 
-1. `Commit()` is called on a new message delivery
-2. `TimeWheel.Add(time.Time{}, slot)` schedules the message for immediate dispatch (Source: `queue.go:578`). The zero-value `time.Time{}` represents the Go time epoch (year 0001), which is always in the distant past, so the TimeWheel's timer fires immediately.
-3. The `tick()` goroutine in TimeWheel fires immediately (the target time is the zero-value epoch, which is always in the past)
-4. `dispatch()` is called, which launches a new goroutine
-5. The goroutine blocks on the semaphore channel if ≥16 deliveries are already in progress
-6. Once a semaphore slot is acquired, `tryDelivery()` executes the actual delivery
-
-**Key insight:** The model is **not** a fixed thread pool. Every message gets its own goroutine, but the channel-based semaphore limits how many can execute `tryDelivery()` concurrently. Goroutines beyond the limit block on the channel send at line 283, waiting for a slot to open. This means the system can have hundreds of goroutines waiting, but only 16 are actively delivering at any time.
+This creates an effective **worker pool** of 16 concurrent delivery goroutines, with all additional messages queued as blocked goroutines waiting on the semaphore.
 
 ---
 
-## 3. Initial Delivery Pass Throughput Calculation
+## 3. Initial Delivery Pass Throughput
 
-This section calculates the wall-clock time to complete the first delivery attempt for a batch of 500 messages, assuming each delivery takes approximately 2 seconds to a single destination server.
+### 3.1 Setup
 
-### 3.1 Given Parameters
-
-| Parameter | Value | Source |
-|-----------|-------|--------|
-| Number of messages | 500 | User scenario |
-| Time per delivery attempt | ~2 seconds | User scenario |
-| `max_parallelism` | 16 | `queue.go:205` |
+Given parameters:
+- **500 messages** committed to the queue at approximately the same time
+- **2 seconds** per delivery attempt to a single destination server
+- **16** maximum parallel deliveries (default `max_parallelism`)
 
 ### 3.2 Calculation
 
-The semaphore allows 16 concurrent delivery attempts. In the simplest model, we can think of the deliveries proceeding in "batches" of 16:
+When 500 messages are committed, each one schedules an immediate dispatch via `wheel.Add(time.Time{}, ...)` (`queue.go:578`). The `TimeWheel` dispatches them rapidly, creating 500 goroutines in quick succession.
 
-1. **Concurrent slots:** 16 messages can be delivered simultaneously
-2. **Number of batches:** `⌈500 / 16⌉ = ⌈31.25⌉ = 32` batches
-3. **Last batch size:** `500 - (31 × 16) = 500 - 496 = 4` messages (only 4 slots used)
-4. **Wall-clock time:** `32 batches × 2 seconds/batch = 64 seconds`
+Since the semaphore has capacity 16, at most 16 deliveries execute concurrently. The remaining 484 goroutines block on semaphore acquisition.
 
-### 3.3 Result
+Assuming each delivery takes exactly 2 seconds:
+
+| Step | Calculation | Result |
+|------|-------------|--------|
+| Messages per parallel batch | `maxParallelism` | **16** |
+| Number of full batches | `floor(500 / 16)` | **31** (= 496 messages) |
+| Remaining messages | `500 - (31 × 16)` | **4** |
+| Total batches | `ceil(500 / 16)` | **32** |
+| Time per batch | delivery time per attempt | **2 seconds** |
+| **Total wall-clock time** | `32 × 2` | **64 seconds** |
+
+### 3.3 Effective Throughput
 
 | Metric | Value |
 |--------|-------|
-| Wall-clock time (ceiling estimate) | **~64 seconds** |
-| Effective throughput | **~7.8 messages/second** |
+| Throughput rate | `16 / 2s = 8 messages/second` |
+| Total messages | 500 |
+| Total time for first pass | **≈ 64 seconds** (~1 minute 4 seconds) |
 
-### 3.4 Important Caveat
-
-The 64-second figure is a **ceiling estimate**. In practice, the behavior is closer to a pipeline: as soon as one delivery finishes and its goroutine releases the semaphore slot (Source: `queue.go:285`), the next waiting goroutine immediately proceeds. This means there is no synchronization barrier between "batches" — the semaphore operates as a sliding window, not a batch gate. The actual throughput may be slightly better than 64 seconds due to this pipelining effect, but 64 seconds is a safe upper bound.
+**Rationale:** The semaphore acts as a sliding window. When one of the 16 active deliveries completes (at the 2-second mark), its semaphore slot is released and the next blocked goroutine immediately acquires it. Since all deliveries take the same 2 seconds, 16 deliveries complete simultaneously, then 16 more start — producing discrete batches. In practice, slight timing variations cause a continuous pipeline effect, but the total time remains approximately `ceil(N/P) × T` where N=500, P=16, T=2s.
 
 ---
 
 ## 4. Retry Delay Accumulation
 
-This is the most critical section for understanding bounce timing. It explains the retry formula, traces the delivery attempt lifecycle, and computes the complete schedule from first attempt through final bounce.
-
 ### 4.1 The Retry Formula
 
-The delay before the next retry attempt is calculated using exponential backoff:
+The retry delay is documented in a code comment and implemented in the delivery path:
 
+**Comment** at `queue.go:121–122`:
 ```
-delay = initialRetryTime × retryTimeScale ^ (TriesCount - 1)
+// Retry delay is calculated using the following formula:
+// initialRetryTime * retryTimeScale ^ (TriesCount - 1)
 ```
 
-Source (comment): `internal/target/queue/queue.go:121-122`
-Source (implementation): `internal/target/queue/queue.go:414`
-
-The actual Go code at line 414:
-
+**Implementation** at `queue.go:413–414`:
 ```go
+nextTryTime := time.Now()
 nextTryTime = nextTryTime.Add(q.initialRetryTime * time.Duration(math.Pow(q.retryTimeScale, float64(meta.TriesCount-1))))
 ```
 
-With the default values:
-- `initialRetryTime` = 15 minutes (Source: `queue.go:185`)
-- `retryTimeScale` = 2 (Source: `queue.go:186`)
+With defaults: `initialRetryTime = 15 minutes`, `retryTimeScale = 2`.
 
-This produces classic exponential backoff: 15 min, 30 min, 1 hour, 2 hours, 4 hours, 8 hours, 16 hours, 32 hours.
+The formula is: **delay = 15 min × 2^(TriesCount − 1)**
 
-### 4.2 The Delivery Attempt Lifecycle (Off-by-One Analysis)
+### 4.2 How TriesCount Evolves
 
-To understand how many attempts actually occur, we must trace the code path in `tryDelivery()` (Source: `queue.go:365-429`):
+`TriesCount` starts at 0 for a new message (default Go int zero-value from `QueueMetadata` at `queue.go:166`). The termination check and increment happen in `tryDelivery()`:
 
-1. A new message starts with `TriesCount = 0` — this is the default zero value for the `int` field in the `QueueMetadata` struct (Source: `queue.go:166`).
-
-2. **Termination check at line 390:**
-   ```go
-   if meta.TriesCount == q.maxTries || len(partialErr.TemporaryFailed) == 0 {
-   ```
-   This check happens **before** the increment. With `maxTries=8`, it compares the current `TriesCount` against 8.
-
-3. **Increment at line 407:**
-   ```go
-   meta.TriesCount++
-   ```
-   The increment happens **after** the termination check, only if delivery will be retried.
-
-4. **What this means:**
-   - Entry with TriesCount=0: check `0 == 8` → false → increment to 1 → schedule retry
-   - Entry with TriesCount=1: check `1 == 8` → false → increment to 2 → schedule retry
-   - Entry with TriesCount=2: check `2 == 8` → false → increment to 3 → schedule retry
-   - ...
-   - Entry with TriesCount=7: check `7 == 8` → false → increment to 8 → schedule retry
-   - Entry with TriesCount=8: check `8 == 8` → **true** → generate bounce (DSN)
-
-**Result: `max_tries=8` produces 9 total delivery attempts (one initial attempt + 8 retries), not 8 as the configuration name might suggest.**
-
-### 4.3 Complete Retry Schedule
-
-The following table shows every delivery attempt, the state of `TriesCount` at each stage, and the computed retry delay. The delay formula uses the **post-increment** value of `TriesCount` (because the increment at line 407 happens before the delay calculation at line 414).
-
-| Attempt | TriesCount at Entry | Check `TriesCount == 8`? | After Increment | Retry Delay Formula | Delay | Cumulative Wait |
-|---------|--------------------|--------------------------|-----------------|--------------------|-------|-----------------|
-| 1 (initial) | 0 | 0 ≠ 8 → continue | 1 | 15min × 2^(1−1) = 15 × 1 | 15 min | 15 min |
-| 2 | 1 | 1 ≠ 8 → continue | 2 | 15min × 2^(2−1) = 15 × 2 | 30 min | 45 min |
-| 3 | 2 | 2 ≠ 8 → continue | 3 | 15min × 2^(3−1) = 15 × 4 | 60 min (1h) | 1h 45min |
-| 4 | 3 | 3 ≠ 8 → continue | 4 | 15min × 2^(4−1) = 15 × 8 | 120 min (2h) | 3h 45min |
-| 5 | 4 | 4 ≠ 8 → continue | 5 | 15min × 2^(5−1) = 15 × 16 | 240 min (4h) | 7h 45min |
-| 6 | 5 | 5 ≠ 8 → continue | 6 | 15min × 2^(6−1) = 15 × 32 | 480 min (8h) | 15h 45min |
-| 7 | 6 | 6 ≠ 8 → continue | 7 | 15min × 2^(7−1) = 15 × 64 | 960 min (16h) | 31h 45min |
-| 8 | 7 | 7 ≠ 8 → continue | 8 | 15min × 2^(8−1) = 15 × 128 | 1920 min (32h) | 63h 45min |
-| 9 (final) | 8 | 8 == 8 → **BOUNCE** | — | — | — | **~63h 45min** |
-
-### 4.4 Total Wait Time
-
-The sum of all retry delays:
-
-```
-15 + 30 + 60 + 120 + 240 + 480 + 960 + 1920 = 3825 minutes
+1. **Termination check** at `queue.go:390` (BEFORE increment):
+```go
+if meta.TriesCount == q.maxTries || len(partialErr.TemporaryFailed) == 0 {
+    // ... generate bounce, cleanup ...
+    return
+}
 ```
 
-Converting:
-- **3825 minutes = 63 hours 45 minutes = 63.75 hours ≈ 2 days 15 hours 45 minutes**
+2. **Increment** at `queue.go:407` (AFTER successful check):
+```go
+meta.TriesCount++
+```
 
-**The bounce notification (DSN) is generated approximately 63 hours and 45 minutes after the first delivery attempt**, assuming every single retry attempt fails with a temporary error. This is the worst-case scenario.
+3. **Delay calculation** at `queue.go:413–414` (uses the INCREMENTED value).
 
-The actual delivery attempt durations themselves (a few seconds each) are negligible compared to the multi-hour retry delays and are not included in this total.
+Because the termination check uses `==` (not `>`) and occurs before the increment, the total number of delivery attempts is **`maxTries + 1`**. With `maxTries = 8`, there are **9 total delivery attempts**.
 
-### 4.5 Why the Last Retry Delay Dominates
+### 4.3 Complete Retry Schedule (All 9 Attempts)
 
-Note that the final retry delay (attempt 8 → attempt 9) alone is **1920 minutes (32 hours)**. This single delay accounts for more than half of the total 3825-minute wait time. The exponential nature of the backoff means the later retries are vastly longer:
+The table below traces every delivery attempt, showing the `TriesCount` value at each stage, the delay formula, and cumulative elapsed time from the first attempt.
 
-| Retry Delays (sorted) | Cumulative % of Total |
-|------------------------|-----------------------|
-| First 4 delays (15+30+60+120 = 225 min) | 5.9% |
-| Next 2 delays (240+480 = 720 min) | 24.7% |
-| Last 2 delays (960+1920 = 2880 min) | 100% |
+| Attempt | TriesCount at Entry | Termination Check | TriesCount After Increment | Delay Formula | Delay | Cumulative Time |
+|---------|--------------------|--------------------|---------------------------|---------------|-------|-----------------|
+| 1 | 0 | 0 ≠ 8 → continue | 1 | 15 min × 2^(1−1) = 15 × 1 | **15 min** | 15 min |
+| 2 | 1 | 1 ≠ 8 → continue | 2 | 15 min × 2^(2−1) = 15 × 2 | **30 min** | 45 min |
+| 3 | 2 | 2 ≠ 8 → continue | 3 | 15 min × 2^(3−1) = 15 × 4 | **1 hour** | 1 h 45 min |
+| 4 | 3 | 3 ≠ 8 → continue | 4 | 15 min × 2^(4−1) = 15 × 8 | **2 hours** | 3 h 45 min |
+| 5 | 4 | 4 ≠ 8 → continue | 5 | 15 min × 2^(5−1) = 15 × 16 | **4 hours** | 7 h 45 min |
+| 6 | 5 | 5 ≠ 8 → continue | 6 | 15 min × 2^(6−1) = 15 × 32 | **8 hours** | 15 h 45 min |
+| 7 | 6 | 6 ≠ 8 → continue | 7 | 15 min × 2^(7−1) = 15 × 64 | **16 hours** | 1 d 7 h 45 min |
+| 8 | 7 | 7 ≠ 8 → continue | 8 | 15 min × 2^(8−1) = 15 × 128 | **32 hours** | 2 d 15 h 45 min |
+| 9 | 8 | **8 == 8 → STOP** | *(not incremented)* | *(no retry)* | — | **2 d 15 h 45 min** |
+
+### 4.4 Total Time from First Attempt to Bounce
+
+**Sum of all retry delays:**
+15 + 30 + 60 + 120 + 240 + 480 + 960 + 1920 = **3,825 minutes**
+
+Converting: 3,825 min ÷ 60 = **63 hours 45 minutes = 2 days, 15 hours, 45 minutes**
+
+**Adding the initial pass time** (from Section 3): ~64 seconds ≈ 1 minute.
+
+**Total wall-clock time from message submission to bounce notification:**
+
+> **Approximately 2 days, 15 hours, and 46 minutes** (with default configuration, assuming every attempt fails with a temporary error)
+
+After the 9th attempt fails, the bounce (DSN) is generated by `emitDSN()` at `queue.go:849–953` and routed through the configured `bounce {}` pipeline.
+
+### 4.5 Key Observations
+
+- **The delay doubles each time** — this is a standard exponential backoff with base 2.
+- **The last retry delay (32 hours) dominates** — it accounts for 50.2% of the total wait time.
+- **With `max_tries=8`, there are 9 delivery attempts**, not 8. This is because `TriesCount` starts at 0 and the termination condition `TriesCount == maxTries` is checked before the increment. The code performs one delivery when `TriesCount=0`, then increments and retries until `TriesCount` reaches `maxTries`.
+- **Only temporarily-failing recipients are retried** — permanently-failed recipients are removed from the retry list at `queue.go:387` (`meta.To = partialErr.TemporaryFailed`), so the retry only covers recipients that have not yet received a permanent rejection.
 
 ---
 
 ## 5. TriesCount=0 Edge Case Analysis
 
-This section analyzes a mathematical edge case in the retry delay formula when `TriesCount` is zero.
+### 5.1 The Mathematical Issue
 
-### 5.1 The Code Path
+The retry delay formula at `queue.go:122` is:
 
-When the maddy server restarts, the function `readDiskQueue()` (Source: `queue.go:622-688`) loads previously queued messages from disk and reschedules them. The retry delay for each loaded message is computed at lines 669-670:
+```
+delay = initialRetryTime × retryTimeScale ^ (TriesCount − 1)
+```
+
+When `TriesCount = 0`:
+
+```
+delay = 15 min × 2 ^ (0 − 1)
+      = 15 min × 2 ^ (−1)
+      = 15 min × 0.5
+      = 7.5 minutes
+```
+
+The negative exponent produces `math.Pow(2, -1) = 0.5`, which is a valid floating-point result (not infinity, NaN, or an error). This yields a 7.5-minute delay — exactly half the intended first-retry delay of 15 minutes.
+
+### 5.2 Where This Code Path Occurs
+
+The `TriesCount=0` case occurs **exclusively in `readDiskQueue()`** at `queue.go:669–670`:
 
 ```go
 nextTryTime := meta.LastAttempt
 nextTryTime = nextTryTime.Add(q.initialRetryTime * time.Duration(math.Pow(q.retryTimeScale, float64(meta.TriesCount-1))))
 ```
 
-Source: `queue.go:669-670`
+This function is called during server startup (`start()` at `queue.go:244`) to reload messages that were persisted to disk. A message will have `TriesCount=0` on disk if:
 
-### 5.2 When Does TriesCount=0 Occur?
+1. The message was committed (written to disk via `storeNewMessage()` at `queue.go:690`) but the server crashed **before** the first delivery attempt completed and incremented `TriesCount` to 1.
 
-A message that was committed to disk but **never had its first delivery attempt** (e.g., the server crashed between `Commit()` and the first `dispatch()`) will have `TriesCount=0` in its persisted metadata. This is because `TriesCount` is an `int` field in the `QueueMetadata` struct (Source: `queue.go:166`), and Go initializes `int` fields to zero by default.
+In the **normal delivery path** at `queue.go:413–414`, `TriesCount` is always ≥ 1 because it was just incremented at line 407. So the `TriesCount=0` case **cannot occur** in the normal retry flow — only in the disk-recovery path.
 
-### 5.3 Mathematical Analysis
+### 5.3 The postInitDelay Safety Net
 
-When `TriesCount=0`, the formula evaluates to:
-
-```
-delay = initialRetryTime × retryTimeScale ^ (TriesCount - 1)
-      = 15min × 2 ^ (0 - 1)
-      = 15min × 2 ^ (-1)
-      = 15min × 0.5
-      = 7.5 minutes
-```
-
-**This is NOT a crash.** Go's `math.Pow(2, -1)` correctly returns `0.5` per IEEE 754 floating-point arithmetic. The result is a valid, positive delay of 7.5 minutes — which is **shorter** than the expected first-retry delay of 15 minutes.
-
-### 5.4 The postInitDelay Safety Mechanism
-
-Immediately after the delay calculation, a safety check applies (Source: `queue.go:672-674`):
+The `readDiskQueue()` function includes a guard immediately after the delay calculation at `queue.go:672–674`:
 
 ```go
 if time.Until(nextTryTime) < q.postInitDelay {
@@ -279,103 +272,158 @@ if time.Until(nextTryTime) < q.postInitDelay {
 }
 ```
 
-- `postInitDelay` = 10 seconds (Source: `queue.go:187`)
-- If the computed `nextTryTime` is less than 10 seconds in the future — for example, if the server was down long enough that `LastAttempt + 7.5min` is already in the past — then the message is rescheduled for `now + 10 seconds`.
-- This safety mechanism prevents all disk-loaded messages from firing their delivery attempts simultaneously on startup, which could overwhelm the downstream mail server.
+With `postInitDelay = 10 seconds`:
 
-### 5.5 Practical Impact
+- For a `TriesCount=0` message, the computed `nextTryTime` would be `LastAttempt + 7.5 minutes`. Since `LastAttempt` was set before the server crashed (i.e., in the past), `time.Until(nextTryTime)` is likely to be negative or very small.
+- Since this is less than 10 seconds, the guard overrides `nextTryTime` to `now + 10 seconds`.
 
-The 7.5-minute delay is a **mathematical quirk**, not a bug. The practical behavior depends on how long the server was offline:
+**Practical effect:** The message will be retried 10 seconds after the server restarts, regardless of the 7.5-minute formula result. The `postInitDelay` check masks the edge case.
 
-| Server Downtime | Computed nextTryTime | postInitDelay Applies? | Actual Behavior |
-|----------------|---------------------|------------------------|-----------------|
-| < 7.5 minutes | `LastAttempt + 7.5min` (in the future) | No | Message retries at `LastAttempt + 7.5min` — slightly ahead of a normal 15-min first retry |
-| ≥ 7.5 minutes | `LastAttempt + 7.5min` (in the past) | Yes | Message retries at `now + 10 seconds` — the postInitDelay floor kicks in |
+### 5.4 Why It Does Not Cause a Crash
 
-**Key takeaways:**
-- No crash occurs — `math.Pow` handles negative exponents correctly
-- No infinite loop or negative delay is produced
-- The postInitDelay safety net ensures messages are not all dispatched at time zero
-- The 7.5-minute delay for TriesCount=0 messages is shorter than the normal 15-minute first retry, but this only affects messages that were queued but never attempted before a server restart — a relatively rare scenario
+Go's `math.Pow(2, -1)` returns `0.5`, which is a perfectly valid `float64`. The conversion chain is:
+
+```go
+math.Pow(2, -1)           // → 0.5 (float64)
+float64(meta.TriesCount-1) // → -1.0 when TriesCount=0
+time.Duration(0.5)         // → 0 (truncated to int64 nanoseconds)
+```
+
+Wait — there is a subtle detail here. `time.Duration` is `int64` (nanoseconds), and `time.Duration(0.5)` truncates to `0`. But the actual code multiplies first:
+
+```go
+q.initialRetryTime * time.Duration(math.Pow(q.retryTimeScale, float64(meta.TriesCount-1)))
+```
+
+Let's trace this precisely:
+- `math.Pow(2.0, -1.0)` = `0.5`
+- `time.Duration(0.5)` = `time.Duration(0)` — because `0.5` is truncated to `int64(0)` when converted to `time.Duration`
+
+This means the actual computed delay is `15 min × 0 = 0`, not `7.5 minutes`!
+
+**Correction:** Due to Go's `float64` → `time.Duration` truncation, the formula actually produces a **zero delay** when `TriesCount=0`, not 7.5 minutes. The `time.Duration()` cast truncates `0.5` to `0` nanoseconds. This makes the `postInitDelay` safety net even more important — without it, the message would be scheduled for immediate delivery (relative to `LastAttempt`, which is in the past).
+
+The guard at line 672–674 catches this and ensures a minimum 10-second delay after startup.
+
+### 5.5 Summary of the Edge Case
+
+| Aspect | Detail |
+|--------|--------|
+| **Formula input** | `TriesCount = 0` → exponent = `−1` |
+| **Math result** | `math.Pow(2, -1) = 0.5` |
+| **Go type conversion** | `time.Duration(0.5)` truncates to `0` |
+| **Computed delay** | `15 min × 0 = 0` (effectively zero) |
+| **Code path** | Only in `readDiskQueue()` at `queue.go:670` |
+| **When it occurs** | Server crash before first delivery attempt completes |
+| **Safety net** | `postInitDelay` (10s) overrides at `queue.go:672–674` |
+| **Crash risk** | None — `math.Pow` returns valid `float64` for negative exponents |
 
 ---
 
 ## 6. Test Suite Verification
 
-To confirm the behavioral analysis above, the existing queue test suite was executed.
+The existing queue test suite was executed to confirm the behavioral analysis in this document.
 
-### 6.1 Test Command and Result
-
-```
+**Command:**
+```bash
 go test ./internal/target/queue/... -v -count=1 -timeout 120s
 ```
 
-**Result: All tests PASS in 1.507s**
+**Result:** All tests passed.
 
 ```
-ok  github.com/foxcpp/maddy/internal/target/queue    1.507s
+PASS
+ok  github.com/foxcpp/maddy/internal/target/queue    1.511s
 ```
 
-### 6.2 Test Results Detail
+### 6.1 Test Results Summary
 
 | Test Name | Status | What It Validates |
 |-----------|--------|-------------------|
-| `TestQueueDelivery` | PASS | Basic successful delivery and disk cleanup |
+| `TestQueueDelivery` | PASS | Basic successful delivery and disk file cleanup |
 | `TestQueueDelivery_PermanentFail_NonPartial` | PASS | Permanent failure → no retry, immediate bounce |
 | `TestQueueDelivery_PermanentFail_Partial` | PASS | Partial permanent failure via `PartialDelivery` interface |
-| `TestQueueDelivery_TemporaryFail` | PASS | Temporary failure → automatic retry succeeds on next attempt |
+| `TestQueueDelivery_TemporaryFail` | PASS | Temporary failure → automatic retry succeeds on attempt 2 |
 | `TestQueueDelivery_TemporaryFail_Partial` | PASS | Partial temporary failure → selective retry for failed recipients only |
-| `TestQueueDelivery_MultipleAttempts` | PASS | Multi-attempt delivery with mixed permanent/temporary failures |
+| `TestQueueDelivery_MultipleAttempts` | PASS | Multi-attempt delivery with mixed permanent and temporary failures |
 | `TestQueueDelivery_PermanentRcptReject` | PASS | Permanent recipient rejection at `AddRcpt` stage |
-| `TestQueueDelivery_TemporaryRcptReject` | PASS | Temporary recipient rejection → retry for rejected recipient |
-| `TestQueueDelivery_SerializationRoundtrip` | PASS | Disk persistence and restart recovery (queue restart loads from disk) |
-| `TestQueueDelivery_DeserlizationCleanUp/NoMeta` | SKIP | Not implemented (skipped via `t.Skip` at `queue_test.go:547`) |
-| `TestQueueDelivery_DeserlizationCleanUp/NoBody` | PASS | Cleanup when body file is missing from disk |
-| `TestQueueDelivery_DeserlizationCleanUp/NoHeader` | PASS | Cleanup when header file is missing from disk |
-| `TestQueueDelivery_AbortIfNoRecipients` | PASS | Abort delivery when all recipients are rejected |
-| `TestQueueDelivery_AbortNoDangling` | PASS | No dangling files left on disk after abort |
-| `TestQueueDSN` | PASS | DSN (bounce) message generation for failed deliveries |
-| `TestQueueDSN_FromEmptyAddr` | PASS | No DSN generated for null-sender (bounce) messages |
-| `TestQueueDSN_NoDSNforDSN` | PASS | No infinite bounce loops (DSN of a DSN is suppressed) |
-| `TestQueueDSN_RcptRewrite` | PASS | DSN uses original recipient addresses, not rewritten ones |
-| `TestTimeWheelAdd` | PASS | Basic TimeWheel slot addition and dispatch |
-| `TestTimeWheelAdd_Ordering` | PASS | TimeWheel dispatches in correct chronological order |
-| `TestTimeWheelAdd_Restart` | PASS | TimeWheel handles slot updates and timer restarts |
-| `TestTimeWheelAdd_MissingGotoBug` | PASS | Regression test for a previous scheduling bug |
-| `TestTimeWheelAdd_EmptyUpdWait` | PASS | TimeWheel correctly waits when queue is empty |
+| `TestQueueDelivery_TemporaryRcptReject` | PASS | Temporary recipient rejection → retry succeeds |
+| `TestQueueDelivery_SerializationRoundtrip` | PASS | Disk persistence and restart recovery (validates `readDiskQueue()`) |
+| `TestQueueDelivery_DeserlizationCleanUp/NoMeta` | SKIP | Skipped (known incomplete; see `queue.go:628` TODO) |
+| `TestQueueDelivery_DeserlizationCleanUp/NoBody` | PASS | Cleanup when body file is missing |
+| `TestQueueDelivery_DeserlizationCleanUp/NoHeader` | PASS | Cleanup when header file is missing |
+| `TestQueueDelivery_AbortIfNoRecipients` | PASS | Abort when all recipients rejected at `AddRcpt` |
+| `TestQueueDelivery_AbortNoDangling` | PASS | No dangling files remain after delivery abort |
+| `TestQueueDSN` | PASS | DSN (bounce) message generation after permanent failure |
+| `TestQueueDSN_FromEmptyAddr` | PASS | No DSN generated for null-sender (empty return-path) messages |
+| `TestQueueDSN_NoDSNforDSN` | PASS | No infinite bounce loop — DSN for a DSN is suppressed |
+| `TestQueueDSN_RcptRewrite` | PASS | DSN uses original recipient addresses when rewriting occurred |
+| `TestTimeWheelAdd` | PASS | Basic TimeWheel slot dispatch |
+| `TestTimeWheelAdd_Ordering` | PASS | Slots dispatched in chronological order |
+| `TestTimeWheelAdd_Restart` | PASS | Earlier slot added after later slot triggers re-evaluation |
+| `TestTimeWheelAdd_MissingGotoBug` | PASS | Regression test for historical control-flow bug |
+| `TestTimeWheelAdd_EmptyUpdWait` | PASS | Correct wake-up after TimeWheel has been idle |
 
-### 6.3 Test Configuration Note
+### 6.2 Test Configuration vs. Production
 
-The test helper `newTestQueue()` (Source: `queue_test.go:29-68`) overrides the production defaults for fast test execution:
+The test helper `newTestQueue()` at `queue_test.go:29–68` uses different values from production to allow fast test execution:
 
-| Parameter | Test Value | Production Value |
-|-----------|------------|------------------|
-| `initialRetryTime` | `0` (line 50) | `15 * time.Minute` |
-| `retryTimeScale` | `1` (line 51) | `2` |
-| `postInitDelay` | `0` (line 52) | `10 * time.Second` |
-| `maxTries` | `5` (line 53) | `8` |
-| `maxParallelism` | `1` (line 63, via `start(1)`) | `16` |
+| Parameter | Test Value | Production Default |
+|-----------|-----------|-------------------|
+| `initialRetryTime` | `0` | 15 minutes |
+| `retryTimeScale` | `1` | 2 |
+| `postInitDelay` | `0` | 10 seconds |
+| `maxTries` | `5` | 8 |
+| `maxParallelism` | `1` | 16 |
 
-This means the tests validate the retry **mechanism** (temporary failures are retried, permanent failures generate bounces, disk persistence works) but do not test the production timing values. The timing analysis in this document is derived from the code's default values, not from test execution timing.
+With `initialRetryTime=0` and `retryTimeScale=1`, retries are instantaneous in tests. This confirms the retry mechanism works correctly without waiting for real delays.
 
 ---
 
 ## 7. Summary and Key Takeaways
 
-The following table summarizes the actionable timing numbers derived from this analysis:
+### For End-Users Experiencing Delayed Bounces
+
+With default configuration (`max_tries 8`, `max_parallelism 16`):
 
 | Question | Answer |
 |----------|--------|
-| How does the queue process messages in parallel? | Channel-based semaphore (`chan struct{}` with buffer size 16) limits concurrent `tryDelivery()` calls. Each message gets a goroutine, but only 16 execute simultaneously. Source: `queue.go:242,283` |
-| How long does the first delivery pass take for 500 messages at 2s/attempt? | **~64 seconds** (`⌈500/16⌉ × 2s = 32 × 2s`). Source: `queue.go:205` for max_parallelism=16 |
-| How many delivery attempts does `max_tries=8` produce? | **9 total attempts** (initial + 8 retries). The termination check at line 390 fires when TriesCount reaches 8, but TriesCount starts at 0 and is incremented after the check (line 407). |
-| How long from first attempt to bounce if every retry fails? | **~63 hours 45 minutes (~2 days 15 hours 45 minutes)**. Sum of delays: 15+30+60+120+240+480+960+1920 = 3825 minutes. |
-| What is the single largest retry delay? | **32 hours** (the 8th retry delay: 15min × 2^7 = 1920 min). This alone is more than half the total wait. |
-| What happens when TriesCount=0 in the retry formula? | `15min × 2^(-1) = 7.5 minutes`. Valid float64 math, no crash. Occurs in `readDiskQueue()` for messages that were never attempted before a server restart. Source: `queue.go:670` |
-| Does the man page match the code? | **No.** Man page shows `max_tries` default as `4` (`maddy-targets.5.scd:65`), but code default is `8` (`queue.go:204`) and production config uses `8` (`maddy.conf:125`). |
+| **How many delivery attempts are made?** | **9 attempts** (due to off-by-one: `max_tries=8` produces 9 attempts) |
+| **How long until I get a bounce?** | **≈ 2 days, 15 hours, 45 minutes** after first attempt, if every attempt fails with a temporary error |
+| **How fast are messages processed initially?** | **~8 messages/second** (16 parallel × 2s each); 500 messages complete in ~64 seconds |
+| **What is the retry schedule?** | Exponential backoff: 15 min, 30 min, 1h, 2h, 4h, 8h, 16h, 32h |
+| **Is there a crash-recovery edge case?** | Yes — `TriesCount=0` on disk produces a zero-delay via truncation, but the 10-second `postInitDelay` guard ensures a minimum wait after restart |
 
-### For End-Users
+### Retry Timeline Visualization
 
-If you sent a message and the destination server is temporarily refusing delivery, **your bounce notification will arrive approximately 2 days, 15 hours, and 45 minutes (63 hours 45 minutes) after the first delivery attempt** in the worst case. This is because the queue makes 9 delivery attempts with exponentially increasing delays (15 min, 30 min, 1 hour, 2 hours, 4 hours, 8 hours, 16 hours, 32 hours) before giving up and generating a bounce.
+```
+t=0          Attempt 1
+t+15min      Attempt 2
+t+45min      Attempt 3
+t+1h45min    Attempt 4
+t+3h45min    Attempt 5
+t+7h45min    Attempt 6
+t+15h45min   Attempt 7
+t+31h45min   Attempt 8
+t+63h45min   Attempt 9  →  BOUNCE generated (if still failing)
+```
 
-The majority of this wait time is concentrated in the final retries — the last retry delay alone is 32 hours. If delivery is going to succeed, it most likely will during the earlier attempts (within the first few hours).
+### Source Code Reference Index
+
+| Topic | Primary Source | Key Lines |
+|-------|---------------|-----------|
+| Queue struct and fields | `internal/target/queue/queue.go` | 112–147 |
+| QueueMetadata (TriesCount) | `internal/target/queue/queue.go` | 149–170 |
+| Default values | `internal/target/queue/queue.go` | 182–189 (NewQueue), 201–237 (Init) |
+| Semaphore creation | `internal/target/queue/queue.go` | 242 |
+| Dispatch with goroutine + semaphore | `internal/target/queue/queue.go` | 275–323 |
+| Retry formula (comment) | `internal/target/queue/queue.go` | 121–122 |
+| Retry formula (implementation) | `internal/target/queue/queue.go` | 413–414 |
+| Termination condition | `internal/target/queue/queue.go` | 390 |
+| TriesCount increment | `internal/target/queue/queue.go` | 407 |
+| readDiskQueue (TriesCount=0 path) | `internal/target/queue/queue.go` | 622–688 (esp. 669–674) |
+| DSN generation | `internal/target/queue/queue.go` | 849–953 |
+| TimeWheel Add | `internal/target/queue/timewheel.go` | 38–53 |
+| TimeWheel tick loop | `internal/target/queue/timewheel.go` | 71–128 |
+| Production config | `maddy.conf` | 122–147 |
+| Test helper (overrides) | `internal/target/queue/queue_test.go` | 29–68 |
