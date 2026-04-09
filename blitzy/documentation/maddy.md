@@ -16,12 +16,7 @@ sender's DMARC record.
 (`maddy.conf` lines 53–70) configures the following check pipeline:
 
 ```
-check {
-    require_matching_ehlo
-    require_mx_record
-    verify_dkim
-    apply_spf
-}
+check { ...  apply_spf }
 dmarc yes
 ```
 
