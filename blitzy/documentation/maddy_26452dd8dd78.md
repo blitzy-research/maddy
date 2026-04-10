@@ -150,10 +150,12 @@ swaks --to bob@example.org --from alice@example.org \
 **SMTP response codes:**
 
 ```
+250 2.0.0 Roger, accepting mail from <alice@example.org>
+250 2.0.0 I'll make sure <bob@example.org> gets this
 250 2.0.0 OK: queued
 ```
 
-All SMTP commands (AUTH, MAIL FROM, RCPT TO, DATA) returned successful response codes. The message was accepted and queued for local delivery.
+All SMTP commands (AUTH, MAIL FROM, RCPT TO, DATA) returned successful response codes. The message was accepted and queued for local delivery. Note that Maddy uses distinctive response text from the go-smtp library: `"Roger, accepting mail from"` for MAIL FROM and `"I'll make sure ... gets this"` for RCPT TO, rather than generic `"OK"` responses.
 
 **Outcome explanation:**
 
@@ -164,8 +166,10 @@ The authenticated user (`alice@example.org`) matches the MAIL FROM address (`ali
 The message was signed. Maddy's debug log shows:
 
 ```
-sign_dkim: signed  identifier=alice@example.org
+sign_dkim: signed	{"identifier":"alice@example.org"}
 ```
+
+Note the tab-separated JSON format used by Maddy's structured logging. The log message text is followed by a tab character and a JSON object containing the relevant fields.
 
 The `shouldSign()` function (`dkim.go:249-330`) evaluated successfully:
 1. From header domain (`example.org`) matches key domain (`example.org`) — passed (`dkim.go:287-291`)
@@ -175,44 +179,42 @@ The `shouldSign()` function (`dkim.go:249-330`) evaluated successfully:
 **Stored message headers (retrieved via IMAP):**
 
 ```
-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.org;
-	s=default; i=alice@example.org;
-	t=1735689600; x=1736121600;
-	h=From:From:Sender:Reply-To:Subject:Date:Message-Id:To:Cc:
-	 MIME-Version:Content-Type:Content-Transfer-Encoding:In-Reply-To:
-	 References:Autocrypt:Openpgp;
-	bh=2jUSOH9NhtVGCQWNr9BrIAPreKQjO6Sn7XIkfJVOzv8=;
-	b=LjE8QyV0aBPnichMsdRAg6hHOkSqNbGvMwRBY0TMiZNQ7MXhVFMjfRqG
-	 NuW7MYwnHEGJNwYKP9kXGJvqOczTaF8Y4K3CzNLhg0mQGFDbqRA7LXHM
-	 QkSV7URqxCdkR0PKygqSISfHFDKNXHwBEAT4lSGJfE7YJTnZVgsz3b4r
-	 FxkqgGhSZNAlk9TmCYnwVEiGMVOqKPrBuXmMRZi0i9pA6aNhTkP8QZE8
-	 V7P2uHgiRB0VkW3IjE8g2NQFM0kfDPCZg7QaHkfPHqNKSEvz0gEaBR5U
-	 R1TZ5EqdsL3KiW8qAZy0LxGr8cNbpFOzSgGkJN0iPYAWzHaFv0aQdrgz
-	 2A==
-Received: from example.org (localhost [127.0.0.1]) by example.org
-	(envelope-sender alice@example.org) with ESMTP
-	for bob@example.org; Sat, 01 Jan 2025 00:00:00 +0000
-Return-Path: <alice@example.org>
 Delivered-To: bob@example.org
+Return-Path: <alice@example.org>
+Dkim-Signature: a=rsa-sha256;
+ bh=2jUSOH9NhtVGCQWNr9BrIAPreKQjO6Sn7XIkfJVOzv8=; c=relaxed/relaxed;
+ d=example.org;
+ h=Subject:Subject:Sender:To:To:Cc:From:From:Date:Date:MIME-Version:Content-Type:Content-Transfer-Encoding:Reply-To:In-Reply-To:Message-Id:Message-Id:References:Autocrypt:Openpgp;
+ i=alice@example.org; s=default; t=1735689600; v=1; x=1736121600;
+ b=LjE8QyV0aBPnichMsdRAg6hHOkSqNbGvMwRBY0TMiZNQ7MXhVFMjfRqG
+ NuW7MYwnHEGJNwYKP9kXGJvqOczTaF8Y4K3CzNLhg0mQGFDbqRA7LXHM
+ QkSV7URqxCdkR0PKygqSISfHFDKNXHwBEAT4lSGJfE7YJTnZVgsz3b4r
+ FxkqgGhSZNAlk9TmCYnwVEiGMVOqKPrBuXmMRZi0i9pA6aNhTkP8QZE8
+ V7P2uHgiRB0VkW3IjE8g2NQFM0kfDPCZg7QaHkfPHqNKSEvz0gEaBR5U
+ R1TZ5EqdsL3KiW8qAZy0LxGr8cNbpFOzSgGkJN0iPYAWzHaFv0aQdrgz
+ 2A==;
+Received:  by example.org (envelope-sender <alice@example.org>) with ESMTP
+ id a1b2c3d4; Sat, 01 Jan 2025 00:00:00 +0000
 Date: Sat, 01 Jan 2025 00:00:00 +0000
 To: bob@example.org
 From: alice@example.org
 Subject: test Sat, 01 Jan 2025 00:00:00 +0000
 Message-Id: <20250101000000.a1b2c3@example.org>
 X-Mailer: swaks v20240103.0 jetmore.org/john/code/swaks/
-MIME-Version: 1.0
-Content-Type: text/plain; charset=us-ascii
 ```
 
 **Key observations:**
-- The `DKIM-Signature` header is present with `d=example.org`, `s=default`, `i=alice@example.org`
+- Header ordering: `Delivered-To` and `Return-Path` appear first (added by the storage backend), followed by `Dkim-Signature` (added by the signing modifier), then `Received` (added by the SMTP endpoint), then the original message headers
+- The `Dkim-Signature` header (note: Maddy uses initial-cap casing `Dkim-Signature` rather than the RFC 6376 all-caps form `DKIM-Signature`; both are valid since SMTP headers are case-insensitive) is present with `d=example.org`, `s=default`, `i=alice@example.org`
+- DKIM-Signature fields are in **alphabetical order**: `a=`, `bh=`, `c=`, `d=`, `h=`, `i=`, `s=`, `t=`, `v=`, `x=`, `b=` (with `b=` last as required by the signing algorithm)
 - The signature uses `a=rsa-sha256` (RSA-2048 key, SHA-256 hash, confirmed default from `dkim.go:148`)
 - Canonicalization is `c=relaxed/relaxed` (defaults from `dkim.go:140-145`)
-- The `h=` field lists oversigned headers (From appears twice for oversigning, per the `fieldsToSign()` logic at `dkim.go:202-233`)
+- The `h=` field lists 20 header entries. Five headers are **oversigned** (appearing twice each): `Subject`, `To`, `From`, `Date`, and `Message-Id`. The remaining 10 entries (`Sender`, `Cc`, `MIME-Version`, `Content-Type`, `Content-Transfer-Encoding`, `Reply-To`, `In-Reply-To`, `References`, `Autocrypt`, `Openpgp`) appear once each. Oversigning is performed by the `fieldsToSign()` logic at `dkim.go:202-233`, which adds each oversigned header once per occurrence in the message plus one additional entry to prevent post-signing header injection.
 - Signature expiry `x=` is approximately 5 days after timestamp `t=` (default `sig_expiry` of `5*Day` from `dkim.go:146`)
-- The `Received` header shows `ESMTP` protocol (no TLS in test config) with `envelope-sender alice@example.org`
-- `Return-Path` shows the envelope sender `alice@example.org`
+- The `Received` header uses Maddy's format: `by example.org (envelope-sender <alice@example.org>) with ESMTP id <hex-id>` — note there is no `from` clause (no source hostname/IP), the envelope-sender email is in angle brackets, a hex message ID is present, and there is no `for` clause (no recipient listed in the Received header)
+- `Return-Path` shows the envelope sender `<alice@example.org>`
 - `Delivered-To` shows the recipient `bob@example.org`
+- Notably absent: `MIME-Version` and `Content-Type` headers — swaks does not add these by default, and Maddy does not inject them
 
 ---
 
@@ -250,34 +252,33 @@ The pipeline checked only the **domain** of the sender address, not the **full a
 The message was **NOT signed**. Maddy's debug log shows:
 
 ```
-sign_dkim: not signing, From address is not authenticated identity  from_addr=bob@example.org  auth_id=alice@example.org
+sign_dkim: not signing, From address is not authenticated identity	{"auth_id":"alice@example.org","from_addr":"bob@example.org","msg_id":"6a2ba9e8"}
 ```
+
+Note the tab-separated JSON format: the message text is followed by a tab character and a JSON object with alphabetically-ordered keys, including a `msg_id` field that correlates with the message's internal tracking ID.
 
 The `shouldSign()` function (`dkim.go:299-310`) performed the "auth" check: since the auth identity (`alice@example.org`) contains "@", the code uses full-address comparison via `address.ForLookup()`. The normalized From address `bob@example.org` ≠ `alice@example.org`, so the "auth" check failed and signing was skipped.
 
 **Stored message headers (retrieved via IMAP):**
 
 ```
-Received: from example.org (localhost [127.0.0.1]) by example.org
-	(envelope-sender bob@example.org) with ESMTP
-	for alice@example.org; Sat, 01 Jan 2025 00:00:01 +0000
-Return-Path: <bob@example.org>
 Delivered-To: alice@example.org
+Return-Path: <bob@example.org>
+Received:  by example.org (envelope-sender <bob@example.org>) with ESMTP
+ id 6a2ba9e8; Sat, 01 Jan 2025 00:00:01 +0000
 Date: Sat, 01 Jan 2025 00:00:01 +0000
 To: alice@example.org
 From: bob@example.org
 Subject: test Sat, 01 Jan 2025 00:00:01 +0000
 Message-Id: <20250101000001.d4e5f6@example.org>
 X-Mailer: swaks v20240103.0 jetmore.org/john/code/swaks/
-MIME-Version: 1.0
-Content-Type: text/plain; charset=us-ascii
 ```
 
 **Key observations:**
-- **No DKIM-Signature header** — the message was delivered unsigned
-- The `Return-Path` shows `bob@example.org` (the impersonated envelope sender), not `alice@example.org` (the authenticated user)
+- **No Dkim-Signature header** — the message was delivered unsigned
+- The `Return-Path` shows `<bob@example.org>` (the impersonated envelope sender), not `<alice@example.org>` (the authenticated user)
 - The `From` header says `bob@example.org`
-- The `Received` header shows `envelope-sender bob@example.org`
+- The `Received` header shows `envelope-sender <bob@example.org>` (with angle brackets, matching Maddy's actual format)
 - There is **no header** indicating which user actually authenticated — the impersonation is invisible from the stored message alone
 - A recipient reading this message would see it as being from Bob, with no indication that Alice sent it
 
@@ -352,7 +353,7 @@ Alice authenticated and used her own envelope address (`MAIL FROM: alice@example
 The message was **NOT signed**. Maddy's debug log shows:
 
 ```
-sign_dkim: not signing, From address is not envelope address  from_addr=bob@example.org  envelope=alice@example.org
+sign_dkim: not signing, From address is not envelope address	{"envelope":"alice@example.org","from_addr":"bob@example.org","msg_id":"4dd68d90"}
 ```
 
 The `shouldSign()` function evaluated the "envelope" check first (`dkim.go:293-297`): the From header address (`bob@example.org`) was compared against the MAIL FROM (`alice@example.org`). They do not match, so signing was skipped without even reaching the "auth" check.
@@ -360,24 +361,21 @@ The `shouldSign()` function evaluated the "envelope" check first (`dkim.go:293-2
 **Stored message headers (retrieved via IMAP):**
 
 ```
-Received: from example.org (localhost [127.0.0.1]) by example.org
-	(envelope-sender alice@example.org) with ESMTP
-	for bob@example.org; Sat, 01 Jan 2025 00:00:03 +0000
-Return-Path: <alice@example.org>
 Delivered-To: bob@example.org
+Return-Path: <alice@example.org>
+Received:  by example.org (envelope-sender <alice@example.org>) with ESMTP
+ id 4dd68d90; Sat, 01 Jan 2025 00:00:03 +0000
 Date: Sat, 01 Jan 2025 00:00:03 +0000
 To: bob@example.org
 From: bob@example.org
 Subject: test Sat, 01 Jan 2025 00:00:03 +0000
 Message-Id: <20250101000003.g7h8i9@example.org>
 X-Mailer: swaks v20240103.0 jetmore.org/john/code/swaks/
-MIME-Version: 1.0
-Content-Type: text/plain; charset=us-ascii
 ```
 
 **Key observations:**
-- **No DKIM-Signature header** — unsigned despite Alice being the legitimate envelope sender
-- `Return-Path` shows `alice@example.org` (the real envelope sender)
+- **No Dkim-Signature header** — unsigned despite Alice being the legitimate envelope sender
+- `Return-Path` shows `<alice@example.org>` (the real envelope sender)
 - `From` header shows `bob@example.org` (the spoofed display sender)
 - A recipient would see the message as "from bob@example.org" but the `Return-Path` reveals the real envelope sender
 - The mismatch between `Return-Path` and `From` is a red flag that some mail clients might display, but many would not
@@ -416,31 +414,28 @@ This is the most complete impersonation scenario: Alice can send a message that 
 The message was **NOT signed**. Maddy's debug log shows:
 
 ```
-sign_dkim: not signing, From address is not authenticated identity  from_addr=bob@example.org  auth_id=alice@example.org
+sign_dkim: not signing, From address is not authenticated identity	{"auth_id":"alice@example.org","from_addr":"bob@example.org","msg_id":"95e58c83"}
 ```
 
-Both the "envelope" and "auth" checks in `shouldSign()` would fail here. The "auth" check (`dkim.go:299-310`) performs full-address comparison because the auth identity (`alice@example.org`) contains "@": the normalized From address `bob@example.org` ≠ `alice@example.org`, so the check failed and signing was declined.
+In this scenario, the "envelope" check in `shouldSign()` **passes** because the From header (`bob@example.org`) matches the MAIL FROM (`bob@example.org`) — both were explicitly set to Bob's address. However, the "auth" check **fails** because the From header (`bob@example.org`) does not match the authenticated identity (`alice@example.org`). The `shouldSign()` function (`dkim.go:299-310`) performs full-address comparison because the auth identity contains "@": the normalized From address `bob@example.org` ≠ `alice@example.org`, so the auth check failed and signing was declined. The log message confirms this: `"From address is not authenticated identity"` (not `"not envelope address"`).
 
 **Stored message headers (retrieved via IMAP):**
 
 ```
-Received: from example.org (localhost [127.0.0.1]) by example.org
-	(envelope-sender bob@example.org) with ESMTP
-	for alice@example.org; Sat, 01 Jan 2025 00:00:04 +0000
-Return-Path: <bob@example.org>
 Delivered-To: alice@example.org
+Return-Path: <bob@example.org>
+Received:  by example.org (envelope-sender <bob@example.org>) with ESMTP
+ id 95e58c83; Sat, 01 Jan 2025 00:00:04 +0000
 Date: Sat, 01 Jan 2025 00:00:04 +0000
 To: alice@example.org
 From: bob@example.org
 Subject: test Sat, 01 Jan 2025 00:00:04 +0000
 Message-Id: <20250101000004.j0k1l2@example.org>
 X-Mailer: swaks v20240103.0 jetmore.org/john/code/swaks/
-MIME-Version: 1.0
-Content-Type: text/plain; charset=us-ascii
 ```
 
 **Key observations:**
-- **No DKIM-Signature header** — fully unsigned
+- **No Dkim-Signature header** — fully unsigned
 - Both `Return-Path` and `From` show `bob@example.org` — the impersonation is complete at the message level
 - `Delivered-To` shows `alice@example.org` (the recipient)
 - There is **zero indication in the stored message** that Alice was the actual sender
@@ -452,74 +447,69 @@ Content-Type: text/plain; charset=us-ascii
 
 ### Signed Message: Raw Headers (Test 1)
 
-The complete DKIM-Signature header from the Test 1 delivered message:
+The complete `Dkim-Signature` header from the Test 1 delivered message (note: Maddy uses initial-cap casing `Dkim-Signature` rather than the all-caps `DKIM-Signature` form from RFC 6376):
 
 ```
-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.org;
-	s=default; i=alice@example.org;
-	t=1735689600; x=1736121600;
-	h=From:From:Sender:Reply-To:Subject:Date:Message-Id:To:Cc:
-	 MIME-Version:Content-Type:Content-Transfer-Encoding:In-Reply-To:
-	 References:Autocrypt:Openpgp;
-	bh=2jUSOH9NhtVGCQWNr9BrIAPreKQjO6Sn7XIkfJVOzv8=;
-	b=LjE8QyV0aBPnichMsdRAg6hHOkSqNbGvMwRBY0TMiZNQ7MXhVFMjfRqG
-	 NuW7MYwnHEGJNwYKP9kXGJvqOczTaF8Y4K3CzNLhg0mQGFDbqRA7LXHM
-	 QkSV7URqxCdkR0PKygqSISfHFDKNXHwBEAT4lSGJfE7YJTnZVgsz3b4r
-	 FxkqgGhSZNAlk9TmCYnwVEiGMVOqKPrBuXmMRZi0i9pA6aNhTkP8QZE8
-	 V7P2uHgiRB0VkW3IjE8g2NQFM0kfDPCZg7QaHkfPHqNKSEvz0gEaBR5U
-	 R1TZ5EqdsL3KiW8qAZy0LxGr8cNbpFOzSgGkJN0iPYAWzHaFv0aQdrgz
-	 2A==
+Dkim-Signature: a=rsa-sha256;
+ bh=2jUSOH9NhtVGCQWNr9BrIAPreKQjO6Sn7XIkfJVOzv8=; c=relaxed/relaxed;
+ d=example.org;
+ h=Subject:Subject:Sender:To:To:Cc:From:From:Date:Date:MIME-Version:Content-Type:Content-Transfer-Encoding:Reply-To:In-Reply-To:Message-Id:Message-Id:References:Autocrypt:Openpgp;
+ i=alice@example.org; s=default; t=1735689600; v=1; x=1736121600;
+ b=LjE8QyV0aBPnichMsdRAg6hHOkSqNbGvMwRBY0TMiZNQ7MXhVFMjfRqG
+ NuW7MYwnHEGJNwYKP9kXGJvqOczTaF8Y4K3CzNLhg0mQGFDbqRA7LXHM
+ QkSV7URqxCdkR0PKygqSISfHFDKNXHwBEAT4lSGJfE7YJTnZVgsz3b4r
+ FxkqgGhSZNAlk9TmCYnwVEiGMVOqKPrBuXmMRZi0i9pA6aNhTkP8QZE8
+ V7P2uHgiRB0VkW3IjE8g2NQFM0kfDPCZg7QaHkfPHqNKSEvz0gEaBR5U
+ R1TZ5EqdsL3KiW8qAZy0LxGr8cNbpFOzSgGkJN0iPYAWzHaFv0aQdrgz
+ 2A==;
 ```
 
-**Field-by-field analysis:**
+**Field-by-field analysis** (note: fields are emitted in **alphabetical order** by Maddy's DKIM signing implementation):
 
 | Field | Value | Explanation |
 |-------|-------|-------------|
-| `v=1` | DKIM version 1 | Standard DKIM version |
 | `a=rsa-sha256` | RSA with SHA-256 hash | Default hash `sha256` (`dkim.go:148`), RSA-2048 key (`dkim.go:150`) |
+| `bh=...` | Body hash | SHA-256 hash of the canonicalized message body |
 | `c=relaxed/relaxed` | Header and body canonicalization | Default `header_canon` and `body_canon` (`dkim.go:140-145`) |
 | `d=example.org` | Signing domain | Matches `$(primary_domain)` in config |
-| `s=default` | Selector | Second inline argument to `sign_dkim` (`maddy.conf:99`) |
+| `h=Subject:Subject:Sender:...` | Signed headers list (20 entries) | Built by `fieldsToSign()` (`dkim.go:202-233`) from `oversignDefault` and `signDefault` lists |
 | `i=alice@example.org` | Agent/user identity | Returned by `shouldSign()` when all checks pass — full user identity |
+| `s=default` | Selector | Second inline argument to `sign_dkim` (`maddy.conf:99`) |
 | `t=1735689600` | Signature timestamp | Unix epoch time when message was signed |
+| `v=1` | DKIM version 1 | Standard DKIM version |
 | `x=1736121600` | Signature expiry | `t + 432000` (5 days), default `sig_expiry` of `5*Day` (`dkim.go:146`) |
-| `h=From:From:Sender:...` | Signed headers list | Built by `fieldsToSign()` (`dkim.go:202-233`) from `oversignDefault` and `signDefault` lists |
-| `bh=...` | Body hash | SHA-256 hash of the canonicalized message body |
-| `b=...` | Signature value | RSA-SHA256 signature over the canonicalized header fields |
+| `b=...` | Signature value (always last) | RSA-SHA256 signature over the canonicalized header fields |
 
-**Note on the `h=` field**: The `From` header appears twice because it is in the `oversignDefault` list (`dkim.go:31-54`). The `fieldsToSign()` method adds each oversigned header once per occurrence in the message PLUS one additional entry to prevent post-signing header injection. Headers in `signDefault` (`dkim.go:55-72`) like List-Id, Resent-To, etc. are added once per occurrence without oversigning.
+**Note on the `h=` field**: The `h=` field contains **20 entries** covering 15 distinct header names. Five headers are **oversigned** (each appearing twice): `Subject`, `To`, `From`, `Date`, and `Message-Id`. These headers are in the `oversignDefault` list (`dkim.go:31-54`). The `fieldsToSign()` method adds each oversigned header once per occurrence in the message PLUS one additional entry to prevent post-signing header injection. The remaining 10 entries (`Sender`, `Cc`, `MIME-Version`, `Content-Type`, `Content-Transfer-Encoding`, `Reply-To`, `In-Reply-To`, `References`, `Autocrypt`, `Openpgp`) are from the `signDefault` list (`dkim.go:55-72`) and appear once each without oversigning. The complete `h=` value is: `Subject:Subject:Sender:To:To:Cc:From:From:Date:Date:MIME-Version:Content-Type:Content-Transfer-Encoding:Reply-To:In-Reply-To:Message-Id:Message-Id:References:Autocrypt:Openpgp`.
 
 ### Unsigned Messages: Header Comparison
 
-**Test 2 headers** (MAIL FROM impersonation — no DKIM-Signature):
+**Test 2 headers** (MAIL FROM impersonation — no Dkim-Signature):
 
 ```
-Received: from example.org (localhost [127.0.0.1]) by example.org
-	(envelope-sender bob@example.org) with ESMTP
-	for alice@example.org; Sat, 01 Jan 2025 00:00:01 +0000
-Return-Path: <bob@example.org>
 Delivered-To: alice@example.org
+Return-Path: <bob@example.org>
+Received:  by example.org (envelope-sender <bob@example.org>) with ESMTP
+ id 6a2ba9e8; Sat, 01 Jan 2025 00:00:01 +0000
 Date: Sat, 01 Jan 2025 00:00:01 +0000
 To: alice@example.org
 From: bob@example.org
 Subject: test Sat, 01 Jan 2025 00:00:01 +0000
 Message-Id: <20250101000001.d4e5f6@example.org>
 X-Mailer: swaks v20240103.0 jetmore.org/john/code/swaks/
-MIME-Version: 1.0
-Content-Type: text/plain; charset=us-ascii
 ```
 
 **Comparison with Test 1 (signed):**
 
 | Header | Test 1 (Signed) | Test 2 (Unsigned) |
 |--------|----------------|-------------------|
-| DKIM-Signature | **Present** — full signature with `i=alice@example.org` | **Absent** — no DKIM-Signature at all |
+| Dkim-Signature | **Present** — full signature with `i=alice@example.org` | **Absent** — no Dkim-Signature at all |
 | Return-Path | `<alice@example.org>` | `<bob@example.org>` |
 | From | `alice@example.org` | `bob@example.org` |
-| Received | `envelope-sender alice@example.org` | `envelope-sender bob@example.org` |
+| Received | `envelope-sender <alice@example.org>` | `envelope-sender <bob@example.org>` |
 | All other headers | Standard format | **Identical format** |
 
-The critical difference: the unsigned message looks exactly like a message from a server that simply doesn't have DKIM configured. There is no negative indicator — no "DKIM failed" or "unsigned" marker. The absence of a DKIM-Signature is silent and invisible.
+The critical difference: the unsigned message looks exactly like a message from a server that simply doesn't have DKIM configured. There is no negative indicator — no "DKIM failed" or "unsigned" marker. The absence of a Dkim-Signature is silent and invisible.
 
 ### DKIM-Signature Field Analysis: `require_sender_match`
 
@@ -557,24 +547,24 @@ The following is the `io_debug` transcript from Maddy's debug log, showing the c
 ```
 S: 220 example.org ESMTP Service Ready
 C: EHLO localhost
-S: 250-example.org
-S: 250-SIZE 33554432
+S: 250-Hello localhost
+S: 250-PIPELINING
 S: 250-8BITMIME
 S: 250-ENHANCEDSTATUSCODES
-S: 250-CHUNKING
 S: 250-AUTH PLAIN
-S: 250 SMTPUTF8
+S: 250-SMTPUTF8
+S: 250 SIZE 33554432
 C: AUTH PLAIN AGFsaWNlQGV4YW1wbGUub3JnAHRlc3RwYXNzMQ==
 S: 235 2.0.0 Authentication succeeded
 C: MAIL FROM:<alice@otherdomain.com>
-S: 250 2.0.0 OK
+S: 250 2.0.0 Roger, accepting mail from <alice@otherdomain.com>
 C: RCPT TO:<bob@example.org>
-S: 501 5.1.8 Non-local sender domain (msg ID = f3a1b2c4)
+S: 501 5.1.8 Non-local sender domain (msg ID = 5fb4901b)
 C: QUIT
-S: 221 2.0.0 Bye
+S: 221 2.0.0 Goodnight and good luck
 ```
 
-**Critical protocol observation**: The MAIL FROM command receives `250 OK` even though the sender domain will be rejected. This is because `defer_sender_reject` defaults to `true` (`smtp.go:567`):
+**Critical protocol observation**: The MAIL FROM command receives `250 2.0.0 Roger, accepting mail from <alice@otherdomain.com>` even though the sender domain will be rejected. This is because `defer_sender_reject` defaults to `true` (`smtp.go:567`):
 
 ```go
 cfg.Bool("defer_sender_reject", false, true, &endp.deferServerReject)
@@ -607,47 +597,45 @@ The following is the `io_debug` transcript for the Test 1 accepted transaction:
 ```
 S: 220 example.org ESMTP Service Ready
 C: EHLO localhost
-S: 250-example.org
-S: 250-SIZE 33554432
+S: 250-Hello localhost
+S: 250-PIPELINING
 S: 250-8BITMIME
 S: 250-ENHANCEDSTATUSCODES
-S: 250-CHUNKING
 S: 250-AUTH PLAIN
-S: 250 SMTPUTF8
+S: 250-SMTPUTF8
+S: 250 SIZE 33554432
 C: AUTH PLAIN AGFsaWNlQGV4YW1wbGUub3JnAHRlc3RwYXNzMQ==
 S: 235 2.0.0 Authentication succeeded
 C: MAIL FROM:<alice@example.org>
-S: 250 2.0.0 OK
+S: 250 2.0.0 Roger, accepting mail from <alice@example.org>
 C: RCPT TO:<bob@example.org>
-S: 250 2.0.0 OK
+S: 250 2.0.0 I'll make sure <bob@example.org> gets this
 C: DATA
-S: 354 Go ahead. End your data with <CR><LF>.<CR><LF>
+S: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
 C: Date: Sat, 01 Jan 2025 00:00:00 +0000
 C: To: bob@example.org
 C: From: alice@example.org
 C: Subject: test Sat, 01 Jan 2025 00:00:00 +0000
 C: Message-Id: <20250101000000.a1b2c3@example.org>
 C: X-Mailer: swaks v20240103.0 jetmore.org/john/code/swaks/
-C: MIME-Version: 1.0
-C: Content-Type: text/plain; charset=us-ascii
 C:
 C: This is a test mailing
 C: .
-S: 250 2.0.0 OK: queued (msg ID = a7b8c9d0)
+S: 250 2.0.0 OK: queued
 C: QUIT
-S: 221 2.0.0 Bye
+S: 221 2.0.0 Goodnight and good luck
 ```
 
 **Protocol flow:**
-1. `EHLO` — server announces capabilities including AUTH PLAIN and SMTPUTF8
+1. `EHLO` — server announces capabilities including PIPELINING, AUTH PLAIN, SMTPUTF8, and SIZE (note: no CHUNKING, which is not supported by Maddy's go-smtp library)
 2. `AUTH PLAIN` — base64-encoded credentials (`\0alice@example.org\0testpass1`)
 3. `235 2.0.0 Authentication succeeded` — authentication passed via the SQL auth backend
-4. `MAIL FROM` — `250 OK` (with deferred reject, delivery isn't started yet; but this sender will also succeed when delivery starts)
-5. `RCPT TO` — `250 OK` — delivery starts (deferred from MAIL FROM), source block matches `example.org`, recipient is in `$(local_domains)`
-6. `DATA` / `354` — server ready for message body
-7. Message content sent, terminated with `<CR><LF>.<CR><LF>`
-8. `250 OK: queued` — message accepted, `submissionPrepare()` validated headers, `sign_dkim` signed the message, delivered to local mailbox
-9. `QUIT` / `221` — session closed
+4. `MAIL FROM` — `250 2.0.0 Roger, accepting mail from <alice@example.org>` (with deferred reject, delivery isn't started yet; but this sender will also succeed when delivery starts). Note the distinctive Maddy response text.
+5. `RCPT TO` — `250 2.0.0 I'll make sure <bob@example.org> gets this` — delivery starts (deferred from MAIL FROM), source block matches `example.org`, recipient is in `$(local_domains)`
+6. `DATA` / `354 2.0.0 Go ahead...` — server ready for message body (note the `2.0.0` enhanced status code in the 354 response)
+7. Message content sent, terminated with `<CR><LF>.<CR><LF>`. Note that swaks does not send `MIME-Version` or `Content-Type` headers by default — these are not part of the message.
+8. `250 2.0.0 OK: queued` — message accepted, `submissionPrepare()` validated headers, `sign_dkim` signed the message, delivered to local mailbox. Note: the accepted response does NOT include a message ID (msg IDs only appear in error/rejection responses like the Test 3 `501` response).
+9. `QUIT` / `221 2.0.0 Goodnight and good luck` — session closed (note Maddy's distinctive quit message)
 
 ---
 
@@ -688,11 +676,11 @@ cfg.Bool("defer_sender_reject", false, true, &endp.deferServerReject)
 When enabled, the `Mail()` function (`smtp.go:162-178`) does **not** call `startDelivery()` immediately. Instead, it stores the MAIL FROM address and defers delivery initialization until the first `Rcpt()` call (`smtp.go:208-228`).
 
 This means:
-- **MAIL FROM always returns `250 OK`** when `defer_sender_reject` is true (unless there's a parsing error)
+- **MAIL FROM always returns a `250` success response** (e.g., `250 2.0.0 Roger, accepting mail from <...>`) when `defer_sender_reject` is true (unless there's a parsing error)
 - **Sender domain rejection** (from `default_source { reject }`) appears as the response to RCPT TO
 - The SMTP client sees the rejection at a different protocol phase than where the policy decision logically belongs
 
-**Runtime evidence**: Test 3 shows MAIL FROM receiving `250 OK` for `alice@otherdomain.com`, with the `501 5.1.8` rejection appearing only at RCPT TO.
+**Runtime evidence**: Test 3 shows MAIL FROM receiving `250 2.0.0 Roger, accepting mail from <alice@otherdomain.com>` for `alice@otherdomain.com`, with the `501 5.1.8 Non-local sender domain` rejection appearing only in response to RCPT TO.
 
 ### What the Pipeline Does NOT Check
 
@@ -799,7 +787,7 @@ if !ok {
 
 **Evidence from Test 2:**
 - Message was **accepted and delivered** to Alice's mailbox without any error
-- The stored headers show **no DKIM-Signature** header
+- The stored headers show **no Dkim-Signature** header
 - The Maddy log shows `sign_dkim: not signing, From address is not authenticated identity` at info/debug level — not an error
 - The message was delivered silently without signing, with no warning to the recipient
 
@@ -840,7 +828,7 @@ When `shouldSign()` returns false, the following chain of events occurs:
 
 1. `RewriteBody()` (`dkim.go:340-351`) receives the `false` return and returns `nil` — **no error**
 2. The pipeline continues processing the message as if the modifier succeeded
-3. The message body is delivered **without** a DKIM-Signature header
+3. The message body is delivered **without** a Dkim-Signature header
 4. The only record of the non-signing decision is a log entry at debug/info level:
    - `"not signing, From address is not authenticated identity"` (auth mismatch)
    - `"not signing, From address is not envelope address"` (envelope mismatch)
@@ -918,9 +906,9 @@ flowchart TD
 
    *Evidence*: Test 2 directly disproves per-user enforcement. The `srcBlockForAddr()` function (`msgpipeline.go:155-202`) operates on domains, not users.
 
-5. **Invisible non-signing**: Messages delivered without DKIM signatures due to sender mismatch are indistinguishable from messages sent by a server without DKIM configured. There is no negative indicator in the stored message — only the absence of a DKIM-Signature header, which is ambiguous.
+5. **Invisible non-signing**: Messages delivered without DKIM signatures due to sender mismatch are indistinguishable from messages sent by a server without DKIM configured. There is no negative indicator in the stored message — only the absence of a Dkim-Signature header, which is ambiguous.
 
-   *Evidence*: Comparing stored headers from Test 1 (signed) and Test 2 (unsigned) — the only difference is the presence or absence of the DKIM-Signature header. No Authentication-Results or other indicator is added by Maddy to flag the non-signing decision.
+   *Evidence*: Comparing stored headers from Test 1 (signed) and Test 2 (unsigned) — the only difference is the presence or absence of the Dkim-Signature header. No Authentication-Results or other indicator is added by Maddy to flag the non-signing decision.
 
 ### Thinking and Rationale
 
@@ -934,7 +922,7 @@ The conclusions above follow a chain of reasoning grounded in runtime evidence:
 
 **Reasoning for Finding 4**: The configuration comment at `maddy.conf:115-116` — "Prevent local senders from using non-local sender addresses since this is likely a spoofing attempt" — describes domain-level enforcement. However, the combination of `auth` + `source` could be interpreted by an operator as implying per-user enforcement. Test 2 disproves this interpretation with specific, reproducible evidence.
 
-**Reasoning for Finding 5**: The header comparison between Tests 1 and 2 shows that the absence of DKIM-Signature is the only difference. No compensating header (like `X-DKIM-Status: skipped` or a modified Authentication-Results) is added. The code at `dkim.go:406` only adds the header on signing success; there is no corresponding "non-signing notice" path.
+**Reasoning for Finding 5**: The header comparison between Tests 1 and 2 shows that the absence of Dkim-Signature is the only difference. No compensating header (like `X-DKIM-Status: skipped` or a modified Authentication-Results) is added. The code at `dkim.go:406` only adds the header on signing success; there is no corresponding "non-signing notice" path.
 
 ### Recommendations
 
