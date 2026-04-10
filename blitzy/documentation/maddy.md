@@ -878,7 +878,7 @@ flowchart TD
 
 2. **Empty queue handling** (lines 89-97): If no slots exist, blocks on a `select` between `updateNotify` (new slot added → restart scan) and `stopNotify` (shutdown → return).
 
-3. **Create timer** (line 99): `time.NewTimer(closestSlot.Time.Sub(time.Now()))` — waits until the nearest deadline.
+3. **Create timer** (line 99): `time.NewTimer(closestSlot.Time.Sub(now))` — where `now` was captured at the start of the iteration (line 73). Waits until the nearest deadline.
 
 4. **Select loop** (lines 102-126): Three cases:
    - **Timer fires** (line 104): Removes the slot from the linked list under lock, calls `tw.dispatch(closestSlot)`, breaks out to restart the scan
