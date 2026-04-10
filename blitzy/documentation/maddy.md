@@ -287,8 +287,9 @@ This is **eager initialization** — endpoints are initialized immediately, in t
 After all endpoints have been initialized (and their transitive lazy initialization chains have completed), lines 358–365 verify every regular module:
 
 ```go
-for _, inst := range mods { // maddy.go:358-365
-    if !module.Initialized[inst.instance.InstanceName()] { return nil, fmt.Errorf("Unused configuration block at %s:%d ...", ...) }
+for _, inst := range mods {
+    if module.Initialized[inst.instance.InstanceName()] { continue }
+    return nil, fmt.Errorf("Unused configuration block at %s:%d - %s (%s)", ...)
 }
 ```
 
@@ -413,9 +414,9 @@ Consider the IMAP endpoint in `maddy.conf` with directives `auth &local_authdb` 
    - Line 67: `cfg.Process()` — processes all directives.
 3. When `Process()` encounters the `auth &local_authdb` directive, it calls `modconfig.AuthDirective` (at `internal/config/module/auth.go:8-14`), which calls `ModuleFromNode(node.Args, node, m.Globals, &provider)`.
 4. `ModuleFromNode` detects the `&` prefix → calls `module.GetInstance("local_authdb")`.
-5. `GetInstance` checks `Initialized["local_authdb"]` → it is `false`, so sets it to `true` and calls `local_authdb.Init(cfg)`.
+5. `GetInstance` resolves alias `"local_authdb"` → `"local_mailboxes"` (via `aliases` map, line 54–56), then checks `Initialized["local_mailboxes"]` → it is `false`, so sets `Initialized["local_mailboxes"] = true` and calls the module's `Init(cfg)`.
 6. The SQL module's `Init()` runs, potentially triggering further lazy inits.
-7. Control returns to the IMAP endpoint's `Process()`, which continues with the `storage` directive, triggering lazy init of `&local_mailboxes` in the same way.
+7. Control returns to the IMAP endpoint's `Process()`, which continues with the `storage &local_mailboxes` directive. `GetInstance("local_mailboxes")` finds `Initialized["local_mailboxes"] == true` (already set via the `local_authdb` alias in step 5) and returns the module immediately — no second `Init()` call occurs, honoring the at-most-once guarantee.
 
 ```mermaid
 sequenceDiagram
@@ -423,23 +424,31 @@ sequenceDiagram
     participant IMAP as IMAP Endpoint
     participant Proc as cfg.Process()
     participant Auth as AuthDirective
+    participant Stor as StorageDirective
     participant MFN as ModuleFromNode
     participant GI as GetInstance
-    participant SQL as sql Module (local_authdb)
+    participant SQL as sql Module (local_mailboxes)
 
     IC->>IMAP: Init(cfg)
     IMAP->>Proc: cfg.Process()
     Proc->>Auth: auth directive: ["&local_authdb"]
     Auth->>MFN: ModuleFromNode(["&local_authdb"], ...)
     MFN->>GI: GetInstance("local_authdb")
-    Note over GI: Initialized["local_authdb"] = false
-    GI->>GI: Set Initialized["local_authdb"] = true
+    Note over GI: Resolve alias: "local_authdb" → "local_mailboxes"
+    Note over GI: Initialized["local_mailboxes"] = false
+    GI->>GI: Set Initialized["local_mailboxes"] = true
     GI->>SQL: Init(cfg)
     SQL-->>GI: return nil
     GI-->>MFN: return sql module
     MFN-->>Auth: return (reflection check passed)
     Auth-->>Proc: return provider
-    Note over Proc: Continue to "storage" directive...
+    Proc->>Stor: storage directive: ["&local_mailboxes"]
+    Stor->>MFN: ModuleFromNode(["&local_mailboxes"], ...)
+    MFN->>GI: GetInstance("local_mailboxes")
+    Note over GI: Initialized["local_mailboxes"] == true → return immediately
+    GI-->>MFN: return sql module (no second Init)
+    MFN-->>Stor: return (reflection check passed)
+    Stor-->>Proc: return storage
 ```
 
 ---
