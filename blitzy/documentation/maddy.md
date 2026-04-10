@@ -321,7 +321,7 @@ With `max_tries = 2`, the complete sequence is:
 
 On the final attempt (TriesCount == maxTries at line 390):
 
-1. Recipients remaining in `meta.To` (temporarily failed) are logged as `"not delivered, temporary error"` (lines 393-395)
+1. The code iterates `meta.TemporaryFailedRcpts` to log each recipient as `"not delivered, temporary error"` (lines 393-395). However, since `meta.TemporaryFailedRcpts` is never populated anywhere in the codebase (see note below), this loop body never executes and **no "not delivered, temporary error" log entries are emitted in practice**
 2. Recipients in `meta.FailedRcpts` (permanently failed) are logged as `"not delivered, permanent error"` (lines 396-398) — however, in the all-timeout scenario, `meta.FailedRcpts` is empty because all failures were temporary, so **no permanent-error log entries are emitted**
 3. The DSN condition at line 400 checks `len(meta.FailedRcpts) + len(meta.TemporaryFailedRcpts) != 0`. In the all-timeout scenario, `meta.FailedRcpts` is empty (only temporary errors occurred) and `meta.TemporaryFailedRcpts` is **always empty** (the field is declared at `queue.go:160` but never populated anywhere in the codebase). Therefore, the condition evaluates to **false** and **no DSN/bounce message is generated** — the message is silently discarded
 4. **`removeFromDisk()`** deletes the `.header`, `.body`, and `.meta` files (line 403)
@@ -381,7 +381,7 @@ sequenceDiagram
     MX-->>R: *net.OpError (timeout)
     R-->>D: SMTPError{451, "No usable MXs, last err: ..."}
     Note over D: TriesCount(2) == maxTries(2) → FINAL FAILURE
-    D->>D: Log "not delivered, temporary error"
+    Note over D: TemporaryFailedRcpts is empty → no "not delivered" log emitted
     D->>D: No DSN (FailedRcpts + TemporaryFailedRcpts == 0)
     D->>D: removeFromDisk() — delete .header, .body, .meta
     D->>D: Release deliverySemaphore
@@ -514,14 +514,14 @@ The `DeliveryLogger()` utility (`internal/target/delivery.go:8-16`) creates a ch
 
 ```go
 // Source: internal/target/delivery.go:8-16
-func DeliveryLogger(log log.Logger, msgMeta *module.MsgMetadata) log.Logger {
-    out := log
-    out.Fields = make(map[string]interface{}, len(log.Fields)+1)
-    for k, v := range log.Fields {
-        out.Fields[k] = v
+func DeliveryLogger(l log.Logger, msgMeta *module.MsgMetadata) log.Logger {
+    fields := make(map[string]interface{}, len(l.Fields)+1)
+    for k, v := range l.Fields {
+        fields[k] = v
     }
-    out.Fields["msg_id"] = msgMeta.ID
-    return out
+    fields["msg_id"] = msgMeta.ID
+    l.Fields = fields
+    return l
 }
 ```
 
@@ -589,7 +589,7 @@ The following log entries are emitted during the queue dispatch and retry cycle.
 | 5 | debug | `queue.go:367` | `"delivery attempt #N"` | `msg_id` |
 | 6 | info | `queue.go:378` | `"delivered"` | `msg_id`, `rcpt`, `attempt` |
 | 7 | error | `queue.go:384` | `"delivery attempt failed"` | `msg_id`, `rcpt`, `reason`, `smtp_code`, `smtp_enchcode`, `smtp_msg`, + error Misc fields |
-| 8 | info | `queue.go:394` | `"not delivered, temporary error"` | `msg_id`, `rcpt` |
+| 8 | info | `queue.go:394` | `"not delivered, temporary error"` | `msg_id`, `rcpt` | ⚠️ **Never emitted in practice** — iterates `meta.TemporaryFailedRcpts` which is never populated (see Q2.6) |
 | 9 | info | `queue.go:398` | `"not delivered, permanent error"` | `msg_id`, `rcpt` |
 | 10 | info | `queue.go:415-418` | `"will retry"` | `msg_id`, `attempts_count`, `next_try_delay`, `rcpts` |
 
@@ -623,7 +623,7 @@ The following shows a realistic complete log output for a message to `user@unrea
 2025-01-15T11:19:00.001Z [debug] queue: delivery semaphore acquired for a1b2c3d4
 2025-01-15T11:19:00.002Z [debug] queue: delivery attempt #3	{"msg_id":"a1b2c3d4"}
 2025-01-15T11:21:10.200Z queue: delivery attempt failed	{"domain":"unreachable.example.com","io_op":"dial","msg_id":"a1b2c3d4","rcpt":"user@unreachable.example.com","reason":"dial tcp 192.0.2.1:25: i/o timeout","remote_addr":"192.0.2.1:25","smtp_code":451,"smtp_enchcode":"5.4.0","smtp_msg":"No usable MXs, last err: dial tcp 192.0.2.1:25: i/o timeout","target":"remote"}
-2025-01-15T11:21:10.250Z queue: not delivered, temporary error	{"msg_id":"a1b2c3d4","rcpt":"user@unreachable.example.com"}
+(message silently removed from disk — no further log entries)
 ```
 
 **Notes on the example:**
@@ -634,7 +634,7 @@ The following shows a realistic complete log output for a message to `user@unrea
 - The `~2 minutes` gap between "delivery attempt #N" and "delivery attempt failed" represents the TCP SYN timeout to the unreachable host.
 - Debug entries (`[debug]` prefix) from `dispatch()` use `q.Log` directly (not `DeliveryLogger`) and therefore do **not** include a JSON payload when the logger has no base `Fields`.
 - Entries from `tryDelivery()` use `DeliveryLogger` and always include `{"msg_id":"..."}`.
-- On the final attempt (attempt #3), retries are exhausted (TriesCount == maxTries). The recipient in `meta.To` is logged as `"not delivered, temporary error"` (Source: `internal/target/queue/queue.go:393-395`). No DSN/bounce is generated because both `meta.FailedRcpts` and `meta.TemporaryFailedRcpts` are empty (see Q2.6 for details). The message is then silently removed from disk via `removeFromDisk()`.
+- On the final attempt (attempt #3), retries are exhausted (`TriesCount == maxTries`). The code at lines 393-395 iterates `meta.TemporaryFailedRcpts` to log `"not delivered, temporary error"` — but since `TemporaryFailedRcpts` is never populated anywhere in the codebase, **this log entry is never emitted** (Source: `internal/target/queue/queue.go:393-395`; see Q2.6 for details). No DSN/bounce is generated because both `meta.FailedRcpts` and `meta.TemporaryFailedRcpts` are empty. The message is then **silently removed from disk** via `removeFromDisk()` with no explicit log entry indicating the message was discarded — the last log entry an operator would see is the `"delivery attempt failed"` line above.
 
 ---
 
@@ -1106,7 +1106,7 @@ Source: `internal/target/queue/queue.go:129-138, 672-674`
 
 **Shutdown behavior:** `Queue.Close()` calls `deliveryWg.Wait()` at line 255, which blocks until ALL pending deliveries complete — including goroutines blocked on the semaphore AND goroutines blocked on TCP timeouts. This means **shutdown can be delayed by the cumulative timeout of all stalled connections**.
 
-Source: `internal/target/queue/queue.go:253-265`
+Source: `internal/target/queue/queue.go:253-258`
 
 ### 8.7 Semaphore Saturation Diagram
 
@@ -1290,21 +1290,21 @@ All source code references in this document point to files within the maddy repo
 
 | File | Lines | Key Contents |
 |------|-------|-------------|
-| `internal/target/queue/queue.go` | 958 | Queue struct (112-147), QueueMetadata (149-170), NewQueue defaults (182-199), Init config (201-238), start/TimeWheel/semaphore (240-252), Close (253-265), dispatch (275-323), toSMTPErr (325-363), tryDelivery (365-429), deliver (431-532), queueDelivery (534-587), Queue.Start (589-598), removeFromDisk (600-620), readDiskQueue (622-688), storeNewMessage (690-740), updateMetadataOnDisk (742-767), readMessageMeta (769-791), openMessage (806-839), emitDSN (849-953) |
-| `internal/target/queue/timewheel.go` | 129 | TimeSlot/TimeWheel structs (10-25), NewTimeWheel (27-35), Add (38-53), Close (55-69), tick scheduling loop (71-128) |
+| `internal/target/queue/queue.go` | 957 | Queue struct (112-147), QueueMetadata (149-170), NewQueue defaults (182-199), Init config (201-238), start/TimeWheel/semaphore (240-252), Close (253-258), dispatch (275-323), toSMTPErr (325-363), tryDelivery (365-429), deliver (431-532), queueDelivery (534-587), Queue.Start (589-598), removeFromDisk (600-620), readDiskQueue (622-688), storeNewMessage (690-740), updateMetadataOnDisk (742-767), readMessageMeta (769-791), openMessage (806-839), emitDSN (849-953) |
+| `internal/target/queue/timewheel.go` | 128 | TimeSlot/TimeWheel structs (10-25), NewTimeWheel (27-35), Add (38-53), Close (55-69), tick scheduling loop (71-128) |
 
 ### Remote Delivery Subsystem
 
 | File | Lines | Key Contents |
 |------|-------|-------------|
-| `internal/target/remote/remote.go` | 487 | Target struct (49-70), remoteDelivery with connections map (175-183), Target.Start (185-193), AddRcpt → connectionForDomain (195-241), BodyNonAtomic concurrent delivery (400-440) |
-| `internal/target/remote/connect.go` | 277 | connectionForDomain (113-225), MX iteration with failover (154-199), "No usable MXs" error (204-213), lookupMX DNS resolution (240-276) |
+| `internal/target/remote/remote.go` | 486 | Target struct (49-70), remoteDelivery with connections map (175-183), Target.Start (185-193), AddRcpt → connectionForDomain (195-241), BodyNonAtomic concurrent delivery (400-440) |
+| `internal/target/remote/connect.go` | 276 | connectionForDomain (113-225), MX iteration with failover (154-199), "No usable MXs" error (204-213), lookupMX DNS resolution (240-276) |
 
 ### SMTP Connection Layer
 
 | File | Lines | Key Contents |
 |------|-------|-------------|
-| `internal/smtpconn/smtpconn.go` | 339 | C struct with Dialer (31-53), New() with (&net.Dialer{}).DialContext (57-63), wrapClientErr error conversion (65-120), Connect (122-133), attemptConnect TCP dial (152-200) |
+| `internal/smtpconn/smtpconn.go` | 338 | C struct with Dialer (31-53), New() with (&net.Dialer{}).DialContext (57-63), wrapClientErr error conversion (65-120), Connect (122-133), attemptConnect TCP dial (152-200) |
 
 ### Message Pipeline
 
@@ -1322,39 +1322,40 @@ All source code references in this document point to files within the maddy repo
 
 | File | Lines | Key Contents |
 |------|-------|-------------|
-| `internal/log/log.go` | 208 | Logger struct (26-34), Msg (72-76), Error with exterrors.Fields (89-104), formatMsg with marshalOrderedJSON (135-155), log with Name prefix (180-195) |
-| `internal/log/orderedjson.go` | 63 | marshalOrderedJSON (16-62), alphabetical sort (23), type-specific formatting: time.Time, Duration, LogFormatter, Stringer, error (40-51) |
-| `internal/log/writer.go` | 78 | wcOutput.Write with timestamp format "2006-01-02T15:04:05.000Z " (16-29) |
+| `internal/log/log.go` | 207 | Logger struct (26-34), Msg (72-76), Error with exterrors.Fields (89-104), formatMsg with marshalOrderedJSON (135-155), log with Name prefix (180-195) |
+| `internal/log/orderedjson.go` | 62 | marshalOrderedJSON (16-62), alphabetical sort (23), type-specific formatting: time.Time, Duration, LogFormatter, Stringer, error (40-51) |
+| `internal/log/writer.go` | 77 | wcOutput.Write with timestamp format "2006-01-02T15:04:05.000Z " (16-29) |
 
 ### Error Handling
 
 | File | Lines | Key Contents |
 |------|-------|-------------|
-| `internal/exterrors/smtp.go` | 129 | EnhancedCode type (9), FormatLog "X.Y.Z" format (11-13), SMTPError struct (19-66), Fields method (72-92), Temporary: Code/100==4 (95-97) |
-| `internal/exterrors/temporary.go` | 57 | IsTemporaryOrUnspec: defaults to true if no Temporary() method (15-21), IsTemporary: defaults to false (25-31) |
-| `internal/exterrors/fields.go` | 57 | Fields: walks error chain, outer overrides inner (28-52) |
+| `internal/exterrors/smtp.go` | 128 | EnhancedCode type (9), FormatLog "X.Y.Z" format (11-13), SMTPError struct (19-66), Fields method (72-92), Temporary: Code/100==4 (95-97) |
+| `internal/exterrors/temporary.go` | 56 | IsTemporaryOrUnspec: defaults to true if no Temporary() method (15-21), IsTemporary: defaults to false (25-31) |
+| `internal/exterrors/fields.go` | 56 | Fields: walks error chain, outer overrides inner (28-52) |
 
 ### Module Interfaces
 
 | File | Lines | Key Contents |
 |------|-------|-------------|
-| `internal/module/delivery_target.go` | 72 | DeliveryTarget interface with Start(), Delivery interface with AddRcpt/Body/Commit/Abort |
-| `internal/module/msgmetadata.go` | 118 | ConnState (10-42), MsgMetadata with ID/OriginalFrom/SMTPOpts (55-105) |
+| `internal/module/delivery_target.go` | 71 | DeliveryTarget interface with Start(), Delivery interface with AddRcpt/Body/Commit/Abort |
+| `internal/module/msgmetadata.go` | 117 | ConnState (10-42), MsgMetadata with ID/OriginalFrom/SMTPOpts (55-105) |
 
 ### Supporting Subsystems
 
 | File | Lines | Key Contents |
 |------|-------|-------------|
-| `internal/target/delivery.go` | 17 | DeliveryLogger: adds msg_id field (8-16) |
-| `internal/dsn/dsn.go` | 276 | ReportingMTAInfo (19-34), RecipientInfo (97-106), GenerateDSN RFC 3464 multipart/report (167-191) |
-| `internal/limiters/concurrency.go` | 47 | Semaphore wrapping buffered channel |
-| `internal/buffer/buffer.go` | ~43 | Buffer interface, FileBuffer for on-disk body |
+| `internal/target/delivery.go` | 16 | DeliveryLogger: adds msg_id field (8-16) |
+| `internal/dsn/dsn.go` | 275 | ReportingMTAInfo (19-34), RecipientInfo (97-106), GenerateDSN RFC 3464 multipart/report (167-191) |
+| `internal/limiters/concurrency.go` | 46 | Semaphore wrapping buffered channel |
+| `internal/buffer/buffer.go` | 42 | Buffer interface |
+| `internal/buffer/file.go` | 68 | FileBuffer for on-disk body storage |
 
 ### Configuration
 
 | File | Lines | Key Contents |
 |------|-------|-------------|
-| `maddy.conf` | 153 | Queue block (122-147): max_tries 8, max_parallelism 16, target remote, bounce block |
+| `maddy.conf` | 152 | Queue block (122-147): max_tries 8, max_parallelism 16, target remote, bounce block |
 
 ---
 
