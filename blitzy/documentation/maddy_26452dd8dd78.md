@@ -43,13 +43,15 @@ The message receives a `250` success response on the SMTP wire. However, it is *
 
 ### (3) Relevant Server Log Lines
 
+Maddy uses structured JSON logging (internal/log/log.go `formatMsg` → `marshalOrderedJSON`). Each log line has the format `<logger_name>: <message>\t{<ordered_json_fields>}`. The `msg_id` field is added by `target.DeliveryLogger` (internal/target/delivery.go:13) and appears in all per-message log entries. Variable IDs are replaced with `<id>` below.
+
 ```
-apply_spf: result: fail (<nil>)
-quarantined    err="apply_spf: SPF authentication failed (smtp:550 5.7.23)"
+apply_spf: result: fail (<nil>)	{"msg_id":"<id>"}
+pipeline: quarantined	{"check":"apply_spf","msg_id":"<id>","reason":"SPF authentication failed","smtp_code":550,"smtp_enchcode":"5.7.23","smtp_msg":"SPF authentication failed"}
 ```
 
-- **First line**: SPF evaluation result from the async goroutine (spf.go:315, `Debugf` level — appears when debug is enabled).
-- **Second line**: From `runAndMergeResults` (check_runner.go:204) after the quarantine path is triggered.
+- **First line**: SPF evaluation result from the async goroutine (spf.go:315, `Debugf` level — appears only when debug is enabled). The `msg_id` comes from the logger's `Fields` map.
+- **Second line**: From `runAndMergeResults` (check_runner.go:204) via `Logger.Error`, which extracts structured fields from the `SMTPError` (exterrors/smtp.go:72-91) and merges them with the logger's `msg_id` field. The `smtp_enchcode` is formatted via `EnhancedCode.FormatLog()` (exterrors/smtp.go:11-13).
 - The `"deferring action due to a DMARC policy"` log line is **not** emitted for Case A because `relyOnDMARC` returns `false`.
 
 ### Rationale
@@ -100,14 +102,14 @@ The message is **accepted with no quarantine and no rejection**. This is the cou
 ### (3) Relevant Server Log Lines
 
 ```
-apply_spf: result: fail (<nil>)
-apply_spf: deferring action due to a DMARC policy
-no check action    err="apply_spf: SPF authentication failed (smtp:550 5.7.23)"
+apply_spf: result: fail (<nil>)	{"msg_id":"<id>"}
+apply_spf: deferring action due to a DMARC policy	{"msg_id":"<id>"}
+pipeline: no check action	{"check":"apply_spf","msg_id":"<id>","reason":"SPF authentication failed","smtp_code":550,"smtp_enchcode":"5.7.23","smtp_msg":"SPF authentication failed"}
 ```
 
-- **First line**: SPF evaluation result (spf.go:315, `Debugf` level).
+- **First line**: SPF evaluation result (spf.go:315, `Debugf` level — appears only when debug is enabled).
 - **Second line**: From `CheckBody` (spf.go:353, `Printf` level — always logged because `res.res != spf.Pass`). This is the **key observable signal** unique to Case B.
-- **Third line**: From `runAndMergeResults` (check_runner.go:191). Since `Quarantine=false` and `Reject=false` but `Reason != nil`, the code enters the `"no check action"` branch and logs the reason for deployment testing purposes.
+- **Third line**: From `runAndMergeResults` (check_runner.go:191) via `Logger.Error`. Since `Quarantine=false` and `Reject=false` but `Reason != nil`, the code enters the `"no check action"` branch and logs the structured error fields for deployment testing purposes.
 
 ### Rationale
 
@@ -158,11 +160,11 @@ Cases A and C follow the **exact same code path** after `relyOnDMARC` returns `f
 ### (3) Relevant Server Log Lines
 
 ```
-apply_spf: result: fail (<nil>)
-quarantined    err="apply_spf: SPF authentication failed (smtp:550 5.7.23)"
+apply_spf: result: fail (<nil>)	{"msg_id":"<id>"}
+pipeline: quarantined	{"check":"apply_spf","msg_id":"<id>","reason":"SPF authentication failed","smtp_code":550,"smtp_enchcode":"5.7.23","smtp_msg":"SPF authentication failed"}
 ```
 
-Same log lines as Case A. The `"deferring action due to a DMARC policy"` line is **not** emitted because `relyOnDMARC` returns `false`.
+Same log output as Case A (same structured JSON format, same fields). The `"deferring action due to a DMARC policy"` line is **not** emitted because `relyOnDMARC` returns `false`.
 
 ### Rationale
 
@@ -182,7 +184,7 @@ Same log lines as Case A. The `"deferring action due to a DMARC policy"` line is
 
 6. **Pipeline quarantine** (check_runner.go:179-182, 203-206): Quarantine path triggered, logged.
 
-7. **DMARC evaluation** (check_runner.go:267-268): `Apply` receives no DKIM results → `ResultNone` → `PolicyNone`. No DMARC action.
+7. **DMARC evaluation** (check_runner.go:267-268): `Apply` (verifier.go:111) receives the fetched data. Since `data.record == nil` (no DMARC record was found), `Apply` returns early at verifier.go:132-137 with `{Authres: {Value: ResultNone, From: "no-dmarc.com"}, PolicyNone}` — `EvaluateAlignment` is never called. Unlike Cases A and B, where the `!dkimPresent` guard in `EvaluateAlignment` (evaluate.go:148) produces the `ResultNone`, Case C's `ResultNone` comes from the nil-record short-circuit. The outcome is the same (`PolicyNone`), but the code path and the `Reason` field differ: Case C's `DMARCResult` has an empty `Reason`, while Cases A/B carry `"Not enough information (required checks are disabled)"`.
 
 8. **Result**: Message quarantined internally. SMTP responds `250`.
 
@@ -197,7 +199,7 @@ Same log lines as Case A. The `"deferring action due to a DMARC policy"` line is
 | `relyOnDMARC` Result | `false` | **`true`** | `false` |
 | SPF Enforcement | **Normal (quarantine)** | **Cleared** | **Normal (quarantine)** |
 | "Deferring" Log Emitted | No | **Yes** | No |
-| DMARC `EvaluateAlignment` | `ResultNone` (!dkimPresent) | `ResultNone` (!dkimPresent) | `ResultNone` (!dkimPresent) |
+| DMARC `EvaluateAlignment` | `ResultNone` (!dkimPresent) | `ResultNone` (!dkimPresent) | `ResultNone` (no record — not called) |
 | DMARC Policy Applied | `PolicyNone` | `PolicyNone` | `PolicyNone` |
 | SMTP Response | `250 2.0.0 OK: queued` | `250 2.0.0 OK: queued` | `250 2.0.0 OK: queued` |
 | `MsgMeta.Quarantine` | `true` | **`false`** | `true` |
@@ -317,13 +319,21 @@ The distinguishing log lines are:
 
 ### Authentication-Results Header
 
-All three cases produce the same Authentication-Results header pattern because SPF always fails (same `v=spf1 -all` for all domains) and DMARC always returns `none` (no DKIM results in any case):
+All three cases produce `spf=fail` and `dmarc=none` in the Authentication-Results header, but the DMARC portion differs between Cases A/B and Case C due to different code paths producing the `ResultNone`.
+
+**Cases A and B** — `EvaluateAlignment` is called, hits the `!dkimPresent` guard (evaluate.go:148), and returns a `DMARCResult` with `Reason: "Not enough information (required checks are disabled)"` (evaluate.go:151). The `authres` formatter includes this non-empty reason in the header:
 
 ```
 <hostname>; spf=fail smtp.mailfrom=<domain>; dmarc=none reason="Not enough information (required checks are disabled)" header.from=<domain>
 ```
 
-The `dmarc=none` with reason `"Not enough information (required checks are disabled)"` directly reflects the `!dkimPresent` guard in evaluate.go:148-154.
+**Case C** — `Apply` (verifier.go:132-137) returns early because `data.record == nil` (no DMARC record found). The `DMARCResult` has `Value: ResultNone` and `From: "no-dmarc.com"`, but an empty `Reason` field. The `authres` formatter (authres/format.go:60) skips the `reason` key when the value is empty, so the header omits it:
+
+```
+<hostname>; spf=fail smtp.mailfrom=no-dmarc.com; dmarc=none header.from=no-dmarc.com
+```
+
+The `dmarc=none` result appears in all three cases, but the presence or absence of the `reason` clause is a distinguishing observable signal: it reveals whether the DMARC verifier reached `EvaluateAlignment` (Cases A/B) or short-circuited on a nil record (Case C).
 
 If `verify_dkim` were present in the pipeline, the Authentication-Results would differ significantly and DMARC would be able to make a real pass/fail decision.
 
