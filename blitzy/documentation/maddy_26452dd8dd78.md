@@ -453,7 +453,7 @@ if meta.TriesCount == q.maxTries {
 queue: not delivered, temporary error	{"msg_id":"<40-char-hex>","rcpt":"<address>"}
 ```
 
-This message is emitted only when the maximum retry count is exhausted (`meta.TriesCount == q.maxTries`) and there are still temporarily-failed recipients. It was observed in the `TestQueueDelivery_PermanentFail_NonPartial` test but not in the `TestQueueDelivery_MultipleAttempts` test because the latter's temporary failures were resolved before `maxTries` was reached.
+This message is emitted only when the maximum retry count is exhausted (`meta.TriesCount == q.maxTries`) and there are still temporarily-failed recipients. This code path is defined in source code at `queue.go` lines 392–395 but is not exercised by any existing test in the current queue test suite. The `TestQueueDelivery_PermanentFail_NonPartial` test only produces `delivery attempt failed` and `not delivered, permanent error` log lines, and `TestQueueDelivery_MultipleAttempts` resolves all temporary failures before `maxTries` is reached. The log format and field analysis above are derived from source code inspection rather than runtime observation.
 
 ---
 
