@@ -265,7 +265,7 @@ SHA1 produces a 20-byte hash, which hex-encodes to 40 characters. The test name 
 msgMeta.ID = msgMeta.ID + "-" + strconv.Itoa(meta.TriesCount+1)
 ```
 
-Each delivery attempt appends `"-N"` to the base ID (where N is the attempt number), so the actual delivery-level msg_id seen in downstream target logs is `<40-char-hex>-<attempt_number>`. However, the queue's own log lines use the **base ID without the attempt suffix**, because `tryDelivery()` creates the `DeliveryLogger` at line 366 *before* `deliver()` mutates the ID at line 439.
+Each delivery attempt appends `"-N"` to the base ID (where N is the attempt number), so the actual delivery-level msg_id seen in downstream target logs is `<40-char-hex>-<attempt_number>`. However, the queue's own log lines use the **base ID without the attempt suffix**, because `deliver()` at line 438 creates a deep copy of the message metadata via `meta.MsgMeta.DeepCopy()`, and only the copy's ID is mutated at line 439. The original `meta.MsgMeta.ID` — which is what the `DeliveryLogger` (created at line 366 in `tryDelivery()`) references — is therefore inherently unaffected, regardless of creation order.
 
 ### 2.3 DeliveryLogger and Persistent `msg_id` Field
 
@@ -465,7 +465,7 @@ This message is emitted only when the maximum retry count is exhausted (`meta.Tr
 
 **Source:** `internal/target/remote/connect.go`, lines 35–111 (`checkPolicies` method).
 
-The authentication pipeline checks three mechanisms in order:
+The authentication pipeline checks four mechanisms in order:
 1. **Implicit MX** (line 43): MX hostname equals the domain itself → authenticated
 2. **MTA-STS** (lines 48–73): If MTA-STS policy fetched, matching MX → authenticated
 3. **DNSSEC** (lines 76–79): If DNS zone is signed and verified → authenticated
