@@ -32,7 +32,7 @@ Per RFC 5321 §4.1.1.4, the canonical DATA terminator is `<CRLF>.<CRLF>` — tha
 Maddy itself performs **no** DATA boundary detection. The entire boundary decision is delegated through a chain of components that terminates in Go's standard library:
 
 1. **go-smtp `conn.go` `handleData()`** (line 498): After sending the `354` response (`"Go ahead. End your data with <CR><LF>.<CR><LF>"`), creates a `dataReader` via `newDataReader(c)`.
-2. **go-smtp `data.go` `newDataReader()`** (line 57): Wraps `c.text.DotReader()` — the Go standard library's `net/textproto.Reader.DotReader()` — with an optional size limit via `MaxMessageBytes`. **No additional boundary logic is added.**
+2. **go-smtp `data.go` `newDataReader()`** (line 51): Wraps `c.text.DotReader()` — the Go standard library's `net/textproto.Reader.DotReader()` — with an optional size limit via `MaxMessageBytes`. **No additional boundary logic is added.**
 3. **Go stdlib `net/textproto/reader.go` `DotReader()`** (line 300): Creates a `dotReader` struct — a state machine that is the **sole arbiter** of when the DATA phase ends.
 
 The critical insight: **Maddy adds NO additional boundary validation on top of `DotReader`.** The `dataReader` in go-smtp's `data.go` only adds size limiting (checking `MaxMessageBytes`), not any boundary detection or validation logic. The go-smtp `handleData()` function passes this reader directly to `Session.Data(r)` in Maddy's `internal/endpoint/smtp/smtp.go` (line 312).
@@ -121,7 +121,7 @@ The primary mechanism for wire-level observability is the `io_debug` configurati
       endp.Log.Println("I/O debugging is on! It may leak passwords in logs, be careful!")
   }
   ```
-- **Effect on go-smtp:** When `Server.Debug` is set, go-smtp's `conn.go` `init()` method (lines 65–73) wraps the raw connection in `io.TeeReader` and `io.MultiWriter`:
+- **Effect on go-smtp:** When `Server.Debug` is set, go-smtp's `conn.go` `init()` method (lines 62–72) wraps the raw connection in `io.TeeReader` and `io.MultiWriter`:
   ```go
   if c.server.Debug != nil {
       rwc = struct {
@@ -206,7 +206,7 @@ for {
 }
 ```
 
-The critical safety mechanism is in `textproto.Reader.ReadLine()`. Before reading the next line from the underlying buffered reader, `ReadLine()` calls `closeDot()` (`net/textproto/reader.go`, lines 405–413):
+The critical safety mechanism is in `textproto.Reader.ReadLine()`. Before reading the next line from the underlying buffered reader, `ReadLine()` calls `closeDot()` (`net/textproto/reader.go`, lines 400–410):
 ```go
 func (r *Reader) closeDot() {
     if r.dot == nil {
@@ -225,7 +225,7 @@ This drains the entire DotReader until it reaches `stateEOF` (at which point `r.
 
 ### 3.2 The Defensive Drain in `handleData()`
 
-go-smtp's `handleData()` in `conn.go` (lines 524–525) includes an explicit drain after the session callback returns:
+go-smtp's `handleData()` in `conn.go` (lines 521–522) includes an explicit drain after the session callback returns:
 ```go
 r := newDataReader(c)
 code, enhancedCode, msg := toSMTPStatus(c.Session().Data(r))
@@ -254,7 +254,7 @@ If a stricter MTA only accepts `\r\n.\r\n` as the DATA terminator:
 - It would **not** recognize `\n.\n` as a terminator and would continue reading body data.
 - The two servers would **disagree** on where the body ends.
 - However, when Maddy **forwards** messages via `internal/smtpconn/smtpconn.go` `Data()` (lines 303–323), it uses go-smtp's client `Data()` method which returns a `DotWriter`.
-- The `DotWriter` (`net/textproto/writer.go`, lines 69–99) converts all `\n` to `\r\n` in its output and appends `.\r\n` on `Close()` (lines 103–118).
+- The `DotWriter` (`net/textproto/writer.go`, lines 67–101) converts all `\n` to `\r\n` in its output and appends `.\r\n` on `Close()` (lines 103–119).
 - Therefore, the downstream peer **always** sees canonical RFC-compliant `\r\n.\r\n` termination, regardless of what the original client sent.
 - The boundary mismatch does **NOT propagate** downstream through Maddy when it acts as a relay.
 
@@ -270,11 +270,11 @@ After each message transaction, the following cleanup sequence executes:
 
 1. **Maddy `Session.Data()` completes** (`internal/endpoint/smtp/smtp.go`, lines 337–341): Sets `s.delivery = nil`, `s.msgCtx = nil`, ends the trace task, and releases the semaphore.
 
-2. **go-smtp `handleData()` drains residual body** (`conn.go`, line 524): `io.Copy(ioutil.Discard, r)` ensures all body data is consumed through the DotReader.
+2. **go-smtp `handleData()` drains residual body** (`conn.go`, line 521): `io.Copy(ioutil.Discard, r)` ensures all body data is consumed through the DotReader.
 
-3. **go-smtp `handleData()` sends the response** (`conn.go`, line 525): Sends `250 OK` or the appropriate error response.
+3. **go-smtp `handleData()` sends the response** (`conn.go`, line 522): Sends `250 OK` or the appropriate error response.
 
-4. **go-smtp `handleData()` calls `c.reset()`** (`conn.go`, line 516, deferred at entry): The `reset()` method (lines 694–703) acquires a lock, calls `c.session.Reset()` (which triggers Maddy's `Session.Reset()` — aborting any active delivery and logging `"reset"`), and clears `c.fromReceived = false` and `c.recipients = nil`.
+4. **go-smtp `handleData()` calls `c.reset()`** (`conn.go`, line 512, deferred at entry): The `reset()` method (lines 694–703) acquires a lock, calls `c.session.Reset()` (which triggers Maddy's `Session.Reset()` — aborting any active delivery and logging `"reset"`), and clears `c.fromReceived = false` and `c.recipients = nil`.
 
 5. **Next `ReadLine()` invokes `closeDot()`**: When the `handleConn()` loop calls `c.ReadLine()` for the next command, `closeDot()` runs as a final safety measure, draining any remaining DotReader data (though the drain in step 2 should have already consumed it).
 
@@ -343,9 +343,9 @@ func (c *C) Data(ctx context.Context, hdr textproto.Header, body io.Reader) erro
 ```
 
 The `DotWriter` (`net/textproto/writer.go`, lines 69–118):
-- Converts all `\n` to `\r\n` during `Write()` (line 87: if `c == '\n'`, writes `\r` before `\n`)
-- Escapes leading dots by doubling them (line 82)
-- On `Close()`, ensures the final line ends with `\r\n` and appends `.\r\n` (lines 103–118)
+- Converts all `\n` to `\r\n` during `Write()` (lines 84–85: if `c == '\n'`, writes `\r` before `\n`)
+- Escapes leading dots by doubling them (lines 74–76)
+- On `Close()`, ensures the final line ends with `\r\n` and appends `.\r\n` (lines 103–119)
 
 **Therefore:** Downstream peers **always** receive canonical RFC-compliant framing (`\r\n.\r\n`), regardless of what the original client sent to Maddy. The "leniency mismatch" does **not** propagate through Maddy when it acts as a relay.
 
@@ -368,7 +368,7 @@ When the DATA terminator is accepted (any of the four variants: `\r\n.\r\n`, `\n
 | `"accepted"` log entry | Emitted with `msg_id` field | `smtp.go` line 334 |
 | Message delivered to target | Body stored via `buffer.BufferInMemory()` with `\n`-only line endings | `smtp.go` lines 321–332 |
 | `"reset"` debug log | Emitted when go-smtp calls `Session.Reset()` after transaction | `smtp.go` line 64 |
-| `io_debug` wire capture | Raw bytes showing exact client framing (if `io_debug` is enabled) | `smtp.go` lines 603–606, `conn.go` lines 65–73 |
+| `io_debug` wire capture | Raw bytes showing exact client framing (if `io_debug` is enabled) | `smtp.go` lines 603–606, `conn.go` lines 62–72 |
 
 ### 6.2 Artifacts Present After Failed Transactions
 
@@ -402,7 +402,7 @@ The following expected evidence is **not present**, which is a significant obser
 The connection is clean and ready for the next transaction. The `reset()` call (`go-smtp/conn.go`, lines 694–703) clears all per-message state (`fromReceived = false`, `recipients = nil`, and calls `session.Reset()`). The DotReader has been fully drained via `io.Copy(ioutil.Discard, r)`. The `handleConn()` loop resumes reading the next command.
 
 **Failed delivery (header parse error, body too large, delivery rejection):**
-The delivery is aborted via `Session.abort()` (`smtp.go`, lines 67–81), which releases the semaphore, calls `delivery.Abort()`, and clears per-message state. The DotReader is **still** drained by `io.Copy(ioutil.Discard, r)` in `handleData()` (`conn.go`, line 524). The connection remains usable for subsequent transactions.
+The delivery is aborted via `Session.abort()` (`smtp.go`, lines 67–81), which releases the semaphore, calls `delivery.Abort()`, and clears per-message state. The DotReader is **still** drained by `io.Copy(ioutil.Discard, r)` in `handleData()` (`conn.go`, line 521). The connection remains usable for subsequent transactions.
 
 **Abrupt client disconnect during DATA:**
 - Maddy's `Session.Logout()` (`smtp.go`, lines 269–281) aborts any active delivery.
@@ -455,7 +455,7 @@ If the body is truncated (e.g., connection drops mid-DATA), the DotReader return
 
 ### 7.3 The `lineLimitReader` and Bare LF
 
-It is worth noting that the `lineLimitReader` in `go-smtp/lengthlimit_reader.go` (lines 22–47) also treats bare `\n` as a line boundary. Its `Read()` method resets `curLineLength` on `\n` (line 39), not on `\r\n` specifically. This means line-length enforcement is consistent with the DotReader's bare-LF acceptance — a line terminated by bare `\n` correctly resets the line-length counter.
+It is worth noting that the `lineLimitReader` in `go-smtp/lengthlimit_reader.go` (lines 22–47) also treats bare `\n` as a line boundary. Its `Read()` method resets `curLineLength` on `\n` (line 37), not on `\r\n` specifically. This means line-length enforcement is consistent with the DotReader's bare-LF acceptance — a line terminated by bare `\n` correctly resets the line-length counter.
 
 ---
 
@@ -499,11 +499,11 @@ It is worth noting that the `lineLimitReader` in `go-smtp/lengthlimit_reader.go`
 
 | File | Key Lines | Purpose |
 |------|-----------|---------|
-| `conn.go` | 49–75 | `init()` — `lineLimitReader` + debug `TeeReader`/`MultiWriter` |
+| `conn.go` | 48–75 | `init()` — `lineLimitReader` + debug `TeeReader`/`MultiWriter` |
 | | 498–525 | `handleData()` — 354 response, `newDataReader`, `Session.Data(r)`, drain, response, reset |
 | | 694–703 | `reset()` — clears `fromReceived`, `recipients`, calls `session.Reset()` |
 | `data.go` | 48–80 | `dataReader` — wraps `DotReader()` with `MaxMessageBytes` limit |
-| `server.go` | 82–86 | `NewServer()` — advertises `PIPELINING`, `8BITMIME`, `ENHANCEDSTATUSCODES` |
+| `server.go` | 81 | `NewServer()` — advertises `PIPELINING`, `8BITMIME`, `ENHANCEDSTATUSCODES` |
 | | 124–170 | `handleConn()` — command loop: `ReadLine()` → `parseCmd()` → `handle()` |
 | `parse.go` | 8–37 | `parseCmd()` — strips trailing `\r\n`, splits command from arguments |
 | `lengthlimit_reader.go` | 22–47 | `lineLimitReader` — resets byte counter on `\n` (bare LF) |
@@ -515,10 +515,10 @@ It is worth noting that the `lineLimitReader` in `go-smtp/lengthlimit_reader.go`
 |------|-----------|---------|
 | `net/textproto/reader.go` | 290–306 | `DotReader()` — creates new `dotReader`, calls `closeDot()` on previous |
 | | 311–397 | `dotReader.Read()` — six-state FSM for DATA boundary detection |
-| | 405–413 | `closeDot()` — drains active DotReader to EOF |
+| | 400–410 | `closeDot()` — drains active DotReader to EOF |
 | `net/textproto/writer.go` | 37–48 | `DotWriter()` — creates new `dotWriter` |
-| | 69–99 | `dotWriter.Write()` — converts `\n` to `\r\n`, escapes leading dots |
-| | 103–118 | `dotWriter.Close()` — ensures `\r\n` and appends `.\r\n` |
+| | 67–101 | `dotWriter.Write()` — converts `\n` to `\r\n`, escapes leading dots |
+| | 103–119 | `dotWriter.Close()` — ensures `\r\n` and appends `.\r\n` |
 
 ### Documentation
 
