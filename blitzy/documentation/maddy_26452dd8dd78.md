@@ -238,10 +238,12 @@ submission test.  Raw output:
 ```
 
 This confirms the `username` field *is* present on the authenticated code
-path.  The two extra `adding missing …` lines are debug messages from the
-submission module (`internal/endpoint/smtp/submission.go`) that only appear
-in submission mode; they have no JSON payload and sit between `RCPT ok` and
-`accepted`.
+path.  The two extra `adding missing …` lines are informational (info-level)
+messages emitted via `s.log.Msg(...)` by the submission module
+(`internal/endpoint/smtp/submission.go` lines 35 and 125) — they are *not*
+debug messages and do not go through `Logger.Debugf`/`DebugMsg`.  They
+only appear in submission mode; they have no JSON payload and sit between
+`RCPT ok` and `accepted`.
 
 ### 1.3 Aborted delivery — client hangs up during DATA (`TestSMTPDelivery_AbortData`)
 
@@ -482,13 +484,13 @@ the `log.Logger` struct, declared in `internal/log/log.go` lines 26–34:
 
 ```go
 type Logger struct {
-    Out   Output
-    Name  string
-    Debug bool
+	Out   Output
+	Name  string
+	Debug bool
 
-    // Fields is the logger-wide set of structured fields prepended to each
-    // message (e.g., "msg_id" injected by DeliveryLogger).
-    Fields map[string]interface{}
+	// Additional fields that will be added
+	// to the Msg output.
+	Fields map[string]interface{}
 }
 ```
 
@@ -583,29 +585,67 @@ queue: delivered	{"attempt":1,"msg_id":"10a443bb0a7e5de1d30121b8c14dd6c4aa957760
 ```
 
 These are **not** the production format.  They come from the test helper
-`DoTestDeliveryErrMeta` in `internal/testutils/target.go` lines 234–246:
+`DoTestDeliveryErrMeta` in `internal/testutils/target.go` lines 236–282:
 
 ```go
 func DoTestDeliveryErrMeta(t *testing.T, tgt module.DeliveryTarget, from string, to []string, msgMeta *module.MsgMetadata) (string, error) {
-    t.Helper()
+	t.Helper()
 
-    IDRaw := sha1.Sum([]byte(t.Name()))
-    encodedID := hex.EncodeToString(IDRaw[:])
+	IDRaw := sha1.Sum([]byte(t.Name()))
+	encodedID := hex.EncodeToString(IDRaw[:])
+	testCtx := context.Background()
 
-    body := buffer.MemoryBuffer{Slice: []byte("foobar")}
-    ctx := module.MsgMetadata{
-        DontTraceSender: true,
-        ID:              encodedID,
-    }
-    ...
+	body := buffer.MemoryBuffer{Slice: []byte("foobar\n")}
+	msgMeta.DontTraceSender = true
+	msgMeta.ID = encodedID
+	t.Log("-- tgt.Start", from)
+	delivery, err := tgt.Start(testCtx, msgMeta, from)
+	if err != nil {
+		t.Log("-- ... tgt.Start", from, err, exterrors.Fields(err))
+		return encodedID, err
+	}
+	for _, rcpt := range to {
+		t.Log("-- delivery.AddRcpt", rcpt)
+		if err := delivery.AddRcpt(testCtx, rcpt); err != nil {
+			t.Log("-- ... delivery.AddRcpt", rcpt, err, exterrors.Fields(err))
+			t.Log("-- delivery.Abort")
+			if err := delivery.Abort(testCtx); err != nil {
+				t.Log("-- delivery.Abort:", err, exterrors.Fields(err))
+			}
+			return encodedID, err
+		}
+	}
+	t.Log("-- delivery.Body")
+	hdr := textproto.Header{}
+	hdr.Add("B", "2")
+	hdr.Add("A", "1")
+	if err := delivery.Body(testCtx, hdr, body); err != nil {
+		t.Log("-- ... delivery.Body", err, exterrors.Fields(err))
+		t.Log("-- delivery.Abort")
+		if err := delivery.Abort(testCtx); err != nil {
+			t.Log("-- ... delivery.Abort:", err, exterrors.Fields(err))
+		}
+		return encodedID, err
+	}
+	t.Log("-- delivery.Commit")
+	if err := delivery.Commit(testCtx); err != nil {
+		t.Log("-- ... delivery.Commit", err, exterrors.Fields(err))
+		return encodedID, err
+	}
+
+	return encodedID, err
 }
 ```
 
 The helper hashes the test's function name (e.g. `TestQueueDelivery` →
 `10a443bb0a7e5de1d30121b8c14dd6c4aa957760`) to produce a **deterministic**,
-reproducible ID.  This is a test artifact that lets `CheckMsgID` make exact
-assertions against the delivered meta.  SHA-1 yields 20 bytes, hex-encoded
-to 40 characters.
+reproducible ID.  Note that `DoTestDeliveryErrMeta` **mutates the
+`msgMeta` parameter in place** (`msgMeta.DontTraceSender = true`;
+`msgMeta.ID = encodedID`) rather than constructing a new `MsgMetadata`
+value, and the body buffer carries a trailing newline (`"foobar\n"`).
+This is a test artifact that lets `CheckMsgID` make exact assertions
+against the delivered meta.  SHA-1 yields 20 bytes, hex-encoded to 40
+characters.
 
 #### 2.2.4 Summary
 
@@ -637,25 +677,27 @@ dl := target.DeliveryLogger(q.Log, meta.MsgMeta)
 ```
 
 `target.DeliveryLogger` (from `internal/target/delivery.go` lines 8–16)
-clones the base logger and injects `msg_id` into `Logger.Fields`:
+clones the base logger's field map, injects `msg_id`, and returns the
+(value-receiver) logger with the new `Fields`:
 
 ```go
 func DeliveryLogger(l log.Logger, msgMeta *module.MsgMetadata) log.Logger {
-    dupLogger := l
-
-    dupLogger.Fields = make(map[string]interface{}, 2)
-    for k, v := range l.Fields {
-        dupLogger.Fields[k] = v
-    }
-    dupLogger.Fields["msg_id"] = msgMeta.ID
-
-    return dupLogger
+	fields := make(map[string]interface{}, len(l.Fields)+1)
+	for k, v := range l.Fields {
+		fields[k] = v
+	}
+	fields["msg_id"] = msgMeta.ID
+	l.Fields = fields
+	return l
 }
 ```
 
-Because `formatMsg` merges `Logger.Fields` into every message's field map
-(`internal/log/log.go` line 145–147), **every queue log line automatically
-includes `msg_id`** without each call-site needing to pass it explicitly.
+Because `Logger` is passed by value, the caller's `Logger` is not
+mutated — the reassignment `l.Fields = fields` only affects the local
+copy that is returned.  Because `formatMsg` merges `Logger.Fields`
+into every message's field map (`internal/log/log.go` lines 145–147),
+**every queue log line automatically includes `msg_id`** without each
+call-site needing to pass it explicitly.
 
 The queue logger's name is `queue`, assigned by `newTestQueueDir` at the
 start of every queue test (confirmed by the `queue:` prefix present on
@@ -692,7 +734,10 @@ observed ordering is therefore, for example:
 
 ### 3.4 Retry scheduling math
 
-Lines 406–414 of `queue.go` compute the next attempt time:
+Lines 407–414 of `queue.go` compute the next attempt time (line 407
+increments `meta.TriesCount`; lines 409–411 persist the updated
+metadata via `updateMetadataOnDisk`; lines 413–414 compute
+`nextTryTime`):
 
 ```go
 meta.TriesCount++
@@ -854,24 +899,33 @@ MX authentication is checked by `checkPolicies` in
 lines 94–99:
 
 ```go
-if rd.Target.requireMXAuth && !authenticated {
-    return nil, &exterrors.SMTPError{
-        Code:         550,
-        EnhancedCode: exterrors.EnhancedCode{5, 7, 0},
-        Message:      fmt.Sprintf("Failed to estabilish the MX record (%s) authenticity", mx),
-    }
-}
+	if rd.rt.requireMXAuth && !authenticated {
+		return &exterrors.SMTPError{
+			Code:         550,
+			EnhancedCode: exterrors.EnhancedCode{5, 7, 0},
+			Message:      fmt.Sprintf("Failed to estabilish the MX record (%s) authenticity", mx),
+		}
+	}
 ```
 
-Three critical details are worth calling out:
+Four critical details are worth calling out:
 
-1. **Verbatim error string** — `"Failed to estabilish the MX record (%s) authenticity"`.
+1. **Field access is `rd.rt.requireMXAuth`**, not `rd.Target.requireMXAuth`:
+   inside `remoteDelivery` the target is held in the unexported field
+   `rt *Target` (see the `remoteDelivery` struct definition in
+   `internal/target/remote/remote.go`).  The check therefore reads
+   the requireMXAuth flag through that embedded pointer.
+2. **`checkPolicies` returns a single `error` value** — the statement
+   `return &exterrors.SMTPError{...}` has one return value, not two.
+   The function signature (at the top of the same code block) is
+   `func (rd *remoteDelivery) checkPolicies(mx string, didTLS, authenticated bool) error`.
+3. **Verbatim error string** — `"Failed to estabilish the MX record (%s) authenticity"`.
    The word **`estabilish`** is a typo in the source code; it is **not**
    spelled `establish`.  Any documentation or log grep patterns must use
    the misspelled form.
-2. **Inner SMTP enhanced code** — `EnhancedCode{5, 7, 0}`, which renders
-   via `FormatLog` as `"5.7.0"` in JSON log output.
-3. **Inner SMTP reply code** — `550` (Requested action not taken).
+4. **Inner SMTP enhanced code** — `EnhancedCode{5, 7, 0}`, which renders
+   via `FormatLog` as `"5.7.0"` in JSON log output.  **Inner SMTP reply
+   code** — `550` (Requested action not taken).
 
 ### 4.2 How the enhanced code becomes the `X.Y.Z` string
 
@@ -925,32 +979,49 @@ No usable MXs, last err: Failed to estabilish the MX record (mx.example.invalid.
 `internal/exterrors/smtp.go` lines 118–128:
 
 ```go
-func SMTPEnchCode(err error, fallback EnhancedCode) EnhancedCode {
-    var smtpErr *SMTPError
-    if errors.As(err, &smtpErr) {
-        return smtpErr.EnhancedCode
-    }
-
-    code := fallback
-    if IsTemporaryOrUnspec(err) {
-        code[0] = 4
-    }
-    code[0] = 5
-    return code
+// SMTPEnchCode is a convenience function changes the first number of the SMTP enhanced
+// status code based on the value exterrors.IsTemporary returns for the specified
+// error object.
+func SMTPEnchCode(err error, code EnhancedCode) EnhancedCode {
+	if IsTemporary(err) {
+		code[0] = 4
+	}
+	code[0] = 5
+	return code
 }
 ```
 
-In the MX loop `connectionForDomain` invokes `SMTPEnchCode(err, EnhancedCode{0, 4, 0})`
-(line 206) where `err` is the error **from the DNS lookup**, which
-succeeded — so `err` is `nil`.  Consequently:
+Note what this function **does not** do: there is no `errors.As` unwrap,
+no fallback-vs-error distinction, no branch that preserves an inner
+`SMTPError.EnhancedCode`.  It only takes `err` (used solely to gate the
+`IsTemporary` check), takes a starting `code`, and returns it back with
+`code[0]` overwritten.
 
-* `errors.As(nil, &smtpErr)` returns `false`, so the fallback path runs.
-* `fallback` is `{0, 4, 0}`.
-* `IsTemporaryOrUnspec(nil)` (see `exterrors` DNS helpers) may or may not
-  be true, but **line 126 unconditionally sets `code[0] = 5`** — making
-  the `IsTemporaryOrUnspec` check on lines 123–125 effectively dead code.
+In the MX loop `connectionForDomain` invokes
+`SMTPEnchCode(err, exterrors.EnhancedCode{0, 4, 0})` (line 206).
+Tracing the evaluation:
+
+* The incoming `code` is `{0, 4, 0}`.
+* `IsTemporary(err)` — defined at `internal/exterrors/temporary.go`
+  lines 25–31 — returns `false` unless `err` implements the
+  `Temporary() bool` interface **and** that method returns `true`.
+  For this call path `err` is the last MX-walk error (an
+  `*exterrors.SMTPError` with permanent code `550`) whose `Temporary()`
+  returns `false`; for a nil `err`, the check is also `false`.  Either
+  way the `code[0] = 4` branch does not execute (or does execute,
+  but is then immediately overwritten — see the next point).
+* **Line 126 unconditionally executes `code[0] = 5`**, overwriting any
+  assignment the `IsTemporary` branch might have made.  This makes the
+  `IsTemporary` check on lines 123–125 **dead code**: no matter what
+  `err` is, `code[0]` becomes `5` before the return.
 * The returned value is therefore `{5, 4, 0}`, rendered by `FormatLog`
   as `"5.4.0"`.
+
+This is a latent bug in the source: the doc-comment above the function
+says it "changes the first number of the SMTP enhanced status code
+based on the value `IsTemporary` returns", but the implementation
+always sets it to `5`.  The observed `5.4.0` outer enhanced code would
+not change even if the underlying error were a temporary failure.
 
 **Net effect.** The *inner* `SMTPError` carried by the loop's `lastErr`
 has `EnhancedCode{5, 7, 0}` (from the `checkPolicies` construction), but
@@ -1068,40 +1139,60 @@ All three share `smtp_code:550` and the same inner `EnhancedCode{5, 7, 0}`
 ### 5.1 Where the TLS-fallback log is emitted
 
 `internal/target/remote/connect.go`, inside `connectionForDomain`, lines
-170–189:
+164–189:
 
 ```go
-conn := mxConn{
-    C:         smtpconn.New(),
-    serverName: record.Host,
-}
+		rd.Log.DebugMsg("trying", "mx", record.Host, "domain", domain)
+		didTLS, err := conn.Connect(ctx, config.Endpoint{
+			Host: record.Host,
+			Port: smtpPort,
+		}, true)
+		authErr := rd.checkPolicies(ctx, record.Host, didTLS, conn)
 
-_, err := conn.Connect(ctx, config.Endpoint{
-    Host: record.Host,
-    Port: smtpPort,
-}, rd.Target.tlsConfig)
+		if err != nil {
+			lastErr = err
 
-if err != nil {
-    ...
-    var tlsErr smtpconn.TLSError
-    if errors.As(err, &tlsErr) && authErr == nil {
-        rd.Log.Error("TLS error, falling back to plaintext", err,
-            "mx", record.Host, "domain", domain)
+			// If there was a TLS error and MX auth does not seem to complain
+			// about plaintext - reconnect without TLS.
+			if _, ok := err.(smtpconn.TLSError); ok && authErr == nil {
+				rd.Log.Error("TLS error, falling back to plaintext", err,
+					"mx", record.Host, "domain", domain)
 
-        _, err := conn.Connect(ctx, config.Endpoint{
-            Host: record.Host,
-            Port: smtpPort,
-        }, false)
-        ...
-    }
+				_, err := conn.Connect(ctx, config.Endpoint{
+					Host: record.Host,
+					Port: smtpPort,
+				}, false)
+				if err != nil {
+					// That's odd, but whatever.
+					continue
+				}
+			} else {
+				continue
+			}
+		}
 ```
 
-The log line is emitted **only when two preconditions hold
+Two points about the quoted block that differ from patterns the reader
+might expect:
+
+* **The third argument to `conn.Connect` is a plain `bool`**, not a
+  `*tls.Config` — `true` on the initial attempt (meaning "attempt
+  STARTTLS"), `false` on the plaintext-fallback reconnect.  The actual
+  TLS configuration used by the connection is held elsewhere (on the
+  `mxConn` / `smtpconn.C` wrapper), not passed on each call.
+* **The TLS-error detection uses a direct type assertion**,
+  `if _, ok := err.(smtpconn.TLSError); ok`, rather than
+  `errors.As(err, &tlsErr)`.  That means the error must be a *direct*
+  `smtpconn.TLSError` value (not a wrapped one); in the current code
+  path `conn.Connect` returns `TLSError` directly on STARTTLS-handshake
+  failure, so the type assertion succeeds.
+
+The log line is therefore emitted **only when two preconditions hold
 simultaneously**:
 
-1. The connect error is wrappable to `smtpconn.TLSError` (from
+1. The connect error is a direct `smtpconn.TLSError` (from
    `internal/smtpconn/smtpconn.go` lines 140–146, which wraps any TLS
-   handshake error).
+   handshake error in that type).
 2. There is no separate "auth error" outstanding (`authErr == nil`) —
    i.e., the MX passed authentication checks so plaintext is permissible.
 
@@ -1264,7 +1355,9 @@ nanoseconds.
 
 ### 6.3 Retry-delay computation
 
-Lines 406–414 of `queue.go`:
+Lines 407–414 of `queue.go` (note: line 407 is `meta.TriesCount++`;
+lines 408–412 are an intervening `updateMetadataOnDisk` call whose
+body is elided for readability; lines 413–414 compute `nextTryTime`):
 
 ```go
 meta.TriesCount++
@@ -1357,12 +1450,13 @@ reference for the mechanics.
 
 ```go
 type Logger struct {
-    Out   Output
-    Name  string
-    Debug bool
+	Out   Output
+	Name  string
+	Debug bool
 
-    // Fields is the base set of fields added to each log message.
-    Fields map[string]interface{}
+	// Additional fields that will be added
+	// to the Msg output.
+	Fields map[string]interface{}
 }
 ```
 
@@ -1449,22 +1543,24 @@ wrapping error, applied last).
 
 ```go
 func DeliveryLogger(l log.Logger, msgMeta *module.MsgMetadata) log.Logger {
-    dupLogger := l
-
-    dupLogger.Fields = make(map[string]interface{}, 2)
-    for k, v := range l.Fields {
-        dupLogger.Fields[k] = v
-    }
-    dupLogger.Fields["msg_id"] = msgMeta.ID
-
-    return dupLogger
+	fields := make(map[string]interface{}, len(l.Fields)+1)
+	for k, v := range l.Fields {
+		fields[k] = v
+	}
+	fields["msg_id"] = msgMeta.ID
+	l.Fields = fields
+	return l
 }
 ```
 
 This is how `msg_id` appears in every queue / remote / pipeline log
-line without the call-sites having to mention it.  The returned logger
-is a **value** (not a pointer), so each delivery has its own isolated
-`Fields` map that cannot leak into other concurrent deliveries.
+line without the call-sites having to mention it.  Because `Logger`
+is passed and returned **by value** (not by pointer), the reassignment
+`l.Fields = fields` only affects the local copy that is returned, so
+each delivery has its own isolated `Fields` map that cannot leak into
+other concurrent deliveries or mutate the caller's base logger.  The
+new map is sized `len(l.Fields)+1` to accommodate the inherited
+fields plus the injected `msg_id` entry without reallocation.
 
 ### 7.8 Outputs
 
@@ -1486,23 +1582,58 @@ implementations:
 `internal/testutils/logger.go` lines 18–41 constructs:
 
 ```go
-return log.Logger{
-    Out: log.FuncOutput(func(_ time.Time, debug bool, s string) {
-        s = strings.TrimSuffix(s, "\n")
-        if debug {
-            s = "[debug] " + s
-        }
-        t.Log(s)
-    }, func() error { return nil }),
-    Name:  name,
-    Debug: false, // unless -test.debuglog was passed
+func Logger(t *testing.T, name string) log.Logger {
+	if *directLog {
+		return log.Logger{
+			Out:   log.WriterOutput(os.Stderr, true),
+			Name:  name,
+			Debug: *debugLog,
+		}
+	}
+
+	return log.Logger{
+		Out: log.FuncOutput(func(_ time.Time, debug bool, str string) {
+			t.Helper()
+			str = strings.TrimSuffix(str, "\n")
+			if debug {
+				str = "[debug] " + str
+			}
+			t.Log(str)
+		}, func() error {
+			return nil
+		}),
+		Name:  name,
+		Debug: *debugLog,
+	}
 }
 ```
+
+Two aspects of the real source that the test output depends on:
+
+* **`Debug: *debugLog`** — `debugLog` is a package-level `*bool` set
+  from the `-test.debuglog` command-line flag (declared at the top of
+  `internal/testutils/logger.go`).  When the flag is not passed (the
+  default in normal `go test -v` runs), the pointer dereferences to
+  `false`, so debug messages are suppressed.  This is why `DebugMsg`
+  calls such as `rd.Log.DebugMsg("trying", ...)` in `connect.go` do
+  not appear in the captured test output even though they exist in
+  the code path.
+* **`t.Helper()`** inside the `FuncOutput` callback — this tells Go's
+  testing package to attribute the file:line prefix of each logged line
+  to the caller of `t.Log`, not to the callback itself.  That is why
+  the prefix observed in test output is `output.go:41:` (the
+  `FuncOutput.Write` call site inside `internal/log/output.go`) rather
+  than `logger.go:...`.
 
 Because the callback trims the trailing newline and prepends `[debug] `
 only for debug messages, all non-debug lines you see in `go test -v`
 output are identical in content to what would be written to stderr in
-production — minus the timestamp prefix.
+production — minus the timestamp prefix.  The `if *directLog` branch
+at the top of the function provides an opt-in mechanism (via
+`-test.directlog`) to bypass `t.Log` entirely and write to `os.Stderr`
+through `WriterOutput`, which is useful for debugging live test runs
+but is not the default path used by any of the captures in this
+document.
 
 ### 7.10 Putting it all together — how a single log line is produced
 
@@ -1708,17 +1839,27 @@ ok  	github.com/foxcpp/maddy/internal/endpoint/smtp	0.006s
 | `smtp: MAIL FROM error ... smtp_code:523,"smtp_enchcode":"0.0.0","smtp_msg":"Hey"`  | §1.6            | `*exterrors.SMTPError.Fields()` contributes `smtp_code` (int), `smtp_enchcode` (string formatted by `FormatLog`), `smtp_msg` (string) |
 | `smtp: MAIL FROM error (deferred) ... rcpt:"test1@example.org" ...`                 | §1.7            | Deferred errors surface on `RCPT` and carry an additional `rcpt` field |
 | `smtp: incoming message ... username:"user"`                                         | §1.2            | Authenticated submission sessions add a `username` field |
-| `smtp: adding missing Message-ID` with an empty JSON payload (trailing tab only)    | §1.8            | `submission.go` emits headerless log lines via `Logger.Msg(msg)` with no field arguments |
+| `smtp: adding missing Message-ID` ending with a trailing tab and no JSON payload    | §1.8            | `submission.go` emits headerless log lines via `Logger.Msg(msg)` with no field arguments; `formatMsg` skips `marshalOrderedJSON` when both Fields maps are empty |
 
 An important subtlety visible in this transcript is the *trailing
 tab* after `adding missing Message-ID` and `adding missing Date
-header`: those lines end with `\t` followed by an empty JSON object
-`{}`.  This is produced by `Logger.formatMsg` in
-`internal/log/log.go` lines 149–153: when `len(fields) == 0` the
-`marshalOrderedJSON` call still writes the bytes `{}`, and the tab is
-always appended.  (In the terminal rendering the empty braces are
-nearly invisible next to the trailing tab; the important fact is that
-no field data is present, which is the claim §1.8 makes.)
+header`: those lines end with exactly `\t` and nothing else — **no
+braces are written**.  This is produced by `Logger.formatMsg` in
+`internal/log/log.go` lines 135–155.  After writing the message text
+and the tab (lines 138–139), the method guards the JSON-emission
+block behind `if len(l.Fields)+len(fields) != 0` (line 141): when
+*both* the logger-wide `Fields` map and the per-call `fields` map are
+empty, the `marshalOrderedJSON` call is **skipped entirely** and the
+returned string ends immediately after the tab.  For the submission
+log lines `s.log.Msg("adding missing Message-ID")` and
+`s.log.Msg("adding missing Date header")` this is exactly the case:
+no per-call fields are supplied and the session logger's `Fields`
+map is empty (no `DeliveryLogger` wrap on the SMTP endpoint path),
+so no JSON payload — not even `{}` — is emitted.  Byte-level
+inspection with `cat -A` confirms the lines end with `^I$` (tab +
+newline) with no braces.  This is the behavior §1.8 describes and
+is fully consistent with §1.2's statement that these lines "have no
+JSON payload".
 
 ### 8.3 Queue delivery — full lifecycle across four test cases
 
