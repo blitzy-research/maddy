@@ -142,7 +142,7 @@ queue: delivered	{"attempt":1,"msg_id":"10a443bb0a7e5de1d30121b8c14dd6c4aa957760
 **Analysis:**
 
 - **Module prefix**: **`queue`**
-- **`msg_id` in tests**: A **40-character hexadecimal SHA-1 hash of the test name**, created by `testutils.DoTestDelivery` at `internal/testutils/target.go:184-185`:
+- **`msg_id` in tests**: A **40-character hexadecimal SHA-1 hash of the test name**, created by `testutils.DoTestDeliveryErrMeta` at `internal/testutils/target.go:239-240`:
   ```go
   IDRaw := sha1.Sum([]byte(t.Name()))
   encodedID := hex.EncodeToString(IDRaw[:])
@@ -174,7 +174,7 @@ queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1
 **The JSON field name containing the retry delay value is `next_try_delay`.**
 
 - **Source**: `dl.Msg("will retry", "attempts_count", meta.TriesCount, "next_try_delay", time.Until(nextTryTime), "rcpts", meta.To)` at `internal/target/queue/queue.go:415-418`.
-- The delay is a `time.Duration` value, formatted as a string by `marshalOrderedJSON()`'s `fmt.Stringer` type-switch branch at `orderedjson.go:47`. The negative value (`"-466ns"`) is expected because in the test environment, the retry time is set very close to "now" and by the time the log line is emitted, the target time is already in the past.
+- The delay is a `time.Duration` value, formatted as a string by `marshalOrderedJSON()`'s `time.Duration` type-switch branch at `orderedjson.go:43-44`. The negative value (`"-466ns"`) is expected because in the test environment, the retry time is set very close to "now" and by the time the log line is emitted, the target time is already in the past.
 
 **JSON fields per log event** (alphabetical order):
 
