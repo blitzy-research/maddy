@@ -22,6 +22,11 @@ decision is made.
 | go-smtp dependency (pinned) | `github.com/emersion/go-smtp v0.12.1-0.20191206174923-1f576e0ec85c` |
 | Go standard library analyzed | `/usr/lib/go-1.22/src/net/textproto/reader.go` (lines 333–445) |
 | Test host | Ubuntu 24.04.4 LTS, `127.0.0.1:2525` (backend), `127.0.0.1:2526` (strict proxy) |
+| Commit date | **13 December 2019** (`26452dd`, 17:31:35 +0300) |
+| SMTP smuggling disclosure date | **December 2023** (SEC Consult / Timo Longin) |
+| Time gap commit → disclosure | **~4 years** — the commit under analysis predates the public smuggling disclosure |
+| Upstream go-smtp smuggling fix | `v0.20.0` (27 December 2023) and `v0.20.1` (January 2024) — **post-dates this commit** |
+| Downstream Maddy smuggling fix | `v0.7.1` (PR #661, `[SECURITY] go-smtp: Mitigate SMTP smuggling issue`) — **post-dates this commit** |
 | Analysis date | April 2026 |
 
 > **Scope guarantee**: This analysis is purely **observational**. No file inside
@@ -29,6 +34,16 @@ decision is made.
 > this Markdown document in `blitzy/documentation/`. All temporary Go programs
 > used to probe live behavior were created in `/tmp/maddy-test/` and have been
 > cleaned up.
+
+> **Temporal scope guarantee**: The vulnerability characterisation in this
+> document applies **exclusively to commit `26452dd` and earlier**. The
+> December 2019 commit predates both the December 2023 public disclosure of
+> the SMTP smuggling attack class and the subsequent remediations landed in
+> `go-smtp v0.20.0` / `v0.20.1` and `maddy v0.7.1` (PR #661). Readers
+> encountering this document should **not** conclude that current Maddy
+> releases are vulnerable; see [Remediation Status](#remediation-status-upstream-and-downstream-fixes)
+> (immediately preceding Section 8) and [Appendix E.2 — Vulnerability Disclosures](#e2-vulnerability-disclosures)
+> for the full fix history.
 
 ---
 
@@ -43,12 +58,23 @@ decision is made.
 7. [Section 5 — Proxy Interaction Analysis](#5-proxy-interaction-analysis)
 8. [Section 6 — Diagnostic Artifacts and Residual Evidence](#6-diagnostic-artifacts-and-residual-evidence)
 9. [Section 7 — Static Analysis Corroboration](#7-static-analysis-corroboration)
-10. [Section 8 — Recommendations (Observational)](#8-recommendations-observational)
-11. [Appendix A — Test Environment](#appendix-a--test-environment)
-12. [Appendix B — Complete Protocol Transcripts](#appendix-b--complete-protocol-transcripts)
-13. [Appendix C — Hex Dumps of Wire Traffic](#appendix-c--hex-dumps-of-wire-traffic)
-14. [Appendix D — dotReader State Machine Visualization](#appendix-d--dotreader-state-machine-visualization)
-15. [Appendix E — References](#appendix-e--references)
+10. [Remediation Status (Upstream and Downstream Fixes)](#remediation-status-upstream-and-downstream-fixes)
+11. [Section 8 — Recommendations (Observational)](#8-recommendations-observational)
+12. [Appendix A — Test Environment](#appendix-a--test-environment)
+13. [Appendix B — Complete Protocol Transcripts](#appendix-b--complete-protocol-transcripts)
+14. [Appendix C — Hex Dumps of Wire Traffic](#appendix-c--hex-dumps-of-wire-traffic)
+15. [Appendix D — dotReader State Machine Visualization](#appendix-d--dotreader-state-machine-visualization)
+16. [Appendix E — References](#appendix-e--references)
+    - E.1 Standards and RFCs
+    - E.2 Vulnerability Disclosures (SMTP smuggling CVEs, upstream `go-smtp` fix, downstream Maddy `v0.7.1` fix)
+    - E.3 Source Code References
+    - E.4 External Technical References
+    - E.5 Ecosystem Mitigation Documentation
+    - E.6 Container and Environment References
+    - E.7 Glossary of Acronyms and Terms
+    - E.8 Document Provenance
+    - E.9 Final Notes
+    - E.10 Dependency Vulnerability Landscape at Commit `26452dd`
 
 ---
 
@@ -947,6 +973,21 @@ injects a second message with a different sender envelope.
 The most notable published case of this class of vulnerability is CVE-2023-51764
 (Postfix), though every MTA that accepts bare-LF terminators and multiplexes
 its reader state is affected to the same degree.
+
+> **Temporal note**: The commit under analysis (`26452dd`) was authored on
+> **13 December 2019**, roughly **four years before** the SEC Consult public
+> disclosure. At authoring time the lenient-terminator behaviour inherited
+> from `net/textproto.dotReader` was not recognised as a vulnerability in the
+> MTA ecosystem; RFC 822/RFC 5321 robustness ("be liberal in what you
+> accept") was the prevailing design philosophy for SMTP line-ending
+> handling. The conclusions in this section describe the state of **commit
+> `26452dd` and earlier only**. The upstream `go-smtp` library and downstream
+> Maddy both received remediations in response to the December 2023
+> disclosure; see the dedicated
+> [Remediation Status](#remediation-status-upstream-and-downstream-fixes)
+> section (immediately preceding Section 8) and
+> [Appendix E.2 — Vulnerability Disclosures](#e2-vulnerability-disclosures)
+> for the full fix history.
 
 ### 4.2 The Specific Payload Used
 
@@ -2418,6 +2459,108 @@ the merits and drawbacks of each.
 
 ---
 
+## Remediation Status (Upstream and Downstream Fixes)
+
+The behavioural findings in Sections 1–7 of this document were
+derived from commit `26452dd` (13 December 2019). That commit
+**pre-dates** the December 2023 public disclosure of the SMTP
+smuggling attack class by approximately **four years**. Between
+the time of the commit and the analysis date (April 2026), the
+ecosystem — including the upstream library on which Maddy
+depends, and Maddy itself — landed fixes. This section is a
+single authoritative landing pad for the post-commit remediation
+timeline; every reader-facing anchor elsewhere in the document
+(`Temporal scope guarantee` in the Metadata block, the
+`Temporal note` in Section 4, and the `Fix availability note` in
+Section 8.12) points here.
+
+### RS.1 Upstream library fix — `emersion/go-smtp`
+
+The library whose `dataReader` wraps the stdlib dotReader, and
+whose `handleData` / `handleConn` together form the smuggling
+substrate, received its SMTP smuggling mitigation in two
+consecutive releases:
+
+| Release | Date | Commit summary | Author | What it closes |
+| --- | --- | --- | --- | --- |
+| `v0.20.0` | **27 December 2023** | *"Remove DotLF to EOFState case"* | Brian Mayer | Bare-LF (`\n.\n`) accepted as DATA terminator |
+| `v0.20.0` | **27 December 2023** | *"Add SMTP smuggling test"* | Simon Ser | Regression test around the above fix |
+| `v0.20.1` | **January 2024** | *"Prevent `<LF>.<CR><LF>` SMTP smuggling attacks"* | Mathias Lieber | Mixed-ending `\n.\r\n` terminator edge case |
+
+These releases together remove **all three** of the non-canonical
+terminator acceptance paths analysed in Section 1 (`\n.\n`,
+`\r\n.\n`, `\n.\r\n`). The canonical `\r\n.\r\n` continues to
+work as specified by RFC 5321. In the state-machine terms of
+Appendix D, the `stateDot` → `stateEOF` transition on a bare
+`\n` input is removed; the state machine now requires seeing `\r`
+first (i.e., `stateDot` → `stateDotCR`) before transitioning to
+`stateEOF`.
+
+An operator building Maddy from any source tree that depends on
+`go-smtp v0.20.0` or later (which includes the post-`v0.7.1`
+Maddy tree) therefore **does not need to fork the library, does
+not need to submit a patch upstream, and does not need to wait
+for an ecosystem decision**. The mitigation is present by
+default at the dependency layer.
+
+### RS.2 Downstream application fix — Maddy
+
+Maddy consumed the upstream fix by bumping its `go-smtp`
+dependency in its next security release:
+
+| Release | Disposition | Reference |
+| --- | --- | --- |
+| `v0.7.0` and earlier (incl. commit `26452dd`) | **Vulnerable** — bare-LF terminators accepted; smuggling exploitable as described in Section 4. | This document. |
+| `v0.7.1` | **Fixed** — upgraded to a post-fix `go-smtp` revision; bare-LF rejection is active by default. | PR **#661** *"[SECURITY] go-smtp: Mitigate SMTP smuggling issue"*. Release note by maintainer (foxcpp): *"Until 0.7.1 maddy was a 'email service B'"*, referencing the two-server labelling used in the Postfix SMTP smuggling write-up at `https://www.postfix.org/smtp-smuggling.html`. |
+| `v0.7.1` and later | **Not affected** by the vulnerability class characterised in Section 4. | Inherits the upstream `v0.20.x`-series fix. |
+
+The critical implication: **any reader of this document who
+encounters a live Maddy deployment should first check the
+running version**. If the deployment is running Maddy `v0.7.1`
+or later, the DATA-boundary vulnerability described in Sections
+1–7 is **not present**, and the Section 8 mitigation options are
+not applicable as active remediation work.
+
+### RS.3 Go standard library `net/textproto.dotReader`
+
+The Go standard library's `dotReader` **has not** received an
+equivalent strict-mode option as of Go `1.22.2` (the toolchain
+used for this analysis) or any subsequent release tracked at the
+analysis date. The six-state FSM analysed in Section 7.2 and
+Appendix D continues to accept bare-LF variants as terminators.
+This is consistent with the library's long-standing robustness
+posture for RFC 822/MIME-adjacent protocols, but it means that
+every Go SMTP server that calls `DotReader()` directly without
+the go-smtp v0.20.x wrapper is still exposed to the bare-LF
+acceptance behaviour at the stdlib layer.
+
+For Maddy the stdlib behaviour is immaterial after `v0.7.1`
+because the go-smtp wrapper now enforces canonical terminators
+before the stdlib dotReader's lenient state transitions become
+observable. See Section 8.5 for a discussion of the long-term
+stdlib strict-mode proposal.
+
+### RS.4 Recommendation for current Maddy operators
+
+For an operator encountering this document in 2025/2026 and
+wanting a one-line action: **upgrade to Maddy `v0.7.1` or later**.
+No configuration changes, no rebuild-from-source, no forking of
+`go-smtp`, and no stdlib patches are required; the mitigation is
+shipped by default at the dependency layer. The operator can then
+optionally enable the defence-in-depth observability measures in
+Section 8.9 for detection of any remaining lenient-terminator
+variants that may arise from future upstream changes.
+
+For an operator rebuilding specifically from commit `26452dd`
+(e.g., bisection, regression investigation, or historical study),
+the mitigation with the lowest patch footprint is a single
+`go.mod` line bumping
+`github.com/emersion/go-smtp v0.12.1-0.20191206174923-1f576e0ec85c`
+to `github.com/emersion/go-smtp v0.20.1` (or later). This is the
+operationalised form of Section 8.4 Option 2 in 2026 terms.
+
+---
+
 ## 8. Recommendations (Observational)
 
 ### 8.1 Scope Disclaimer
@@ -2586,12 +2729,43 @@ func looksLikeSmuggledData(peek []byte) bool {
   "legitimate pipelined NOOP" from "smuggled NOOP-then-MAIL-FROM"
   requires strict-mode tightening (e.g., reject any residual data
   whatsoever, which breaks pipelining).
-- Requires an upstream change to go-smtp. Maddy cannot make this
-  change in its own tree without forking the library.
+- Requires an upstream change to go-smtp. At the time commit
+  `26452dd` was authored (December 2019), the pinned go-smtp
+  version (`v0.12.1-0.20191206174923-1f576e0ec85c`) did not offer
+  such a flag, so Maddy could not adopt this mitigation without
+  either forking the library or waiting for an upstream patch.
 
-**Verdict**: This is the most targeted mitigation. Maintainers
-of go-smtp could accept a PR adding a `Server.ForbidBareNewline`
-option that implements this logic.
+> **Remediation status (post-commit)**: The hypothetical patch
+> described above was, in fact, landed **upstream in
+> `emersion/go-smtp` in response to the December 2023 SMTP
+> smuggling disclosure**:
+>
+> - **`go-smtp v0.20.0`** (released 27 December 2023) — commit
+>   *"Remove DotLF to EOFState case"* by Brian Mayer closes the
+>   bare-LF terminator path inside the dotReader wrapper, and a
+>   companion *"Add SMTP smuggling test"* commit by Simon Ser
+>   adds an anti-regression test.
+> - **`go-smtp v0.20.1`** (released January 2024) — commit
+>   *"Prevent `<LF>.<CR><LF>` SMTP smuggling attacks"* by
+>   Mathias Lieber hardens the remaining `\n.\r\n` mixed-ending
+>   edge case.
+>
+> These releases therefore **already implement the substantive
+> core of Option 2** (rejecting bare-LF variants as DATA
+> terminators) without a forking cost. A Maddy operator today
+> obtains the mitigation simply by **upgrading the `go-smtp`
+> dependency** to `v0.20.1` or later (or, equivalently, by
+> running **Maddy `v0.7.1` or later**, which already depends on
+> the fixed go-smtp — see Section 8.8 and Appendix E.2). The
+> original Option 2 framing in this section is preserved as a
+> historical/theoretical sketch for readers studying commit
+> `26452dd` in isolation.
+
+**Verdict**: This is the most targeted mitigation and has since
+been adopted upstream. For commit `26452dd` itself, the mitigation
+is available by upgrading the go-smtp dependency. Maintainers of
+`emersion/go-smtp` have accepted the corresponding patches in
+`v0.20.0` and `v0.20.1`.
 
 ### 8.5 Mitigation Option 3: Strict Mode in the Stdlib dotReader
 
@@ -2712,15 +2886,46 @@ mitigations:
   initial patches, default on in later releases) and
   `smtpd_forbid_bare_newline_exclusions` for compatibility.
   Servers with the flag on reject sessions that contain any bare
-  LF in the data phase or the command phase.
+  LF in the data phase or the command phase. Tracked as
+  **CVE-2023-51764**.
 - **Sendmail**: Added `srv_features` flag `O` (reject bare LF).
-- **Exim**: Added `allow_bare_newlines` (default deny).
-- **Microsoft Exchange**: Patched via CVE-2023-21709.
+  Tracked as **CVE-2023-51765**.
+- **Exim**: Added `allow_bare_newlines` (default deny). Tracked as
+  **CVE-2023-51766**.
+- **Microsoft Exchange**: Patched via **CVE-2023-21709**.
+- **`emersion/go-smtp` (upstream library used by Maddy)**: Patched
+  in **`v0.20.0`** (27 December 2023, *"Remove DotLF to EOFState
+  case"* by Brian Mayer; *"Add SMTP smuggling test"* by Simon
+  Ser) and **`v0.20.1`** (January 2024, *"Prevent
+  `<LF>.<CR><LF>` SMTP smuggling attacks"* by Mathias Lieber).
+  These releases close the bare-LF and mixed-ending terminator
+  paths inside the same reader chain that Maddy uses.
+- **Maddy itself (downstream)**: Patched in **`v0.7.1`** via
+  PR **#661** (*"[SECURITY] go-smtp: Mitigate SMTP smuggling
+  issue"*), released after commit `26452dd`. The fix takes the
+  form of upgrading the pinned `go-smtp` dependency to a post-fix
+  version, so Maddy `v0.7.1` inherits the upstream
+  `v0.20.x`-series correction in full. The Maddy maintainer's
+  release note explicitly states: *"Until 0.7.1 maddy was a
+  'email service B'"*, using the two-server labelling from the
+  Postfix smuggling write-up at
+  `https://www.postfix.org/smtp-smuggling.html`.
 
-Maddy, at the commit under analysis (`26452dd`), has no such flag.
-Adding one would align Maddy with the rest of the MTA ecosystem and
-would take the form of Option 2 above — a go-smtp-level flag
-wired through Maddy's `maddy.conf` syntax.
+The commit under analysis (`26452dd`, 13 December 2019) therefore
+**pre-dates** all of these mitigations by approximately four
+years. At that commit, Maddy has no bare-LF rejection flag and is
+vulnerable as described in Section 4. **As of Maddy `v0.7.1` and
+later**, Maddy is aligned with the rest of the MTA ecosystem: the
+bare-LF terminator is rejected at the go-smtp layer, and Maddy
+operators obtain the mitigation automatically by running any
+release `≥ v0.7.1`.
+
+If an operator were to rebuild from commit `26452dd` specifically
+and needed to close the hole without upgrading the Maddy release,
+the minimal change is to bump the `go-smtp` module version in
+`go.mod` from `v0.12.1-0.20191206174923-1f576e0ec85c` to
+`v0.20.1` (or later). This is the form that the historical
+Option 2 in Section 8.4 takes in practice.
 
 ### 8.9 Observability Recommendations
 
@@ -2773,22 +2978,40 @@ exercise but are worth enumerating for future investigation:
 ### 8.11 Recommended Remediation Priority
 
 If this analysis were accompanied by a remediation plan (which
-per the charter it is not), the recommended priority order would
-be:
+per the charter it is not), the recommended priority order — as
+informed by the post-disclosure upstream and downstream fixes
+(Section 8.8 and Appendix E.2) — would be:
 
 1. **Immediate (days)**: Enable `io_debug` logging and deploy the
    observability recommendations (Section 8.9) to detect attacks
-   in flight.
-2. **Short-term (weeks)**: Adopt Option 2 (buffered peek in
-   `handleData`) either by forking `go-smtp` or by submitting a
-   patch upstream. Wire a `forbid_bare_newline` flag through
-   `maddy.conf`.
-3. **Medium-term (months)**: Contribute a `StrictDotReader` option
-   upstream to the Go standard library (Option 3). This benefits
-   the broader ecosystem and provides a more principled fix.
-4. **Long-term (release cadence)**: Once `StrictDotReader` is
-   available in stdlib, migrate go-smtp and therefore Maddy to use
-   it by default in new deployments.
+   in flight on any still-vulnerable pre-`v0.7.1` deployment.
+2. **Short-term (weeks)**: **Upgrade** — adopt Maddy **`v0.7.1`
+   or later** (or, equivalently, rebuild commit `26452dd`-era
+   code against `emersion/go-smtp v0.20.1` or later). This
+   applies the upstream *"Remove DotLF to EOFState case"* and
+   *"Prevent `<LF>.<CR><LF>` SMTP smuggling attacks"* fixes and
+   achieves the Option 2 mitigation **without any forking or
+   custom patch maintenance**. If for policy reasons the
+   dependency cannot be bumped, Option 2 can be applied via a
+   local vendored patch cherry-picking the go-smtp v0.20.x
+   commits.
+3. **Medium-term (months)**: Consider wiring an explicit
+   `forbid_bare_newline`-style configuration flag through
+   `maddy.conf` for operators who want a defence-in-depth toggle
+   visible in their configuration (the underlying enforcement is
+   already active after the dependency upgrade; the flag is
+   documentation rather than new mechanism).
+4. **Long-term (release cadence)**: Track any future
+   `StrictDotReader` option in the Go standard library
+   (Section 8.5), which would provide a more principled stdlib-level
+   fix. No such stdlib change has been merged as of the analysis
+   date (April 2026).
+
+> **Summary**: For anyone running Maddy today, the single most
+> important action is *"run Maddy `v0.7.1` or later"*. The
+> historical recommendation to *"fork go-smtp or submit a patch
+> upstream"* has been **superseded by upstream acceptance** of
+> those patches in December 2023 / January 2024.
 
 ### 8.12 Conclusion for Section 8
 
@@ -2805,6 +3028,17 @@ the Go standard library's `net/textproto.DotReader` (Option 3).
 
 No mitigation is applied in this analysis. The recommendations
 above are documented for maintainer consideration only.
+
+> **Fix availability note (added for readers encountering this
+> analysis post-2024)**: The Option 2 style of mitigation is
+> **already shipped** in `emersion/go-smtp v0.20.0` / `v0.20.1`
+> (December 2023 / January 2024) and inherited by **Maddy
+> `v0.7.1` and later** via PR #661. The analysis above describes
+> the state of commit `26452dd` (13 December 2019) and earlier;
+> operators of modern Maddy releases should consult Section 8.8,
+> Section 8.11, and [Appendix E.2](#e2-vulnerability-disclosures)
+> for the remediation timeline rather than implementing the
+> hypothetical patches sketched in Sections 8.3–8.7 themselves.
 
 ---
 
@@ -4358,22 +4592,88 @@ and step through each case alongside the table here.
 
 ### E.2 Vulnerability Disclosures
 
+This subsection enumerates the **SMTP smuggling** CVEs and the
+corresponding upstream / downstream fix advisories. For the
+**dependency-tree** vulnerability landscape at commit `26452dd`
+(go-sqlite3 CVE-2023-7104, miekg/dns CVE-2019-19794, stdlib
+`GO-2025-*` series, etc.), see the separate
+[Appendix E.10](#e10-dependency-vulnerability-landscape-at-commit-26452dd).
+
+#### E.2.1 SMTP smuggling CVE class (December 2023 disclosure)
+
 - **CVE-2023-51764** — "SMTP smuggling: an under-the-radar attack
-  class". Disclosed by SEC Consult Vulnerability Lab in December
-  2023. The disclosure documented that differences in DATA
-  terminator recognition between MTAs enable message injection
-  with forged envelope senders. This CVE specifically covers
-  Postfix; related CVEs (below) cover other implementations.
-- **CVE-2023-51766** — Similar class of vulnerability affecting
-  Exim.
-- **CVE-2023-21709** — Microsoft Exchange Server variant,
+  class". Disclosed by SEC Consult Vulnerability Lab (Timo
+  Longin) in **December 2023**. The disclosure documented that
+  differences in DATA terminator recognition between MTAs enable
+  message injection with forged envelope senders. This CVE
+  specifically covers **Postfix**; related CVEs (below) cover
+  other implementations.
+- **CVE-2023-51765** — Same vulnerability class affecting
+  **Sendmail**. Mitigated by the `srv_features` flag `O`
+  (reject bare LF).
+- **CVE-2023-51766** — Same vulnerability class affecting
+  **Exim**. Mitigated by `allow_bare_newlines` (default deny).
+- **CVE-2023-21709** — **Microsoft Exchange Server** variant,
   pre-dating the SEC Consult disclosure but addressing related
   bare-LF processing issues.
 
 Maddy has not (as of the commit under analysis) been assigned a
-CVE for this class of vulnerability, but the behavioural evidence
-in Section 4 of this document establishes that the same class of
-vulnerability is present.
+CVE of its own for this class of vulnerability, but the
+behavioural evidence in Section 4 of this document establishes
+that the same class of vulnerability is present at commit
+`26452dd`.
+
+#### E.2.2 Upstream fix advisory — `emersion/go-smtp`
+
+- **`go-smtp v0.20.0`** (27 December 2023). Release commits
+  relevant to SMTP smuggling:
+  - *"Remove DotLF to EOFState case"* by **Brian Mayer** —
+    closes the bare-LF (`\n.\n`) terminator path in the
+    dotReader wrapper used by `handleData`.
+  - *"Add SMTP smuggling test"* by **Simon Ser** — adds the
+    regression test that locks in the fix.
+- **`go-smtp v0.20.1`** (January 2024). Release commit
+  relevant to SMTP smuggling:
+  - *"Prevent `<LF>.<CR><LF>` SMTP smuggling attacks"* by
+    **Mathias Lieber** — closes the mixed-ending `\n.\r\n`
+    edge case left open after `v0.20.0`.
+- **Net effect**: after upgrading to `v0.20.1` or later, the
+  go-smtp server stops accepting any of the non-canonical
+  terminator variants (`\n.\n`, `\r\n.\n`, `\n.\r\n`) that
+  Section 1 of this document documents as accepted in the
+  pinned `v0.12.1-0.20191206174923-1f576e0ec85c` revision.
+  Canonical `\r\n.\r\n` continues to work per RFC 5321.
+- **No CVE number is currently assigned to `emersion/go-smtp`**
+  for this fix; the advisory is the release note and commit log
+  of `v0.20.0` / `v0.20.1`.
+
+#### E.2.3 Downstream fix advisory — Maddy
+
+- **Maddy `v0.7.1`** — Release note: *"[SECURITY] go-smtp:
+  Mitigate SMTP smuggling issue (#661)"*. The fix is the
+  dependency bump to a post-`v0.20.x` `go-smtp`. Maintainer's
+  release-note commentary (from the Maddy release page):
+  *"Until 0.7.1 maddy was a 'email service B'"*, invoking the
+  two-server nomenclature from the Postfix smuggling write-up
+  at `https://www.postfix.org/smtp-smuggling.html`.
+- **No CVE number is currently assigned to `foxcpp/maddy`** for
+  this fix; the advisory is PR **#661** and the `v0.7.1` release
+  note.
+- **Affected versions**: Maddy releases that pin a pre-`v0.20.0`
+  `go-smtp`. This includes commit `26452dd` and every tagged
+  Maddy release up to and including `v0.7.0`.
+- **Fixed versions**: Maddy `v0.7.1` and later.
+
+#### E.2.4 Related ecosystem mitigations (see Section 8.8)
+
+- **Postfix**: `smtpd_forbid_bare_newline` and
+  `smtpd_forbid_bare_newline_exclusions` configuration knobs.
+- **Exim**: `allow_bare_newlines` (default deny).
+- **Sendmail**: `srv_features` flag `O` (reject bare LF).
+- **Microsoft Exchange**: CVE-2023-21709 patch.
+
+All of these land the same substantive mitigation (reject bare-LF
+terminators) with platform-specific configuration ergonomics.
 
 ### E.3 Source Code References
 
@@ -4591,7 +4891,231 @@ from Go's lenient `net/textproto.dotReader`, a DATA-terminator
 recognition policy that accepts bare-LF variants in addition to the
 canonical `\r\n.\r\n`, making it vulnerable to the SMTP smuggling
 attack class (CVE-2023-51764 and siblings), with no effective
-mitigation available via a naïve strict front-proxy.**
+mitigation available via a naïve strict front-proxy** *(at commit
+`26452dd`; see the [Remediation Status](#remediation-status-upstream-and-downstream-fixes)
+section for the post-commit fix history)*.
+
+### E.10 Dependency Vulnerability Landscape at Commit `26452dd`
+
+The primary analytical focus of this document is the SMTP-DATA
+boundary decision and its SMTP-smuggling implication. That focus
+is **necessarily narrow**: the vulnerability landscape of the
+full dependency tree pinned by `go.mod` at commit `26452dd` is
+substantially larger. This appendix records the broader landscape
+so that security reviewers have a single reference point for the
+concurrent dependency CVEs that affect this specific commit,
+independent of the SMTP smuggling analysis.
+
+The findings below were gathered by running
+`govulncheck ./...` against the repository at commit `26452dd`
+using Go `1.22.2` and the pinned module versions from `go.mod`
+(complemented by manual lookup for C-library vulnerabilities that
+`govulncheck`'s Go-only call-graph analysis cannot detect).
+
+> **Out-of-scope caveat**: None of the CVEs in this appendix is a
+> DATA-boundary vulnerability. They are documented solely to give
+> the reader a complete security posture for commit `26452dd`.
+> Remediation of these dependency CVEs requires independent
+> dependency upgrades (which, per the analysis charter, this
+> document does not apply).
+
+#### E.10.1 Database driver — `github.com/mattn/go-sqlite3`
+
+- **Pinned version**: `v1.11.0` (July 2019).
+- **CVE-2023-7104**: Heap-based buffer overflow in the bundled
+  C SQLite library (specifically in `sessionReadRecord`).
+- **Affected component**: The bundled SQLite C source
+  (`sqlite3-binding.c`) embedded in the `go-sqlite3` module. The
+  vulnerability lives in the C library, not in the Go binding
+  code.
+- **Fixed in**: `go-sqlite3 v1.14.18`.
+- **govulncheck detection**: *Not detected*. `govulncheck` walks
+  the Go call graph only; CVE-2023-7104 is a vulnerability in C
+  code compiled into the module via CGO, so it is outside the
+  tool's analysis scope. Detection requires a separate SBOM /
+  C-library-version audit.
+- **Exposure in Maddy**: `go-sqlite3` is the default storage
+  driver (`imapsql`, queue, `sqlite` modules). Direct reachability
+  of the vulnerable `sessionReadRecord` path depends on whether
+  the operator enables SQLite session extensions.
+- **Related older CVEs pre-dating the pinned version**:
+  **CVE-2022-35737** (SQLite excessive-memory vulnerability prior
+  to SQLite 3.39.2). Remediated in the same `v1.14.18` upgrade.
+
+#### E.10.2 DNS library — `github.com/miekg/dns`
+
+- **Pinned version**: `v1.1.22` (October 2019).
+- **Advisory ID**: `GO-2020-0008` (Go vulnerability database).
+- **CVE**: **CVE-2019-19794** — Insecure generation of random
+  numbers in DNS transaction IDs, which reduces cache-poisoning
+  resistance.
+- **Affected component**:
+  `github.com/miekg/dns/msg.go` — the random-number generator
+  used for DNS message IDs.
+- **Fixed in**: `v1.1.25-0.20191211073109-8ebf2e419df7` (the
+  pseudo-version that immediately post-dates the pinned release).
+- **govulncheck detection**: **Detected and reported as actively
+  called** — the vulnerable code path is reachable from Maddy's
+  DNS-resolution code used in `internal/target/remote/`.
+- **Exposure in Maddy**: Any outbound SMTP path performing MX
+  lookups (i.e., every outbound relay deployment) reaches the
+  vulnerable code.
+
+#### E.10.3 Message parsing library — `github.com/emersion/go-message`
+
+- **Pinned version**: `v0.10.9-0.20191116124005-65fd0119e899`.
+- **Known issue**: **`emersion/go-message` issue #95** — OOM
+  crash when parsing messages with certain character sets, which
+  traces to a downstream bug in `golang.org/x/text`'s charset
+  conversion path.
+- **Formal CVE**: Not assigned. The upstream tracker issue is
+  the only public reference.
+- **Fixed in**: Later `go-message` releases that vendored a
+  newer `golang.org/x/text`; concretely, any `go-message` release
+  depending on `golang.org/x/text v0.3.3` or later.
+- **govulncheck detection**: *Not directly detected* as a
+  `go-message` vulnerability, but `GO-2020-0015`
+  (`x/text` infinite-loop issue) **is** detected and is the
+  root cause behind issue #95.
+- **Exposure in Maddy**:
+  `internal/endpoint/smtp/smtp.go` calls `textproto.ReadHeader`
+  and hands message bytes to `go-message` code paths used by
+  checks/modifiers/targets; any attacker-controllable charset
+  parameter can in principle reach the issue-#95 code path.
+
+#### E.10.4 Text processing — `golang.org/x/text`
+
+- **Pinned version**: `v0.3.2`.
+- **`GO-2021-0113` / CVE-2021-38561**: Out-of-bounds read in
+  `golang.org/x/text/language`. Fixed in `v0.3.7`.
+- **`GO-2020-0015` / CVE-2020-14040**: Infinite loop when
+  decoding some inputs in `golang.org/x/text/encoding`. Fixed
+  in `v0.3.3`. This is the root-cause trigger of
+  `go-message` issue #95.
+- **`GO-2022-1059` / CVE-2022-32149**: (imported-but-uncalled by
+  the commit's code under analysis) — denial of service in
+  `golang.org/x/text/language`. Fixed in `v0.3.8`.
+- **govulncheck detection**: All three are reported; the first
+  two are flagged as **actively called**, the third as
+  imported-but-uncalled.
+- **Exposure in Maddy**: Reached via `go-message` charset
+  handling and via DNS name processing in some code paths.
+
+#### E.10.5 Networking — `golang.org/x/net`
+
+- **Pinned version**: `v0.0.0-20191126235420-ef20fe5d7933`.
+- **`GO-2025-3503`**: HTTP proxy bypass using IPv6 zone IDs in
+  both `golang.org/x/net` and the stdlib `net/http`. Fixed in
+  `golang.org/x/net v0.36.0` (and stdlib `go1.23.7`).
+- **`GO-2024-3333` / CVE-2024-45338**: Non-linear parsing of
+  case-insensitive content in `golang.org/x/net/html`. Fixed in
+  `v0.33.0`. Imported-but-uncalled at this commit.
+- **Other historical advisories**: `GO-2023-2102`, `GO-2023-1988`,
+  `GO-2023-1571`, `GO-2022-1144`, `GO-2022-0288`, `GO-2022-0236`,
+  `GO-2021-0238` — all imported-but-uncalled at this commit; see
+  the Go vulnerability database for details.
+- **Exposure in Maddy**: The `x/net` HTTP/2 and IDNA
+  subpackages are vendored but not on Maddy's hot path; the
+  proxy-bypass CVE is only reachable in deployments that use
+  `net/http`'s proxy support.
+
+#### E.10.6 Cryptography — `golang.org/x/crypto`
+
+- **Pinned version**: `v0.0.0-20191108234033-bd318be0434a`.
+- **All issues imported-but-uncalled** at commit `26452dd`; the
+  vulnerable packages (`x/crypto/ssh`, `x/crypto/ssh/agent`) are
+  not used in Maddy's SMTP hot path.
+- **Notable advisories detected in the dependency but uncalled**:
+  `GO-2025-4135`, `GO-2025-4134` (unbounded memory consumption
+  in `ssh`, fixed in `v0.45.0`), `GO-2025-4116`, `GO-2025-3487`,
+  `GO-2024-3321`, `GO-2023-2402` (SSH prefix truncation, fixed
+  in `v0.17.0`), and others listed in the full govulncheck
+  output.
+- **Exposure in Maddy**: None directly via Maddy's Go code; a
+  concern only for deployments that bundle `x/crypto` via other
+  tooling.
+
+#### E.10.7 System calls — `golang.org/x/sys`
+
+- **Pinned version**: `v0.0.0-20191105231009-c1f44814a5cd`.
+- **`GO-2022-0493`**: (imported-but-uncalled) — affected `setuid`
+  semantics. Fixed in `v0.0.0-20220412211240-33da011f77ad`.
+- **Exposure in Maddy**: None on the hot path; `x/sys` is used
+  for a small number of syscall wrappers in platform-specific
+  code that is not reached by normal SMTP ingress.
+
+#### E.10.8 Go standard library (toolchain `go1.22.2`)
+
+`govulncheck` detects **31 stdlib advisories** that are actively
+called from the repository at this commit. The complete list is
+too long to enumerate entry-by-entry; the most relevant items
+for a security reviewer are:
+
+- **`GO-2025-4015`** — Excessive CPU consumption in
+  `net/textproto.Reader.ReadResponse`. *Notable because it
+  affects the same `net/textproto` package whose `dotReader` is
+  the SMTP-smuggling substrate analysed in the body of this
+  document.* It is a DoS on the **response-reading** path, not
+  the DATA-reading path; therefore it is **orthogonal to the
+  DATA-boundary vulnerability** but reinforces that
+  `net/textproto` has a surface area worth scrutinising. Fixed in
+  `go1.24.8`.
+- **`GO-2025-3563`** — HTTP request smuggling via acceptance of
+  invalid chunked data in `net/http`. *Notable for conceptual
+  parallelism to SMTP smuggling: both are "protocol-layer"
+  smuggling attacks enabled by lenient parsing, though in
+  different protocols.* Fixed in `go1.23.8`.
+- **`GO-2024-2963`** — Denial of service due to improper
+  `100-continue` handling in `net/http`. Fixed in `go1.22.5`.
+- **`GO-2024-2824`** — Malformed DNS message can cause infinite
+  loop in `net`. Fixed in `go1.22.3`.
+- **`GO-2026-4870`** — Unauthenticated TLS 1.3 `KeyUpdate`
+  record DoS in `crypto/tls`. Fixed in `go1.25.9`.
+- **`GO-2026-4341`** — Memory exhaustion in query parameter
+  parsing in `net/url`. Fixed in `go1.24.12`.
+- **`GO-2026-4601`** — Incorrect parsing of IPv6 host literals
+  in `net/url`. Fixed in `go1.25.8`.
+- **`GO-2025-3503`** (shared with `x/net`) — HTTP proxy bypass
+  using IPv6 zone IDs. Fixed in `go1.23.7`.
+- *(Full list: 31 actively-called stdlib advisories are
+  reported by `govulncheck` for `go1.22.2` at this commit. See
+  [`Go vulnerability database`](https://pkg.go.dev/vuln/) for
+  any entry by ID.)*
+
+**Exposure in Maddy**: Maddy does not pin its own Go toolchain;
+the CVE set an operator is exposed to depends on which Go version
+they build with. Building with a current Go release (`go1.24.12`
+or later at the time of writing) resolves most of the stdlib
+advisories above.
+
+#### E.10.9 Summary of dependency CVE posture at `26452dd`
+
+| Severity band | Dependency CVEs at this commit |
+| --- | --- |
+| HIGH | `go-sqlite3 v1.11.0` → CVE-2023-7104 heap overflow (fix: `v1.14.18`). Not detected by govulncheck; requires C-side audit. |
+| MEDIUM | `miekg/dns v1.1.22` → CVE-2019-19794 / GO-2020-0008 (fix: `v1.1.25`). Actively called. |
+| MEDIUM | `golang.org/x/text v0.3.2` → GO-2021-0113 OOB read + GO-2020-0015 infinite loop (fix: `v0.3.7` / `v0.3.3`). Actively called; root cause of `go-message` issue #95. |
+| MEDIUM | `go-message v0.10.9-pre` → issue #95 OOM via `x/text` charset parsing. No CVE; tracks the x/text fix. |
+| MEDIUM | Go stdlib `1.22.2` → 31 actively-called advisories including GO-2025-4015 (net/textproto DoS), GO-2025-3563 (HTTP smuggling), GO-2024-2963, GO-2024-2824. Resolve by upgrading the Go toolchain. |
+| LOW | `golang.org/x/net`, `x/crypto`, `x/sys` → miscellaneous advisories, mostly imported-but-uncalled at this commit. |
+
+This posture is **independent of** the SMTP smuggling
+vulnerability described in the body of this document. Remediating
+either axis (DATA smuggling or dependency CVEs) does not
+automatically remediate the other. A comprehensive security
+upgrade from commit `26452dd` should therefore include both:
+
+1. Upgrading `emersion/go-smtp` to `v0.20.1` or later (closes
+   the SMTP smuggling class — see
+   [Remediation Status](#remediation-status-upstream-and-downstream-fixes)).
+2. Upgrading `go-sqlite3`, `miekg/dns`, `golang.org/x/text`,
+   `go-message`, and the Go toolchain itself (closes the
+   dependency CVE class enumerated above).
+
+The cleanest way to achieve both in a single step is to upgrade
+the entire Maddy deployment to **`v0.7.1` or later** and rebuild
+with a current Go toolchain; this refreshes all of the module
+pins and the stdlib in one motion.
 
 ---
 
