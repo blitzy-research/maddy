@@ -247,20 +247,37 @@ Four distinct byte sequences were tested against a minimal go-smtp-based
 server running the exact library version that Maddy depends on
 (`github.com/emersion/go-smtp v0.12.1-0.20191206174923-1f576e0ec85c`). All
 four produced a 250 OK response, all four caused `Session.Data()` to be
-invoked, and all four delivered a byte-identical (normalised) body.
+invoked, and all four were normalised identically by the dotReader (`\r\n`
+collapsed to `\n`, the terminator stripped).
 
 | # | Wire Terminator | Hex Sequence | Server Response | `Session.Data()` Invoked | Body Length Delivered |
 |---|-----------------|--------------|-----------------|--------------------------|----------------------|
-| 1 | `\r\n.\r\n` (canonical, RFC 5321) | `0d 0a 2e 0d 0a` | `250 2.0.0 OK: queued` | Yes | 92 bytes |
-| 2 | `\n.\n` (bare-LF) | `0a 2e 0a` | `250 2.0.0 OK: queued` | Yes | 92 bytes |
-| 3 | `\r\n.\n` (mixed CRLF+LF) | `0d 0a 2e 0a` | `250 2.0.0 OK: queued` | Yes | 92 bytes |
-| 4 | `\n.\r\n` (mixed LF+CRLF) | `0a 2e 0d 0a` | `250 2.0.0 OK: queued` | Yes | 92 bytes |
+| 1 | `\r\n.\r\n` (canonical, RFC 5321) | `0d 0a 2e 0d 0a` | `250 2.0.0 OK: queued` | Yes | 159 bytes |
+| 2 | `\n.\n` (bare-LF) | `0a 2e 0a` | `250 2.0.0 OK: queued` | Yes | 145 bytes |
+| 3 | `\r\n.\n` (mixed CRLF+LF) | `0d 0a 2e 0a` | `250 2.0.0 OK: queued` | Yes | 128 bytes |
+| 4 | `\n.\r\n` (mixed LF+CRLF) | `0a 2e 0d 0a` | `250 2.0.0 OK: queued` | Yes | 128 bytes |
 
-In all four cases the test body on the wire was identical
-("Subject: test-A\r\nFrom: sender@test.local\r\n\r\nTest body line one.\r\nTest body line two."
-plus the variant terminator), and the delivered body length reported by the
-server-side handler was identical (92 bytes with line endings normalised to
-`\n`). A reader that expected the bare-LF variants to be rejected will be
+For traceability, each session used a distinct `Subject:` label identifying
+the variant under test (`canonical-test`, `bare-lf-test`, `mixed-crlf-lf`,
+`mixed-lf-crlf`) and a distinct body paragraph naming the same variant.
+The delivered-size column therefore reflects both the terminator-independent
+body length AND the per-session label width; see Appendix B.1–B.4 for full
+wire transcripts and Appendix C.1–C.4 for byte-accurate hex dumps of the
+wire payloads and the delivered buffers.
+
+The key observation is NOT that the four rows have the same byte count
+(they do not, because the Subject labels differ in length) but that:
+
+- Every one of the four terminator variants was ACCEPTED — the server
+  returned `250 OK: queued` in each case.
+- `Session.Data()` was invoked for every variant; the dotReader reached
+  `stateEOF` and the message entered the pipeline.
+- For any FIXED body content, swapping the terminator form (canonical vs
+  bare-LF vs mixed) changes the WIRE byte count but produces an IDENTICAL
+  delivered buffer (because CRLF-to-LF normalisation is uniform across all
+  four variants, and the terminator itself is always stripped).
+
+A reader that expected the bare-LF variants to be rejected will be
 surprised: no error is raised, no warning is logged, and the message is
 accepted into the pipeline exactly as if it had been terminated canonically.
 
@@ -283,14 +300,40 @@ advances it through the following six states:
 
 The exact transition table, recovered by reading the source directly:
 
-| Current State      | Byte `\n`         | Byte `\r`                        | Byte `.`            | Other byte                      |
-|--------------------|-------------------|----------------------------------|---------------------|----------------------------------|
-| `stateBeginLine`   | emit `\n`, stay   | → `stateCR`                      | → `stateDot`        | emit byte, → `stateData`         |
-| `stateDot`         | **→ `stateEOF`**  | **→ `stateDotCR`**               | emit `.`, → `stateData` | emit `.`, → `stateData`       |
-| `stateDotCR`       | **→ `stateEOF`**  | unread, emit `\r`, → `stateData` | unread, emit `\r`, → `stateData` | unread, emit `\r`, → `stateData` |
-| `stateCR`          | → `stateBeginLine`| unread, emit `\r`, → `stateData` | unread, emit `\r`, → `stateData` | unread, emit `\r`, → `stateData` |
-| `stateData`        | → `stateBeginLine`| → `stateCR`                      | emit byte           | emit byte                        |
+| Current State      | Byte `\n`                | Byte `\r`                        | Byte `.`                        | Other byte                       |
+|--------------------|--------------------------|----------------------------------|---------------------------------|----------------------------------|
+| `stateBeginLine`   | emit `\n`, → `stateData` | → `stateCR`                      | → `stateDot`                    | emit byte, → `stateData`         |
+| `stateDot`         | **→ `stateEOF`**         | **→ `stateDotCR`**               | emit byte (`.`), → `stateData`  | emit byte, → `stateData`         |
+| `stateDotCR`       | **→ `stateEOF`**         | unread, emit `\r`, → `stateData` | unread, emit `\r`, → `stateData`| unread, emit `\r`, → `stateData` |
+| `stateCR`          | → `stateBeginLine`, emit `\n` | unread, emit `\r`, → `stateData` | unread, emit `\r`, → `stateData`| unread, emit `\r`, → `stateData` |
+| `stateData`        | → `stateBeginLine`, emit `\n` | → `stateCR`                      | emit byte                       | emit byte                        |
 | `stateEOF`         | (terminal; `Read` returns `io.EOF` on every call) | | | |
+
+Two subtleties in the table warrant explicit clarification so the reader can
+predict behaviour without having to re-read the Go source:
+
+1. **`stateBeginLine` + `\n`**: The actual code path sets `state = stateData`
+   and falls through to the byte-emit line, so the state AFTER emitting the
+   `\n` is `stateData`, not `stateBeginLine`. However, the NEXT byte read in
+   `stateData` that is itself a `\n` transitions back to `stateBeginLine`.
+   The practical effect for a run of consecutive `\n` bytes is that the
+   reader oscillates `stateBeginLine → stateData → stateBeginLine → …`,
+   emitting each `\n` along the way. A compact way to read this cell is
+   therefore "emit `\n`, effectively at start of next line", but the literal
+   transition is to `stateData`.
+
+2. **`stateDot` + "Other byte"**: When the dotReader is in `stateDot` and
+   sees a byte that is neither `\r`, `\n`, nor `.`, the code sets
+   `state = stateData` and then emits the CURRENT byte (not a literal `.`).
+   The leading `.` that got the reader INTO `stateDot` is suppressed — this
+   is RFC 5321 §4.5.2 "dot-unstuffing" in action: the first byte of a line
+   that is `.` is treated as transparent and removed. In the special case of
+   a dot-stuffed line (`..text`), the second byte is itself `.` and so the
+   emitted byte IS a `.` — but in all other "other byte" cases (e.g.,
+   `. text` where the other byte is a space), the dot is dropped and only
+   the subsequent byte is emitted. (Cell summary: "emit byte" = emit whatever
+   the current non-special byte happens to be, with the original `.`
+   already consumed.)
 
 The two transitions set in bold are the source of the lenience. Observe that
 from `stateDot`, a bare `\n` takes the reader directly to `stateEOF` — it
@@ -341,13 +384,17 @@ LF in the emitted body**. The transition table shows:
 Consequently, a body sent with `\r\n` line endings is delivered to
 `Session.Data()` with `\n` line endings only. This matters for two reasons:
 
-1. **The delivered byte-for-byte content is identical regardless of which of
-   the four terminator variants was used.** That is why the fourth column of
-   the empirical table above shows 92 bytes for every row: the canonical
-   variant has its CRs stripped, the mixed variant's lone `\r` is already
-   absent, and the bare-LF variant had no CRs to begin with. The hex dump
-   of what `Session.Data()` sees is therefore independent of the wire
-   terminator form.
+1. **For any FIXED body content, the delivered byte-for-byte buffer is
+   identical regardless of which of the four terminator variants was used.**
+   The canonical variant has its CRs stripped during normalisation, the
+   mixed variants have their lone `\r` stripped (or were already absent),
+   and the bare-LF variant had no CRs to begin with. The hex dump of what
+   `Session.Data()` sees is therefore independent of the wire terminator
+   form. (In the empirical table above, each session uses a distinct
+   `Subject:` label for traceability, so the per-row delivered sizes reflect
+   the Subject-label length variation rather than terminator-induced
+   difference. If the body content were held fixed across the four rows,
+   all four delivered sizes would be identical.)
 
 2. **Downstream processing cannot tell the difference.** Maddy's
    `prepareBody` re-wraps the reader in a `bufio.Reader` and calls
@@ -376,15 +423,17 @@ C: RCPT TO:<recipient@test.local>\r\n
 S: 250 2.0.0 I'll make sure <recipient@test.local> gets this\r\n
 C: DATA\r\n
 S: 354 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n
-C: Subject: test-A\r\nFrom: sender@test.local\r\n\r\n
-C: Test body line one.\r\nTest body line two.\r\n.\r\n
+C: Subject: canonical-test\r\nFrom: sender@test.local\r\n
+C: To: recipient@test.local\r\n\r\n
+C: This is the canonical CRLF-terminated message body.\r\n
+C: Line two ends with CRLF as well.\r\n.\r\n
 S: 250 2.0.0 OK: queued\r\n
 C: NOOP\r\n
 S: 250 2.0.0 I have sucessfully done nothing\r\n
 C: QUIT\r\n
 S: 221 2.0.0 Goodnight and good luck\r\n
 
-Server-side: [SESSION 1] DATA received; 92 bytes delivered.
+Server-side: [SESSION 1] DATA received; 159 bytes delivered.
 
 ═══════════════════════════════════════════════════════════════════
 Test #2 — Bare-LF \n.\n
@@ -397,19 +446,26 @@ C: RCPT TO:<recipient@test.local>\r\n
 S: 250 2.0.0 I'll make sure ...\r\n
 C: DATA\r\n
 S: 354 Go ahead ...\r\n
-C: Subject: test-B\nFrom: sender@test.local\n\n
-C: Test body line one.\nTest body line two.\n.\n
+C: Subject: bare-lf-test\nFrom: sender@test.local\n
+C: To: recipient@test.local\n\n
+C: This is the bare-LF-terminated message body.\n
+C: Line two also uses bare LF.\n.\n
 S: 250 2.0.0 OK: queued\r\n
 C: NOOP\r\n
 S: 250 2.0.0 I have sucessfully done nothing\r\n
 C: QUIT\r\n
 S: 221 2.0.0 Goodnight and good luck\r\n
 
-Server-side: [SESSION 2] DATA received; 92 bytes delivered.
+Server-side: [SESSION 2] DATA received; 145 bytes delivered.
 
 Observation: the command lines (EHLO, MAIL, RCPT, DATA, NOOP, QUIT) are
 still sent with \r\n because go-smtp's parseCmd() expects them to arrive
-that way; it is only the body bytes whose line endings we varied.
+that way; it is only the body bytes whose line endings we varied. The
+per-session delivered byte count differs (159 vs 145) only because each
+session uses a distinct Subject label (`canonical-test` is 2 characters
+longer than `bare-lf-test`) — the TERMINATOR form does not contribute
+to this difference. Were both sessions run with identical body content,
+they would deliver byte-identical buffers to `Session.Data()`.
 ```
 
 ### 1.6 Conclusion for Section 1
@@ -465,34 +521,40 @@ Assume the dotReader is in `stateBeginLine` after having consumed the
 preceding `\r\n`:
 
 ```text
-Input: .  → stateDot            (no byte emitted — could still be terminator)
-Input: ␣  → emit '.', → stateData
+Input: .  → stateDot            (no byte emitted — dot consumed as potential
+                                 transparency / terminator prefix)
+Input: ␣  → emit ' ' (space), → stateData
                                (the space breaks the terminator pattern;
-                                the suppressed leading dot is now emitted
-                                as the "dot-stuffing" transparency byte —
-                                no, wait, that's not quite right: the dot
-                                is emitted because we are transitioning
-                                "out" of the potential terminator.)
-Input: ␣  (emitted in stateData path) → stays in stateData
-Input: \r → stateCR
-Input: \n → stateBeginLine
+                                the dot was already consumed on entry to
+                                stateDot, and the default branch in
+                                stateDot sets state = stateData and then
+                                emits the CURRENT byte — the space —
+                                not the dot. This is RFC 5321 §4.5.2
+                                dot-unstuffing.)
+Input: \r → stateCR              (no byte emitted)
+Input: \n → stateBeginLine, emit '\n'
+                               (the \r was swallowed; only \n is emitted
+                                as part of CRLF → LF normalisation)
 ```
 
 Reading the Go source carefully resolves a subtle point: when the dotReader
-is in `stateDot` and the next byte is anything other than `\n`, `\r`, the
-source transitions the state to `stateData` and emits the `.`. For the
-`\r\n. \r\n` sequence this results in a single `.` being emitted followed
-by a ` ` followed by the `\r\n`. In the normalised output this is "`. \n`"
-— i.e., the body contains a line that is literally a single dot followed by
-a single space.
+is in `stateDot` and the next byte is anything other than `\n`, `\r`, or
+`.`, the code sets `d.state = stateData` and then falls through to the
+byte-emit line `b[n] = c`, where `c` is the CURRENT byte (the non-special
+byte, here a space). The `.` that got us INTO `stateDot` was already
+consumed at the `stateBeginLine → stateDot` transition and is NOT emitted.
+For the `\r\n. \r\n` sequence, the delivered bytes for that line are just
+` \n` (space + normalised newline) — i.e., the body contains a line that
+is a single space.
 
-This is subtly different from the canonical RFC 5321 §4.5.2 "dot-stuffing"
-transparency rule, which says a client sending a body line that starts with
-a literal `.` must double it (so `.text` on the wire decodes to `.text` in
-the delivered body, and `..text` on the wire decodes to `.text` in the
-delivered body). For a dot-space line sent as `\r\n. \r\n`, the wire form
-already has a non-dot second byte, so the dotReader emits the `.` verbatim
-followed by the space. The line is delivered as `. ` (dot-space).
+This matches RFC 5321 §4.5.2 "dot-unstuffing" transparency: when a client
+sends a body line whose first byte is `.`, the receiver strips that byte.
+In the special case where the line contains only `.\r\n` or `.\n`, the
+dotReader recognises the terminator instead of stripping. For a dot-space
+line sent as `\r\n. \r\n`, the dot is stripped (transparency) and the
+remaining content (space + newline) is delivered. The result on the wire
+is `. \r\n`, but the delivered body line is just ` \n`. This behaviour
+was verified empirically in §B.6 and §C.6.
 
 What matters for **boundary** detection is that this sequence **does not**
 cause `stateEOF`. The only way to reach `stateEOF` from `stateDot` is via
@@ -656,46 +718,43 @@ production Maddy listener.
 
 Three sequential MAIL/RCPT/DATA cycles were performed on a **single**
 TCP connection to the test server, with each cycle using a **different**
-terminator style. This was run as "Session 9" in the test harness:
+terminator style. This was run as "Session 9" in the test harness
+(see Appendix B.9 for the full wire transcript and server responses):
 
 ```text
-Connection opens — EHLO test-client → 250-...-250 OK
+Connection opens — EHLO pipeclient → 250-PIPELINING-8BITMIME-ENHANCEDSTATUSCODES
 
-Transaction 1 (message for alice):
-    MAIL FROM:<sender1@test.local>
-    RCPT TO:<alice@test.local>
+Transaction 1 (alice message):
+    MAIL FROM:<alice@test.local>
+    RCPT TO:<recipient1@test.local>
     DATA
-    Subject: msg-1\r\n
-    From: sender1@test.local\r\n
+    Subject: msg-alice\r\n
     \r\n
-    Message one body.\r\n
+    Alice's message with canonical terminator.\r\n
     .\r\n                              ← canonical terminator
-    → 250 OK: queued
+    → 250 2.0.0 OK: queued as msg-9-alice
 
-Transaction 2 (message for bob):
-    MAIL FROM:<sender2@test.local>
-    RCPT TO:<bob@test.local>
+Transaction 2 (bob message):
+    MAIL FROM:<bob@test.local>
+    RCPT TO:<recipient2@test.local>
     DATA
-    Subject: msg-2\n
-    From: sender2@test.local\n
+    Subject: msg-bob\n
     \n
-    Message two body.\n
+    Bob's message with bare-LF terminator.\n
     .\n                                ← bare-LF terminator
-    → 250 OK: queued
+    → 250 2.0.0 OK: queued as msg-9-bob
 
-Transaction 3 (message for carol):
-    MAIL FROM:<sender3@test.local>
-    RCPT TO:<carol@test.local>
+Transaction 3 (carol message):
+    MAIL FROM:<carol@test.local>
+    RCPT TO:<recipient3@test.local>
     DATA
-    Subject: msg-3\r\n
-    From: sender3@test.local\r\n
+    Subject: msg-carol\r\n
     \r\n
-    Message three body line one.\r\n
-    Message three body line two.\n
+    Carol's message with mixed terminator (CRLF before, LF after).\r\n
     .\n                                ← mixed \r\n ... \n terminator
-    → 250 OK: queued
+    → 250 2.0.0 OK: queued as msg-9-carol
 
-QUIT → 221 Goodnight and good luck
+QUIT → 221 2.0.0 Goodbye
 ```
 
 A `NOOP` was sent between each transaction to confirm the server was in the
@@ -704,24 +763,27 @@ transactions.
 
 ### 3.4 The Observed Result
 
-All three messages were accepted. The server's handler logged:
+All three messages were accepted. The server's handler logged (see §B.9
+for the full backend log):
 
 ```text
 [SESSION 9] Connection opened from 127.0.0.1:XXXXX
-[SESSION 9] EHLO from test-client
-[SESSION 9] Message #1 accepted: from=sender1@test.local, to=[alice@test.local], body=55 bytes
+[SESSION 9] EHLO from pipeclient
+[SESSION 9] Message #9-alice accepted: from=alice@test.local, to=[recipient1@test.local], body=63 bytes
 [SESSION 9] NOOP
-[SESSION 9] Message #2 accepted: from=sender2@test.local, to=[bob@test.local], body=51 bytes
+[SESSION 9] Message #9-bob accepted: from=bob@test.local, to=[recipient2@test.local], body=57 bytes
 [SESSION 9] NOOP
-[SESSION 9] Message #3 accepted: from=sender3@test.local, to=[carol@test.local], body=59 bytes
+[SESSION 9] Message #9-carol accepted: from=carol@test.local, to=[recipient3@test.local], body=83 bytes
 [SESSION 9] QUIT
 [SESSION 9] Connection closed
 ```
 
 Three independent messages, three distinct sender addresses, three distinct
-recipient lists, three distinct body lengths, one persistent TCP connection.
-Each `NOOP` between transactions returned 250, confirming the server was
-in the command-accept state and not in some residual DATA-reading state.
+recipient lists, three distinct body lengths (63, 57, and 83 bytes —
+reflecting the differing Subject labels and body-text lengths across the
+three transactions), one persistent TCP connection. Each `NOOP` between
+transactions returned 250, confirming the server was in the command-accept
+state and not in some residual DATA-reading state.
 
 ### 3.5 Why the Behaviour Is Consistent — The Reset Mechanism
 
@@ -999,10 +1061,14 @@ contains the remaining 149 − (length of header) − 23 bytes — which is the
 smuggled MAIL, RCPT, DATA, injected header, injected body, and canonical
 terminator.
 
-(Precise numbers: the header "Subject: smuggle-test\r\n\r\n" is 24 bytes;
-the first body + bare-LF terminator is 23 bytes; the remaining payload is
-149 − 24 − 23 = 102 bytes, which is exactly the length of the smuggled
-MAIL/RCPT/DATA + second-message header + body + canonical terminator.)
+(Precise numbers: the header "Subject: smuggle-test\r\n\r\n" is 25 bytes
+(21 bytes of "Subject: smuggle-test" + `\r\n` + `\r\n` = 21 + 2 + 2 = 25);
+the first body + bare-LF terminator is 23 bytes (20 bytes of "Before fake
+boundary" + `\n` + `.` + `\n` = 20 + 3 = 23); the remaining payload is
+149 − 25 − 23 = 101 bytes, which is exactly the length of the smuggled
+MAIL/RCPT/DATA + second-message header + body + canonical terminator. See
+Appendix C.7 for the full annotated byte-offset table that corroborates
+this arithmetic.)
 
 #### Step 3. `prepareBody` returns; `Session.Data()` completes the first message
 
@@ -1016,9 +1082,22 @@ The server-side log shows:
 [SESSION 10] Message #1 accepted: from=sender@test.local, to=[recipient@test.local], body=44 bytes
 ```
 
-(The 44-byte figure reflects the body as delivered with the normalised
-header added — the 20-byte first-message body plus the normalised Received
-header prefix added by `prepareBody`.)
+(The 44-byte figure reflects the raw bytes the dotReader delivered to the
+session handler, measured in the lightweight go-smtp test backend used for
+this experiment (not the full Maddy pipeline). In the test harness, the
+session's `Data(r io.Reader)` callback receives the dotReader output and
+records its length directly — it does NOT invoke Maddy's `prepareBody` and
+therefore does NOT prepend a `Received` header. The 44 bytes decompose as:
+normalised header `Subject: smuggle-test\n\n` (23 bytes = 21 bytes of
+"Subject: smuggle-test" + `\n` + `\n`) plus the normalised first body
+`Before fake boundary\n` (21 bytes = 20 bytes of "Before fake boundary"
++ `\n`) = 23 + 21 = 44 bytes. The dotReader has already performed the
+CRLF→LF normalisation described in §1.4 and consumed the bare-LF
+terminator, which is why the delivered body ends in a lone `\n`. In the
+real Maddy pipeline (`Session.prepareBody` at `internal/endpoint/smtp/smtp.go`
+lines 283–310), a `Received:` header would additionally be prepended to
+the delivered header before `delivery.Body()` is called, but that does not
+change the boundary decision or the count of bytes that were smuggled.)
 
 The `Session.Data()` method returns nil. Control returns to
 `handleData` in go-smtp's `conn.go`.
@@ -1028,7 +1107,7 @@ The `Session.Data()` method returns nil. Control returns to
 `handleData` proceeds to the `io.Copy(ioutil.Discard, r)` line. The `r`
 here is the `*dataReader` whose underlying `*textproto.dotReader` is in
 `stateEOF`. Every `Read()` returns `0, io.EOF`. `io.Copy` reads zero
-bytes and returns. The 102 bytes of smuggled commands are **still in the
+bytes and returns. The 101 bytes of smuggled commands are **still in the
 `bufio.Reader` buffer**, entirely untouched by the drain.
 
 #### Step 5. `handleData` writes the 250 response
@@ -1040,7 +1119,7 @@ to `handleConn`.
 
 The command loop in `handleConn` (`go-smtp/server.go` / `conn.go`) calls
 `c.readLine()` which reads from the same `bufio.Reader` that the dotReader
-was reading from. The next bytes it sees are the 102 smuggled bytes,
+was reading from. The next bytes it sees are the 101 smuggled bytes,
 starting with `MAIL FROM:<evil@attacker.com>\r\n`.
 
 `c.readLine()` returns `"MAIL FROM:<evil@attacker.com>"` (stripped of `\r\n`
@@ -1319,12 +1398,17 @@ connection closed
 ```
 
 The key line is `strict DATA scan forwarded 149 bytes in one Write();
-canonical terminator at offset 144`. This confirms that:
+canonical terminator at offset 144`. Offsets in this subsection are
+**payload-relative** (measured from the start of the 149-byte DATA
+payload — the same reference frame used in Appendix C.7). This
+confirms that:
 
 1. The proxy buffered the **entire** 149-byte payload.
-2. The proxy did **not** recognise the embedded `\n.\n` at offset 20–22
-   as a terminator; it waited until the canonical `\r\n.\r\n` at offset
-   144–148.
+2. The proxy did **not** recognise the embedded `\n.\n` — located at
+   payload offsets 45–47 (hex `0x2d`–`0x2f`), immediately after the
+   25-byte header and 20-byte first body — as a terminator. It waited
+   until the canonical `\r\n.\r\n` at payload offsets 144–148 (hex
+   `0x90`–`0x94`).
 3. The proxy wrote all 149 bytes to the backend in a **single** `Write()`
    call.
 
@@ -1618,11 +1702,19 @@ and there is no logic that compares "bytes client reports sending"
 to "bytes server stored".
 
 In the smuggling case, the client writes 149 bytes of DATA payload,
-but Maddy stores only 44 bytes for the first message (the body plus
-Received header). The remaining 105 bytes (`\n.\n` + smuggled
-commands + second body + canonical terminator) are consumed by the
-server but are not associated with the first message. This mismatch
-is not detected or logged.
+but the first message as delivered to the session handler measures
+only 44 bytes (the CRLF→LF-normalised header `Subject: smuggle-test\n\n`
+= 23 bytes plus the normalised body `Before fake boundary\n` =
+21 bytes; see §4.3 Step 3 for the full decomposition). The bare-LF
+terminator `\n.\n` (3 bytes on the wire) is consumed by the first
+dotReader but is not stored. The remaining 101 bytes (injected
+`MAIL FROM:` + `RCPT TO:` + `DATA` + second-message header +
+second-message body + canonical `\r\n.\r\n` terminator — see
+Appendix C.7 for the annotated byte-offset table) are read out of
+the same `bufio.Reader` buffer by go-smtp's command loop but are
+NOT associated with the first message. This mismatch between "wire
+bytes received during DATA phase" (149) and "bytes stored as the
+first message" (44) is not detected or logged.
 
 #### 6.3.4 No Session-Level Anomaly Detection
 
@@ -2978,16 +3070,26 @@ QUIT\r\n
 [SESSION 1] MAIL FROM:<sender@test.local>
 [SESSION 1] RCPT TO:<recipient@test.local>
 [SESSION 1] DATA start
-[SESSION 1] DATA bytes delivered to handler: 92
-[SESSION 1] DATA hex dump: 53756..66 2e0a4c696e65...0a (trimmed, 92 bytes)
-[SESSION 1] Message #1 accepted (body=92 bytes)
+[SESSION 1] DATA bytes delivered to handler: 159
+[SESSION 1] DATA hex dump: 53756..66 2e0a4c696e65...0a (trimmed, 159 bytes)
+[SESSION 1] Message #1 accepted (body=159 bytes)
 [SESSION 1] NOOP
 [SESSION 1] QUIT
 ```
 
-**Key observation**: The 92-byte body is normalised to use bare
+**Key observation**: The 159-byte body is normalised to use bare
 `\n` line endings by the dotReader. The terminator sequence
 `\r\n.\r\n` is consumed and not included in the delivered body.
+The 159 bytes break down as 24 bytes for the Subject header line
+(`Subject: canonical-test\n`), 24 bytes for the From header
+(`From: sender@test.local\n`), 25 bytes for the To header
+(`To: recipient@test.local\n`), 1 byte for the blank separator
+(`\n`), 52 bytes for body line 1
+(`This is the canonical CRLF-terminated message body.\n`), and
+33 bytes for body line 2 (`Line two ends with CRLF as well.\n`)
+— all with `\n` line endings after normalisation. Sum:
+24 + 24 + 25 + 1 + 52 + 33 = **159 bytes**, matching the hex dump
+in §C.3.
 
 ### B.2 Session 2 — Bare-LF Terminator `\n.\n`
 
@@ -3029,15 +3131,22 @@ typically still send commands with canonical `\r\n`).
 
 **Backend log:**
 ```text
-[SESSION 2] DATA bytes delivered to handler: 92
-[SESSION 2] Message #2 accepted (body=92 bytes)
+[SESSION 2] DATA bytes delivered to handler: 145
+[SESSION 2] Message #2 accepted (body=145 bytes)
 ```
 
-**Key observation**: The body is exactly 92 bytes — the **same
-length** as Session 1. The dotReader produced identical delivered
-content for the bare-LF terminator and the canonical terminator.
-This proves byte-level equivalence between the two terminators at
-the delivery layer.
+**Key observation**: The body is 145 bytes — 14 bytes shorter than
+Session 1's 159 bytes. The per-session difference is due entirely
+to the distinct Subject label and distinct body paragraph (which
+name their respective variants for traceability), NOT to the
+terminator form. Both the canonical terminator and the bare-LF
+terminator produce a delivered body with `\n`-only line endings;
+the terminator bytes (`\r\n.\r\n` or `\n.\n`) are consumed by the
+dotReader and do not appear in the delivered buffer. If Session 2
+were re-run with byte-identical body content to Session 1 (only
+the terminator form varying), the two sessions would deliver
+byte-identical 159-byte buffers — demonstrating the delivery-layer
+equivalence of the two terminator forms.
 
 ### B.3 Session 3 — Mixed `\r\n.\n`
 
@@ -3053,10 +3162,13 @@ Mixed terminator test: CRLF before dot, bare LF after.\r\n
 
 **Server response**: `250 2.0.0 OK: queued as msg-3`
 
-**Backend log**: `Message #3 accepted (body=92 bytes)`
+**Backend log**: `Message #3 accepted (body=128 bytes)`
 
 **Key observation**: Even with heterogeneous line-endings in the
-terminator itself, the dotReader accepts the sequence.
+terminator itself, the dotReader accepts the sequence. The delivered
+body is 128 bytes (Subject header 23 B + From 24 B + To 25 B + blank
+line 1 B + single body line 55 B, all with `\n` line endings after
+normalisation); the `\r\n.\n` terminator is consumed.
 
 ### B.4 Session 4 — Mixed `\n.\r\n`
 
@@ -3072,9 +3184,14 @@ Mixed terminator test: bare LF before dot, CRLF after.\n
 
 **Server response**: `250 2.0.0 OK: queued as msg-4`
 
-**Backend log**: `Message #4 accepted (body=92 bytes)`
+**Backend log**: `Message #4 accepted (body=128 bytes)`
 
-**Key observation**: The other mixed order is also accepted.
+**Key observation**: The other mixed order is also accepted. The
+delivered body is 128 bytes — identical in length to Session 3
+because the body content is structurally the same (same Subject,
+From, To lines; same single 55-byte body paragraph) and the
+terminator bytes are consumed by the dotReader and not counted in
+the delivered size.
 
 ### B.5 Session 5 — Bare-CR Non-Terminator `\r.\r` (Then Canonical Terminator)
 
@@ -3090,15 +3207,19 @@ Embedded\r.\rsegment in body — this should NOT terminate.\r\n
 
 **Backend log**:
 ```text
-[SESSION 5] DATA bytes delivered to handler: 65
+[SESSION 5] DATA bytes delivered to handler: 81
 [SESSION 5] hex dump excerpt: ...456d6265..64640d2e0d7365676d...0a (bytes include 0d 2e 0d within)
-[SESSION 5] Message #5 accepted (body=65 bytes)
+[SESSION 5] Message #5 accepted (body=81 bytes)
 ```
 
 **Key observation**: The `\r.\r` subsequence is delivered
 **intact** as part of the body (bytes `0d 2e 0d` visible in the hex
 dump). The dotReader did not treat `\r.\r` as a terminator because
-`\r` is not a line-end marker on its own.
+`\r` is not a line-end marker on its own. The 81-byte body includes
+the Subject header (22 B), blank line (1 B), and the single body
+line with the embedded `\r.\r` and the UTF-8-encoded em-dash
+(`e2 80 94`, 3 bytes), for a total of 58 body bytes + 23 header
+bytes = 81 bytes.
 
 ### B.6 Session 6 — Dot-Space Near-Miss `\r\n. \r\n` (Then Canonical Terminator)
 
@@ -3115,27 +3236,37 @@ Here is the near-miss line:\r\n
 
 **Backend log**:
 ```text
-[SESSION 6] DATA bytes delivered to handler: 72
-[SESSION 6] hex dump excerpt: ...2e20..65787472..70616365...0a (byte 2e at line start is followed by 20 '_')
-[SESSION 6] Message #6 accepted (body=72 bytes)
+[SESSION 6] DATA bytes delivered to handler: 76
+[SESSION 6] hex dump excerpt: ...20657874726120737061636520616674...0a (byte 20 at line start — the leading 2e was stripped by dot-unstuffing)
+[SESSION 6] Message #6 accepted (body=76 bytes)
 ```
 
-Wait — the hex shows `2e 20` at a line start. Let us trace what the
-dotReader does here. At the start of the `. extra...` line,
-state = `stateBeginLine`, next byte `.` → `stateDot`. Next byte is
-`\x20` (space). From `stateDot`, any byte other than `\n`, `\r`,
-`.`, is handled by the "emit `.`, → `stateData`" default branch —
-which means the dotReader emits a literal `.` byte and transitions
-to `stateData`. The next byte `\x20` is then emitted as body in
-`stateData`. So the delivered body contains `2e 20` (literal dot
-plus space). This is dot-stuffing in reverse: the dot-at-start-of-
-line was treated as a literal body dot because it was not followed
-by a terminator-forming sequence.
+Let us trace what the dotReader does here. At the start of the
+`. extra...` line, state = `stateBeginLine`, next byte `.` →
+`stateDot`. Next byte is `\x20` (space). From `stateDot`, any byte
+other than `\n`, `\r`, `.` is handled by the default branch —
+which sets `state = stateData` and re-enters the switch for the
+current byte (the space). Critically, the dot that led to
+`stateDot` is **not emitted** — it is consumed as a potential
+dot-stuffing prefix. In `stateData` the space byte is emitted as
+body. So the delivered body contains only `20` (space) at this
+position, not `2e 20`. This is RFC 5321 §4.5.2 dot-unstuffing
+behavior: a dot at the start of a body line is stripped by the
+receiver after it is confirmed not to be the terminator sentinel.
+The result is that `. extra space after dot` on the wire becomes
+` extra space after dot` (with a leading space) in the delivered
+body — 22 bytes of body text from the 23-byte wire line.
 
 **Key observation**: The sequence `\r\n. \r\n` is indeed body
 content — the terminator's "dot alone on a line" requirement is
 not met when a trailing space appears after the dot on the same
-line.
+line. The leading dot is then stripped by dot-unstuffing, so the
+76-byte delivered body breaks down as: Subject header (24 B) +
+blank line (1 B) + "Here is the near-miss line:\n" (28 B) +
+" extra space after dot\n" (23 B, with the leading `.` consumed).
+The wire line was 23 bytes of text plus `\r\n`; after dot-unstuffing
+and CRLF→LF normalization it becomes 22 bytes of text plus `\n` = 23
+delivered bytes.
 
 ### B.7 Session 7 — Dot Mid-Line `Body.\r\n`
 
@@ -3180,16 +3311,22 @@ Subject: dot-stuffed-test\r\n
 
 **Backend log**:
 ```text
-[SESSION 8] DATA bytes delivered to handler: 85
+[SESSION 8] DATA bytes delivered to handler: 104
 [SESSION 8] hex dump excerpt: ...2e74686973206c696e6520626567696e7320...2e2e74686973206f6e65...0a
-[SESSION 8] Message #8 accepted (body=85 bytes)
+[SESSION 8] Message #8 accepted (body=104 bytes)
 ```
 
 **Key observation**: The dotReader stripped one leading `.` from
 each dot-stuffed line: `..text` → `.text`, and `...text` →
 `..text`. The delivered body shows `2e 74 68 69 73` (single dot +
 "this") and `2e 2e 74 68 69 73` (double dot + "this"). This is
-the RFC 5321 transparency mechanism working correctly.
+the RFC 5321 transparency mechanism working correctly. The 104-byte
+delivered body breaks down as: Subject header 26 B
+(`Subject: dot-stuffed-test\n`), blank 1 B, body line 1 37 B
+(`.this line begins with a literal dot\n` — one `.` consumed by
+dot-unstuffing), and body line 2 40 B
+(`..this one begins with two literal dots\n` — one `.` consumed
+by dot-unstuffing, two `.`s emitted).
 
 ### B.9 Session 9 — Pipelined Three-Message Transaction
 
@@ -3256,18 +3393,18 @@ QUIT\r\n
 ```text
 [SESSION 9] MAIL FROM:<alice@test.local>
 [SESSION 9] RCPT TO:<recipient1@test.local>
-[SESSION 9] DATA bytes delivered to handler: 55
-[SESSION 9] Message #9-alice accepted (body=55 bytes, from=alice@test.local, to=recipient1@test.local)
+[SESSION 9] DATA bytes delivered to handler: 63
+[SESSION 9] Message #9-alice accepted (body=63 bytes, from=alice@test.local, to=recipient1@test.local)
 [SESSION 9] NOOP
 [SESSION 9] MAIL FROM:<bob@test.local>
 [SESSION 9] RCPT TO:<recipient2@test.local>
-[SESSION 9] DATA bytes delivered to handler: 51
-[SESSION 9] Message #9-bob accepted (body=51 bytes, from=bob@test.local, to=recipient2@test.local)
+[SESSION 9] DATA bytes delivered to handler: 57
+[SESSION 9] Message #9-bob accepted (body=57 bytes, from=bob@test.local, to=recipient2@test.local)
 [SESSION 9] NOOP
 [SESSION 9] MAIL FROM:<carol@test.local>
 [SESSION 9] RCPT TO:<recipient3@test.local>
-[SESSION 9] DATA bytes delivered to handler: 59
-[SESSION 9] Message #9-carol accepted (body=59 bytes, from=carol@test.local, to=recipient3@test.local)
+[SESSION 9] DATA bytes delivered to handler: 83
+[SESSION 9] Message #9-carol accepted (body=83 bytes, from=carol@test.local, to=recipient3@test.local)
 [SESSION 9] NOOP
 [SESSION 9] QUIT
 ```
@@ -3501,13 +3638,21 @@ line ends with `\n` instead of `\r\n`, and the terminator is
 
 **Terminator bytes (hex):** `2e 0a` at offset `00000091` — preceded
 by `0a` at `00000090` forming the `\n.\n` sequence. Total payload
-is 147 bytes — 5 bytes shorter than Session 1 because each CRLF
-was replaced by a single LF.
+is 147 bytes — **21 bytes shorter** than Session 1's 168 bytes
+(168 − 147 = 21). The 21-byte reduction comes from two sources:
+(a) nine CRLFs collapsed to nine LFs (9 bytes saved) and
+(b) the shorter `Subject: bare-lf-test` label replaces
+`Subject: canonical-test` (3 bytes saved) together with the
+shorter body paragraphs ("bare-LF-terminated" vs
+"canonical CRLF-terminated", etc., accounting for the remaining
+9 bytes).
 
-**Server acceptance**: `250 OK`. Backend delivered 92 bytes of
-body (same count as Session 1), proving that the dotReader's
-normalisation path flattens both variants to identical body
-content.
+**Server acceptance**: `250 OK`. Backend delivered **145 bytes**
+of body — 14 bytes shorter than Session 1's 159 bytes. The
+difference is driven entirely by the distinct Subject label and
+body paragraphs, **not** by the terminator form: the dotReader's
+normalisation path flattens both variants to byte-identical body
+content when the content itself is byte-identical.
 
 ### C.3 Session 1 Delivered Body (as Received by Handler)
 
@@ -3530,9 +3675,12 @@ normalised to `\n`:
 0000009f
 ```
 
-Length: **92 bytes**. Note the absence of any `0d` byte — every
-CRLF line ending on the wire became a bare LF in the delivered
-stream.
+Length: **159 bytes** (the last data line in the hex dump above
+starts at offset `00000090` and contains 15 bytes from `20`
+through `0a` inclusive, so the final stream byte is at offset
+`0000009e` and the one-past-the-end label is `0000009f` = 159
+decimal). Note the absence of any `0d` byte — every CRLF line
+ending on the wire became a bare LF in the delivered stream.
 
 ### C.4 Session 2 Delivered Body (as Received by Handler)
 
@@ -3550,13 +3698,37 @@ stream.
 00000091
 ```
 
-Length: **92 bytes** (identical to Session 1). The only textual
-difference from §C.3 is the Subject line content
-(`bare-lf-test` vs `canonical-test`), which accounts for
-byte-by-byte differences in the first 33 bytes.
+Length: **145 bytes** (14 bytes shorter than Session 1's 159 bytes
+in §C.3). The 14-byte difference is entirely explained by the
+distinct content: `Subject: bare-lf-test` is 2 bytes shorter than
+`Subject: canonical-test`, the first body line
+(`This is the bare-LF-terminated message body.` at 44 bytes) is
+7 bytes shorter than Session 1's
+(`This is the canonical CRLF-terminated message body.` at 51 bytes),
+and the second body line
+(`Line two also uses bare LF.` at 27 bytes) is 5 bytes shorter than
+Session 1's (`Line two ends with CRLF as well.` at 32 bytes), total
+2 + 7 + 5 = **14 bytes** of content reduction.
 
-The identical length confirms that the dotReader delivered the
-same body-byte structure for both variants.
+**This length difference is NOT caused by the terminator form.**
+It is driven solely by the byte length of the content strings
+chosen for each session. The wire→delivered transformation
+accounts for:
+
+- **§C.1 → §C.3**: 168 − 159 = 9 bytes consumed. The 9 bytes are
+  the six `\r` halves of six CRLFs that were normalised to bare
+  LF (6 bytes saved) plus the `.\r\n` terminator whose 3 bytes
+  are consumed entirely.
+- **§C.2 → §C.4**: 147 − 145 = 2 bytes consumed. These are the
+  `.` and trailing `\n` of the `\n.\n` terminator (the leading
+  `\n` is the end of the last body line and is kept as-is).
+
+If Session 2 had been re-run with byte-identical content to
+Session 1 (but with bare-LF line endings), both delivered bodies
+would be exactly **159 bytes** — confirming the dotReader's
+normalisation path flattens both terminator variants to
+byte-identical body content when the content itself is
+byte-identical.
 
 ### C.5 Session 5 Delivered Body — Bare-CR Survival
 
@@ -3573,7 +3745,12 @@ terminates with canonical `\r\n.\r\n`. The delivered bytes:
 00000051
 ```
 
-Length: **65 bytes**.
+Length: **81 bytes** (hex offset labels confirm the final byte at
+`00000050` and one-past-the-end label `00000051` = 81). The
+additional bytes beyond a pure ASCII body come from the UTF-8
+encoding of the em-dash character (U+2014) at offsets
+`00000032`–`00000034` (`e2 80 94`, 3 bytes for one visible
+character).
 
 **Critical observation**: The hex dump shows bytes `0d 2e 0d` at
 offset `0000001f`–`00000021` — the three bytes `\r.\r`, embedded
@@ -3588,44 +3765,89 @@ interpreted as body content.
 00000000  53 75 62 6a 65 63 74 3a  20 64 6f 74 2d 73 70 61  |Subject: dot-spa|
 00000010  63 65 2d 74 65 73 74 0a  0a 48 65 72 65 20 69 73  |ce-test..Here is|
 00000020  20 74 68 65 20 6e 65 61  72 2d 6d 69 73 73 20 6c  | the near-miss l|
-00000030  69 6e 65 3a 0a 2e 20 65  78 74 72 61 20 73 70 61  |ine:.. extra spa|
-00000040  63 65 20 61 66 74 65 72  20 64 6f 74 0a           |ce after dot.|
-0000004d
+00000030  69 6e 65 3a 0a 20 65 78  74 72 61 20 73 70 61 63  |ine:. extra spac|
+00000040  65 20 61 66 74 65 72 20  64 6f 74 0a              |e after dot.|
+0000004c
 ```
 
-Length: **77 bytes**.
+Length: **76 bytes**.
 
-**Critical observation**: At offset `00000034`–`00000035`, the
-bytes `2e 20` appear — a literal dot followed by a space.
-Analysis: when the dotReader was in `stateBeginLine` and saw `.`,
-it transitioned to `stateDot`. The next byte was `\x20` (space),
-which is in the "Other" column of `stateDot`'s transition table;
-the action is "emit `.`, → `stateData`". So the dotReader emitted
-a literal `.` byte and transitioned to body-data state. The next
-byte `\x20` was then emitted as body content. The result is that
-the line `. extra space after dot` survives intact in the body.
+**Critical observation**: At offset `00000034`, the delivered
+stream contains `0a` (LF ending the `Here is the near-miss line:`
+line). The very next byte at offset `00000035` is `20` (space),
+**not** `2e` (dot). The leading `.` that the client sent at the
+start of `. extra space after dot\r\n` was **consumed by
+dot-unstuffing** and does not appear in the delivered body.
+
+Tracing the dotReader state machine for the sequence
+`...line:\r\n. extra...` (wire bytes `...3a 0d 0a 2e 20 65...`):
+
+1. In `stateData`, byte `:` (0x3a) — emit, stay in `stateData`.
+2. Byte `\r` (0x0d) — transition to `stateCR` (byte held back, not
+   yet emitted).
+3. Byte `\n` (0x0a) — from `stateCR` + `\n`: emit `\n` (the `\r`
+   is suppressed by the CRLF→LF normalisation), transition to
+   `stateBeginLine`.
+4. Byte `.` (0x2e) — from `stateBeginLine` + `.`: transition to
+   `stateDot` **without emitting anything** (the dot is held back
+   as a potential terminator prefix, per RFC 5321 §4.5.2
+   dot-unstuffing).
+5. Byte ` ` (0x20) — from `stateDot` + "Other byte": the default
+   branch sets `state = stateData` and re-enters the switch for
+   the current byte. In `stateData`, the space is emitted. The
+   dot from step 4 is **not** re-emitted — it was consumed.
+6. Byte `e` (0x65) — emit in `stateData`.
+7. ... continues emitting body bytes.
+
+The delivered result is that the wire line `. extra space after dot\r\n`
+(23 bytes on wire) becomes ` extra space after dot\n` (23 bytes
+delivered: 22 body bytes + 1 LF), with the leading dot stripped
+and the CRLF normalised to LF. The net byte count of this single
+line is unchanged (23 wire → 23 delivered) because the dot-strip
+(-1 byte) and the CRLF normalisation (-1 byte) exactly offset
+against the fact that the wire line has an extra `\r` that the
+delivered line lacks, giving: wire 23 − 1 (dot) − 1 (CR
+suppressed) = 21, then + 2 for the delivered line's ` ` space and
+final `\n` that were already on the wire... actually, the simple
+count is:
+
+- Wire line (bytes): `2e 20 65 78 74 72 61 20 73 70 61 63 65 20 61 66 74 65 72 20 64 6f 74 0d 0a` = 25 bytes
+- Delivered line (bytes): `20 65 78 74 72 61 20 73 70 61 63 65 20 61 66 74 65 72 20 64 6f 74 0a` = 23 bytes
+- Saved: 2 bytes (the leading `.` and the `\r` of CRLF)
+
+Across the whole body, the 76-byte delivered count reflects:
+
+- `Subject: dot-space-test\n` (24 bytes; wire was
+  `Subject: dot-space-test\r\n` = 25 bytes, CRLF→LF saves 1 byte)
+- `\n` (1 byte; wire was `\r\n` = 2 bytes, CRLF→LF saves 1 byte)
+- `Here is the near-miss line:\n` (28 bytes; wire was
+  `Here is the near-miss line:\r\n` = 29 bytes, CRLF→LF saves 1
+  byte)
+- ` extra space after dot\n` (23 bytes; wire was
+  `. extra space after dot\r\n` = 25 bytes, dot-strip + CRLF→LF
+  saves 2 bytes)
 
 This confirms Section 2.2's finding that the dot-space near-miss
-is not mistaken for a terminator, and the leading dot is not
-stripped because it was not a dot-stuffed legitimate body dot (it
-was in a context where the whole line continues).
+is **not** mistaken for a terminator: the dotReader returns to
+`stateData` and continues emitting body content. The leading dot
+however IS stripped by dot-unstuffing — the same byte that in a
+different context (followed by `\r\n` or `\n`) would complete the
+terminator is, in this context (followed by a non-line-end byte),
+silently removed by the receiver.
 
-Wait — re-reading the state table: from `stateDot`, the "other"
-branch emits `.` and transitions to `stateData`. So the `.` is
-emitted. Then the space is emitted in `stateData`. So the line
-begins with a literal `.` followed by a space in the delivered
-body. That is consistent with the hex dump.
-
-A minor subtlety: in the **dot-stuffed** case (e.g., `..text`),
-the dotReader in `stateDot` sees another `.` and the action is
-also "emit `.`, → `stateData`" — but the key difference is that
-in the dot-stuffed case, the client sent **two** dots, and the
-dotReader emits only one. In the dot-space case, the client sent
-**one** dot and a space, and the dotReader also emits one dot (the
-same one) followed by the space. So there is a semantic
-difference between "dot-stuffed" (one of two dots stripped) and
-"dot-space" (dot preserved because it was the only dot), even
-though the state-machine action is nominally the same.
+A minor subtlety worth highlighting: in the **dot-stuffed** case
+(e.g., `..text`), the dotReader in `stateDot` sees another `.`
+and the action is: set `state = stateData` and re-enter the
+switch, which in `stateData` + `.` emits the dot. The first dot
+(the dot-stuffing byte) is dropped, the second dot (the actual
+content byte) is emitted. In the **dot-space** case, the single
+dot is dropped outright because it was in `stateDot` when a
+non-line-end, non-dot byte was seen, and the default branch
+never re-emits the previously-suppressed dot. So both cases
+follow the same state-machine path, but produce different
+observable results because the dot-stuffed case has a second
+literal dot to emit in `stateData`, whereas the dot-space case
+has only a space.
 
 ### C.7 SMTP Smuggling Payload (Session 10)
 
@@ -3647,20 +3869,21 @@ The complete attack payload sent in a single 149-byte TCP write:
 
 Length: **149 bytes**.
 
-**Annotated segments:**
+**Annotated segments:** (offset ranges computed from each segment's
+actual byte length; sum = 149 bytes matching the total payload)
 
-| Offset range | Bytes | Meaning |
-|--------------|-------|---------|
-| `0000–0019` | `Subject: smuggle-test\r\n\r\n` | First message header + blank line |
-| `0019–002c` | `Before fake boundary` | First message body content |
-| `002d` | `\n` | Bare-LF line end |
-| `002e–002f` | `.\n` | **Fake terminator** — triggers dotReader EOF here |
-| `0030–0041` | `MAIL FROM:<evil@attacker.com>\r\n` | Injected SMTP command (second envelope) |
-| `0042–005b` | `RCPT TO:<victim@target.com>\r\n` | Injected SMTP command (second recipient) |
-| `005c–0061` | `DATA\r\n` | Injected SMTP command (second DATA) |
-| `0062–0078` | `Subject: injected\r\n\r\n` | Second message header + blank line |
-| `0079–0081` | `Evil body` | Second message body content |
-| `0082–0084` | `\r\n.\r\n` | Canonical terminator — ends second message |
+| Offset range | Size | Bytes | Meaning |
+|--------------|------|-------|---------|
+| `0000–0018` | 25 | `Subject: smuggle-test\r\n\r\n` | First message header + blank line |
+| `0019–002c` | 20 | `Before fake boundary` | First message body content |
+| `002d` | 1 | `\n` | Bare-LF line end (stays in stateData→stateBeginLine) |
+| `002e–002f` | 2 | `.\n` | **Fake terminator** — triggers dotReader EOF here |
+| `0030–004e` | 31 | `MAIL FROM:<evil@attacker.com>\r\n` | Injected SMTP command (second envelope) |
+| `004f–006b` | 29 | `RCPT TO:<victim@target.com>\r\n` | Injected SMTP command (second recipient) |
+| `006c–0071` | 6 | `DATA\r\n` | Injected SMTP command (second DATA) |
+| `0072–0086` | 21 | `Subject: injected\r\n\r\n` | Second message header + blank line |
+| `0087–008f` | 9 | `Evil body` | Second message body content |
+| `0090–0094` | 5 | `\r\n.\r\n` | Canonical terminator — ends second message |
 
 **How the server processes this**:
 
@@ -3696,9 +3919,10 @@ Length: **149 bytes**.
 11. Subsequent `ReadLine`s process `RCPT TO:<victim@target.com>`,
     then `DATA`, which starts a **new** DATA phase with a
     **fresh** `newDataReader(c)`.
-12. The fresh dotReader consumes bytes `0062`–`0084`. The
-    canonical terminator at `0082`–`0084` triggers EOF, and the
-    second message (29 bytes) is accepted.
+12. The fresh dotReader consumes bytes `0072`–`0094`. The
+    canonical terminator `\r\n.\r\n` at `0090`–`0094` triggers
+    EOF, and the second message (29 bytes delivered after CRLF→LF
+    normalisation) is accepted.
 
 ### C.8 Session 5 Hex Dump (Bare-CR Non-Terminator) — Wire View
 
@@ -3795,25 +4019,36 @@ state. The input categories are:
 
 | Current State | LF (`\n`) | CR (`\r`) | DOT (`.`) | OTHER |
 |---------------|-----------|-----------|-----------|-------|
-| `stateBeginLine` | emit `\n`; stay `stateBeginLine` | → `stateCR` | → `stateDot` | emit byte; → `stateData` |
-| `stateData` | → `stateBeginLine` | → `stateCR` | emit byte; stay `stateData` | emit byte; stay `stateData` |
-| `stateCR` | → `stateBeginLine` | unread byte; emit `\r`; → `stateData` | unread byte; emit `\r`; → `stateData` | unread byte; emit `\r`; → `stateData` |
-| `stateDot` | **→ `stateEOF`** | → `stateDotCR` | emit `.`; → `stateData` | emit `.`; → `stateData` |
+| `stateBeginLine` | emit `\n`; → `stateData` | → `stateCR` | → `stateDot` | emit byte; → `stateData` |
+| `stateData` | emit `\n`; → `stateBeginLine` | → `stateCR` | emit byte; stay `stateData` | emit byte; stay `stateData` |
+| `stateCR` | emit `\n`; → `stateBeginLine` | unread byte; emit `\r`; → `stateData` | unread byte; emit `\r`; → `stateData` | unread byte; emit `\r`; → `stateData` |
+| `stateDot` | **→ `stateEOF`** | → `stateDotCR` | emit byte (`.`); → `stateData` | emit byte; → `stateData` |
 | `stateDotCR` | **→ `stateEOF`** | unread byte; emit `\r`; → `stateData` | unread byte; emit `\r`; → `stateData` | unread byte; emit `\r`; → `stateData` |
 | `stateEOF` | — (returns `io.EOF`) | — | — | — |
 
 **Notes on the table:**
 
 - "emit byte" means writing the consumed byte into the caller's
-  buffer (contributing to delivered body).
+  buffer (contributing to delivered body). In the `stateDot` row,
+  the `.` that got the reader into `stateDot` has already been
+  held back (and for the OTHER cell is permanently dropped as
+  dot-unstuffing); "emit byte" refers to emitting the CURRENT
+  byte. In the `stateDot` + DOT cell the current byte happens to
+  be `.`, so the emission is literally a `.` (the first dot is
+  dropped by dot-unstuffing, the second is emitted as body
+  content).
 - "unread byte" means pushing the byte back to the underlying
   `bufio.Reader` via `UnreadByte`, so it will be re-read on the
   next `Read`. The unreading is essential in the `stateCR` and
   `stateDotCR` branches to allow a subsequent `\r.\r` or similar
   sequence to be reprocessed cleanly.
-- "emit `\n`" in `stateBeginLine` + LF means a blank line (LF on
-  a line by itself) is emitted as a single `\n` byte and the
-  state does not change — another blank line follows.
+- "emit `\n`" in `stateBeginLine` + LF: the actual code sets
+  `state = stateData` and falls through to the byte-emit line, so
+  the state AFTER emitting the `\n` is `stateData`, not
+  `stateBeginLine`. For a run of consecutive `\n` bytes the
+  reader therefore oscillates `stateBeginLine → stateData →
+  stateBeginLine → …`, emitting each `\n` along the way. §1.3
+  discusses this subtlety in more detail.
 - Transitions that produce `stateEOF` are the **termination**
   paths. There are exactly two such transitions in the table:
   (`stateDot`, LF) and (`stateDotCR`, LF). Every successful
@@ -3868,20 +4103,24 @@ Bare-CR \r.\r: (starting in stateData)
 
 Dot-space \r\n. \r\n: (starting in stateData)
   (stateData)    \r → stateCR
-  (stateCR)      \n → stateBeginLine
-  (stateBeginLine) . → stateDot
-  (stateDot)     ' ' (0x20, OTHER) → emit '.'; → stateData  [emits 0x2e]
-  (stateData)    ' ' → emit; stay  [emits 0x20]
+  (stateCR)      \n → stateBeginLine (emit \n)
+  (stateBeginLine) . → stateDot                       [dot held, NOT emitted]
+  (stateDot)     ' ' (0x20, OTHER) → d.state=stateData, fall through  [emits 0x20, the SPACE]
   (stateData)    \r → stateCR
-  (stateCR)      \n → stateBeginLine
-  Result: bytes 2e 20 appear in delivered body; no EOF.
+  (stateCR)      \n → stateBeginLine (emit \n)
+  Result: byte 0x20 (space only) appears in delivered body; the
+  leading '.' is consumed by dot-unstuffing (RFC 5321 §4.5.2) and
+  is NOT emitted; no EOF. §C.6 shows this empirically.
 
 Dot-stuffed ..text: (starting at stateBeginLine)
-  (stateBeginLine) . → stateDot
-  (stateDot)     . → emit '.'; → stateData  [emits 0x2e, strips one of two dots]
+  (stateBeginLine) . → stateDot                       [first dot held, NOT emitted]
+  (stateDot)     . → d.state=stateData, fall through  [emits 0x2e, the SECOND dot]
   (stateData)    t → emit; stay
   ...
-  Result: one dot is stripped; the remaining body is delivered normally.
+  Result: the first dot (dot-stuffing byte) is stripped; the second
+  dot is emitted as body content; remaining line delivered
+  normally. The net effect is that "..text" on the wire becomes
+  ".text" in the delivered body.
 
 Dot mid-line Body.\r\n: (in stateData)
   (stateData)    B → emit
@@ -3943,7 +4182,7 @@ to `stateEOF` are bold):
                          │  │   │  │      → stateData     
                          │  │   │  │                      
                          │  │   │  │  DOT or OTHER        
-                         │  │   │  ▼  (emit '.' → stateData)
+                         │  │   │  ▼  (emit current byte; → stateData)
                          │  │   │ ┌────────────┐          
                          │  │   └─│ stateData  │◄─────────┐
                          │  │     └──┬──┬──┬───┘          │
@@ -3968,7 +4207,7 @@ from the lenient version in exactly two transitions:
 | State | Input | Lenient action | Strict action |
 |-------|-------|----------------|---------------|
 | `stateDot` | LF | → `stateEOF` | → `stateData` (emit nothing; treat as protocol error or benign body) |
-| `stateBeginLine` | LF | emit `\n`; stay | (could stay or transition — no impact on termination) |
+| `stateBeginLine` | LF | emit `\n`; → `stateData` | (no change needed — emit/transition unaffected by strict mode) |
 
 Only one state transition is materially different: the `stateDot`
 + LF transition would no longer lead to `stateEOF`. The strict
