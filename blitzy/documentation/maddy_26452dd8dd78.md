@@ -286,8 +286,14 @@ accepted into the pipeline exactly as if it had been terminated canonically.
 The decision to accept a given byte sequence as a terminator is made inside
 Go's standard library, specifically in `net/textproto/reader.go`
 (`/usr/lib/go-1.22/src/net/textproto/reader.go`, lines 333–445). The
-`dotReader` type holds a single `state` field of type `dotReaderState` and
-advances it through the following six states:
+`dotReader` struct (declared at lines 333–336) holds a single `state` field
+of plain Go type `int`; the six possible values of that field are declared
+as local `iota` constants inside the `(d *dotReader).Read()` method (lines
+343–350), not as a named type at package scope. For readability this
+document refers to those constants by their unqualified names
+(`stateBeginLine`, `stateDot`, `stateDotCR`, `stateCR`, `stateData`,
+`stateEOF`). The reader advances the field through the following six
+states:
 
 | Constant | Meaning |
 |----------|---------|
@@ -1637,14 +1643,13 @@ writer is `ioutil.Discard`, as established by `log.DebugWriter()` in
 `internal/log/log.go` lines 172–178 when `Debug` is false):
 
 ```go
-// internal/log/log.go:172-178 (paraphrased)
+// internal/log/log.go lines 172–178 (verbatim)
 func (l Logger) DebugWriter() io.Writer {
     if !l.Debug {
         return ioutil.Discard
     }
-    copy := l
-    copy.Name = "debug"
-    return &logWriter{&copy}
+    l.Debug = true
+    return &l
 }
 ```
 
@@ -1858,33 +1863,44 @@ The root of all the findings in Sections 1, 2, and 4 is the
 are 333–445. The type and its driver function are:
 
 ```go
-// net/textproto/reader.go (paraphrased; line numbers approximate)
+// net/textproto/reader.go — verbatim excerpts from lines 333–350
 
-type dotReaderState int
-const (
-    stateBeginLine dotReaderState = iota
-    stateDot
-    stateDotCR
-    stateCR
-    stateData
-    stateEOF
-)
-
+// Lines 333–336: struct declaration (package scope).
+// The `state` field is a plain `int`; there is no named state type.
 type dotReader struct {
-    r     *Reader          // the textproto.Reader holding the bufio.Reader
-    state dotReaderState
+    r     *Reader
+    state int
 }
 
-// DotReader on textproto.Reader returns a fresh *dotReader in
-// stateBeginLine, sharing the same underlying bufio.Reader.
-
+// Read satisfies reads by decoding dot-encoded data read from d.r.
 func (d *dotReader) Read(b []byte) (n int, err error) {
-    // Walks the state machine, consuming bytes from d.r.R (the bufio.Reader)
-    // and writing emitted bytes into b.
-    // Returns io.EOF once state == stateEOF.
-    ...
+    // Run data through a simple state machine to
+    // elide leading dots, rewrite trailing \r\n into \n,
+    // and detect ending .\r\n line.
+    //
+    // Lines 343–350: the six state values are declared as UNTYPED iota
+    // constants at FUNCTION scope inside Read() (not at package scope).
+    const (
+        stateBeginLine = iota // beginning of line; initial state; must be zero
+        stateDot              // read . at beginning of line
+        stateDotCR            // read .\r at beginning of line
+        stateCR               // read \r (possibly at end of line)
+        stateData             // reading data in middle of line
+        stateEOF              // reached .\r\n end marker line
+    )
+    // ... remainder of function (lines 351–445): state-machine loop.
 }
+
+// DotReader on *textproto.Reader (defined elsewhere in the same file at
+// lines 327–331, with doc comment at lines 311–326) returns a fresh
+// *dotReader with state == 0 (which equals stateBeginLine by the "must be
+// zero" comment above), sharing the underlying bufio.Reader.
 ```
+
+**Note on naming:** because the six state constants are local to `Read()`,
+they have no exported form and no package-scope type. This document uses
+their unqualified names (`stateBeginLine`, `stateDot`, `stateDotCR`,
+`stateCR`, `stateData`, `stateEOF`) throughout for readability.
 
 The state-transition table derived from a careful reading of this file
 is given in Section 1.3. The single most important transition for this
@@ -2247,26 +2263,37 @@ as a legitimate end-of-body signal.
 ### 7.13 Maddy `Logger.DebugWriter` (log.go lines 172–178)
 
 ```go
-// internal/log/log.go DebugWriter (paraphrased, lines 172-178)
+// internal/log/log.go DebugWriter — verbatim, lines 172–178
 
 func (l Logger) DebugWriter() io.Writer {
     if !l.Debug {
         return ioutil.Discard
     }
-    copy := l
-    copy.Name = "debug"
-    return &logWriter{&copy}
+    l.Debug = true
+    return &l
 }
 ```
 
 **Observation**: When `l.Debug` is false — the default for Maddy's
-SMTP endpoint logger — this method returns `ioutil.Discard`. That
-`io.Writer` is then assigned to `endp.serv.Debug`, which is read by
-go-smtp's `Conn.init()`. Because `Debug` is non-nil (it is
-`ioutil.Discard`), `Conn.init()` **does** install the `io.TeeReader`
-/ `io.MultiWriter` pair — but they mirror every byte to
-`ioutil.Discard`. The performance cost is tiny, but the operational
-cost is that no debug log is produced.
+SMTP endpoint logger — this method returns `ioutil.Discard` directly.
+In that case, the `io.Writer` assigned to `endp.serv.Debug` is
+`ioutil.Discard` itself; go-smtp's `Conn.init()` treats any non-nil
+`server.Debug` as a signal to install the `io.TeeReader` /
+`io.MultiWriter` pair (see `conn.go` lines 48–76), so each wire byte
+is mirrored into `ioutil.Discard`. The CPU cost of the mirror is
+negligible, but the operational cost is that no debug log is produced.
+
+When `l.Debug` is true (for example because `io_debug true` is set on
+the SMTP endpoint — see §7.14), the method takes the other branch: it
+works on `l` by value (receiver is non-pointer), sets the local
+copy's `Debug` flag to `true` — a defensive assignment, since the
+branch is only reached when it is already true — and returns
+`&l`, a pointer to the local Logger copy. Because `Logger` itself
+implements `io.Writer` via its `Write(s []byte)` method (defined at
+`internal/log/log.go` lines 164–167), `&l` satisfies the `io.Writer`
+interface and each chunk of bytes written to it becomes a separate
+debug log message. There is no separate `logWriter` wrapper type;
+the `Logger` value **is** the writer.
 
 ### 7.14 Maddy `io_debug` Config Wiring (smtp.go ~554, ~565, ~603–606)
 
@@ -2285,18 +2312,24 @@ terminator behaviour. There is no `strict_data_terminator` or
 ### 7.15 Maddy `smtp_test.go` — Existing Test Coverage
 
 ```go
-// internal/endpoint/smtp/smtp_test.go testMsg constant (lines 25-28)
+// internal/endpoint/smtp/smtp_test.go testMsg constant — verbatim, lines 25–28
 
-const testMsg = "Subject: test\r\n" +
+const testMsg = "From: <sender@example.org>\r\n" +
+    "Subject: Hello there!\r\n" +
     "\r\n" +
-    "foobar\r\n" +
-    ".\r\n"
+    "foobar\r\n"
 ```
 
 **Observation**: The `testMsg` constant used throughout the
-pre-existing test suite uses **only** canonical `\r\n` line endings
-and the canonical `\r\n.\r\n` terminator. No test exercises
-bare-LF or mixed terminators, no test exercises the `io.Copy(ioutil.Discard, r)`
+pre-existing test suite uses **only** canonical `\r\n` line endings.
+Note that the `.\r\n` DATA terminator is **not** embedded in the
+constant itself — it is emitted on the wire by the go-smtp client's
+`DotWriter` (invoked from `wc.Close()` in the test's `smtp.Client.Data()`
+path) when the client's `io.Writer` returned by `Data()` is closed.
+Because all tests send their body through the go-smtp client (and
+therefore through `DotWriter`), every test exercises the canonical
+`\r\n.\r\n` terminator exclusively. No test exercises bare-LF or
+mixed terminators, no test exercises the `io.Copy(ioutil.Discard, r)`
 drain path, and no test exercises residual-byte command parsing.
 Existing CI therefore would not catch an SMTP smuggling regression,
 nor does it contain any test that would be broken if a terminator-
