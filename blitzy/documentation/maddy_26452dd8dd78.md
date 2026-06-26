@@ -51,7 +51,7 @@ Both binaries built cleanly (only the benign go-sqlite3 gcc warning). The pinned
 
 All observation was performed against an **ephemeral** instance under `/tmp` (configuration, SQLite state, queue files, logs, driver scripts, and the binaries themselves) which was **deleted after observation**; the repository working tree was left unchanged. The temporary `maddy.conf` exposed:
 
-- A global `hostname mx.local` and **`tls off`** (so listeners run without certificates during observation; `tls off` is accepted — config.go:L50).
+- A global `hostname mx.local` and **`tls off`** (so listeners run without certificates during observation; `tls off` is accepted — internal/config/tls_server.go:L18-L23, registered globally at maddy.go:L249).
 - A `sql` module providing **both** storage (`local_mailboxes`) and authentication (`local_authdb`) over SQLite, with `local_domains = local`.
 - An **unauthenticated `smtp` listener** on `tcp://0.0.0.0:2525` (a documented high port) that delivers local recipients to `&local_mailboxes`. It intentionally omits the shipped inbound checks (`require_mx_record`, `apply_spf`, `verify_dkim`, `dmarc`) so a crafted, **non–dot-stuffed** DATA payload reaches the body reader unaltered. *(Used for Q1.)*
 - An **authenticated `submission` listener** on `tcp://0.0.0.0:587` with `auth &local_authdb`, **`insecure_auth`** (so `AUTH PLAIN` is allowed without TLS during observation — smtp.go:L564), and the shipped source-routing preserved (`source local { … } default_source { reject 501 5.1.8 "Non-local sender domain" }`). *(Used for Q2.)*
