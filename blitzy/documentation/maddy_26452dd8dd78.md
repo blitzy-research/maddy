@@ -30,7 +30,7 @@ Both binaries compiled with **EXIT 0**. `maddy -v` reported `maddy unknown (buil
 
 ### 1.3 Throwaway runtime configuration (authored OUTSIDE the repo)
 
-A throwaway `maddy.conf` was authored under `/tmp/maddy-investigation/` (never inside the repo tree) that mirrors the shipped semantics of the repository's [`maddy.conf`](#) so the findings transfer to the default deployment. The shipped config uses `example.org`; the test config used the local test domain `maddytest.local` — a faithful mirror.
+A throwaway `maddy.conf` was authored under `/tmp/maddy-investigation/` (never inside the repo tree) that mirrors the shipped semantics of the repository's `maddy.conf` so the findings transfer to the default deployment. The shipped config uses `example.org`; the test config used the local test domain `maddytest.local` — a faithful mirror.
 
 - `$(hostname)=mail.maddytest.local`; `$(primary_domain)=$(local_domains)=maddytest.local`.
 - `sql local_mailboxes local_authdb { driver sqlite3; dsn /tmp/maddy-investigation/run/all.db }` — one SQLite database serves as **both** the mailbox store and the credentials store, mirroring `maddy.conf` [maddy.conf:L32-L35].
@@ -312,7 +312,13 @@ err=dkim: key syntax error: x509: failed to parse public key (use ParsePKCS1Publ
 
 The published-key prefix confirms the format: the `p=` value begins `MIIBCgKCAQEA…` (PKCS#1 `RSAPublicKey`), whereas a PKIX key would begin `MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A…` (see the `.dns` record in [Section 1.4](#14-accounts-and-dkim-key)). `dkimpy` also returns `verify=False` on the published artifacts as corroboration; note that modern python-`cryptography` can auto-parse PKCS#1, so dkimpy's failure is not *solely* attributable to the key — the code-attributable smoking gun is the go-msgauth error above.
 
-- **Evidence-handling caveat (stated precisely so it is not mis-stated).** The signature does **not** byte-verify against the *stored* mailbox copy (or an `smtp_downstream`-relayed copy) even with a format-corrected key (`crypto/rsa: verification error`), because `go-message` re-serializes the message *after* signing — for example, header field-name case is canonicalized (`DKIM-Signature` → `Dkim-Signature`, `Message-ID` → `Message-Id`, both visible in the E3 stored headers). This is an **inspection artifact, not an additional signing bug**: the pure round-trip in b-1 proves the signature itself is valid. To verify a maddy DKIM signature one needs the exact as-signed bytes **and** a PKIX-corrected key.
+- **Evidence-handling caveat (stated precisely so it is not mis-stated).** The signature does **not** byte-verify against the *stored* mailbox copy (or an `smtp_downstream`-relayed copy) even with a format-corrected key, because `go-message` re-serializes the message *after* signing. The verbatim error returned by this stored-copy verification attempt is:
+
+```
+crypto/rsa: verification error
+```
+
+The re-serialization canonicalizes, for example, header field-name case (`DKIM-Signature` → `Dkim-Signature`, `Message-ID` → `Message-Id`, both visible in the E3 stored headers). This is an **inspection artifact, not an additional signing bug**: the pure round-trip in b-1 proves the signature itself is valid. To verify a maddy DKIM signature one needs the exact as-signed bytes **and** a PKIX-corrected key.
 
 **Net.** maddy's default `sign_dkim` output is **unverifiable by standard verifiers and by maddy's own `verify_dkim`**, despite the signature being cryptographically sound, because the *published key* is encoded in PKCS#1 where PKIX is expected.
 
