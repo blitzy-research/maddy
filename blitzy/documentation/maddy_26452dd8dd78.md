@@ -16,7 +16,7 @@ The goal was to determine **empirically** — not from documentation or assumpti
 
 maddy was compiled directly from this repository. The default storage/auth backend is SQLite via the cgo driver `github.com/mattn/go-sqlite3` [go.mod], so `CGO_ENABLED=1` is mandatory — without a C compiler the build fails.
 
-- **Toolchain:** go1.20.14 linux/amd64; gcc 13.3.0; openssl 3.0.13; python3 3.12.3.
+- **Toolchain:** go1.18.10 linux/amd64; gcc 15.2.0; openssl 3.5.3; python3 3.13.7.
 - **Module:** `github.com/foxcpp/maddy`; floor `go 1.13` [go.mod].
 - **Build commands** (output to an out-of-repo bin directory):
 
@@ -40,7 +40,7 @@ A throwaway `maddy.conf` was authored under `/tmp/maddy-investigation/` (never i
 
 ### 1.4 Accounts and DKIM key
 
-Two accounts were provisioned in the one local domain via `maddyctl` (`internal/storage/sql/maddyctl.go` — `CreateUser` [internal/storage/sql/maddyctl.go:L17]; CLI entry `cmd/maddyctl/users.go` — `usersCreate` [cmd/maddyctl/users.go:L30]). `maddyctl ... creds list` confirmed:
+Two accounts were provisioned in the one local domain via `maddyctl` (`internal/storage/sql/maddyctl.go` — `CreateUser` [internal/storage/sql/maddyctl.go:L17]; CLI entry `cmd/maddyctl/users.go` — `usersCreate` [cmd/maddyctl/users.go:L30]). `maddyctl ... users list` confirmed:
 
 ```
 usera@maddytest.local
