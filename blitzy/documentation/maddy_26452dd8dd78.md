@@ -12,8 +12,9 @@ rationale ("why it is built this way") is taken from the source comments themsel
 The runtime evidence in the appendix was produced by compiling the tree with `go1.23.12`
 (the repository declares a minimum of `go 1.13` [go.mod:L3]) and running the resulting
 binary against throwaway configurations; the captured `-debug` logs are reproduced
-verbatim. Code is the single source of truth here — nothing below is generic mail-server
-lore.
+verbatim, with only the absolute temporary directory rewritten to a `<tmp>` placeholder
+(and trailing whitespace trimmed). Code is the single source of truth here — nothing below
+is generic mail-server lore.
 
 **The six questions:**
 
@@ -77,11 +78,11 @@ populated only after the configuration file has been parsed.
 
 | | Constructor registry | Instance registry |
 |---|---|---|
-| **File** | `internal/module/registry.go` [L7-L11] | `internal/module/instances.go` [L9-L17] |
+| **File** | `internal/module/registry.go` [internal/module/registry.go:L7-L11] | `internal/module/instances.go` [internal/module/instances.go:L9-L17] |
 | **Holds** | module *types* (factory funcs) | configured *blocks* (live objects) |
 | **Populated** | eagerly, at package `init()` (import time) [maddy.go:L20-L38] | at config parse time, via `RegisterInstance` [maddy.go:L338] |
 | **Keyed by** | module name (`smtp`, `sql`, `dummy`, …) | instance name (`local_authdb`, `remote_queue`, …) |
-| **`Init` called?** | n/a (factories, not instances) | lazily, on first `&`-reference [instances.go:L70] |
+| **`Init` called?** | n/a (factories, not instances) | lazily, on first `&`-reference [internal/module/instances.go:L70] |
 | **Answers** | "what module types exist?" | "which config blocks exist?" |
 
 Keep these separate and the rest of the bootstrap reads cleanly.
@@ -102,11 +103,16 @@ constructor [internal/endpoint/smtp/smtp.go:L715-L717] and the IMAP package regi
 
 **Step 1 — the entire config is parsed first.** `parser.Read` returns the whole expanded
 configuration `Node` tree *before any module logic runs*: it calls `readTree`, then
-`expandEnvironment`, and returns the full `[]Node` [pkg/cfgparser/parse.go:L294-L298]. Each
-`Node` carries `Name`, `Args`, `Children`, `File`, and `Line`, plus `Snippet`/`Macro`
-flags that are "Always false for all nodes returned from Read because snippets are expanded
-before it returns" [pkg/cfgparser/parse.go:L18-L43]. The configuration type used everywhere
-else is just a type alias of the parser node — `type ( Node = parser.Node )`
+`expandEnvironment` [pkg/cfgparser/env.go:L9-L29], and returns the full `[]Node`
+[pkg/cfgparser/parse.go:L294-L298]. Each `Node` carries `Name`, `Args`, `Children`, `File`,
+and `Line`, plus `Snippet`/`Macro` flags that are "Always false for all nodes returned from
+Read because snippets are expanded before it returns" [pkg/cfgparser/parse.go:L18-L43].
+Includes pulled in by the `import` directive are likewise resolved during this parse, before
+any module logic runs [pkg/cfgparser/imports.go:L10]. The full textual syntax these nodes
+come from — directives with arguments, `{`-enclosed blocks, snippets, imports, and
+environment variables — is specified in the configuration man page
+[docs/man/maddy-config.5.scd:L5-L6; docs/man/maddy-config.5.scd:L38-L41]. The configuration
+type used everywhere else is just a type alias of the parser node — `type ( Node = parser.Node )`
 [internal/config/config.go:L9-L11].
 
 > **Key structural fact:** at parse time, `&something` is nothing more than a string sitting
@@ -115,9 +121,9 @@ else is just a type alias of the parser node — `type ( Node = parser.Node )`
 
 **Step 2 — `moduleMain` drives startup.** `Run` opens and parses the config
 [maddy.go:L150] and then calls `moduleMain(cfg)` [maddy.go:L157]. `moduleMain`
-[maddy.go:L243] processes global directives (state/runtime dirs, hostname, `tls`, `log`,
-`debug`, …) and then hands the unknown (non-global) blocks to `instancesFromConfig`
-[maddy.go:L267].
+[maddy.go:L243] processes global directives (state/runtime dirs, hostname, `tls`, the `log`
+output matcher [config.go:L25-L34], `debug`, …) and then hands the unknown (non-global)
+blocks to `instancesFromConfig` [maddy.go:L267].
 
 **Step 3 — the two-pass bootstrap in `instancesFromConfig`** [maddy.go:L294-L375]:
 
@@ -152,29 +158,29 @@ else is just a type alias of the parser node — `type ( Node = parser.Node )`
 The whole flow, documenting *existing* behavior (not a change to make):
 
 ```
-init() of imported module packages              [maddy.go:L20-L38]
+init() of imported module packages               [maddy.go:L20-L38]
   └─> Register / RegisterEndpoint populate the
-      modules & endpoints constructor maps        [registry.go:L7-L65]
+      modules & endpoints constructor maps       [internal/module/registry.go:L7-L65]
 
-parser.Read builds the full Node tree            [parse.go:L294-L298]
-  └─> moduleMain ─> instancesFromConfig           [maddy.go:L243, L294]
+parser.Read builds the full Node tree            [pkg/cfgparser/parse.go:L294-L298]
+  └─> moduleMain ─> instancesFromConfig          [maddy.go:L243; maddy.go:L294]
 
-      Pass 1: construct every top-level block      [maddy.go:L300-L346]
+      Pass 1: construct every top-level block    [maddy.go:L300-L346]
         • endpoints: GetEndpoint + factory,
-          appended to slice, NO RegisterInstance   [maddy.go:L312-L321]
+          appended to slice, NO RegisterInstance [maddy.go:L312-L321]
         • regular:   factory + RegisterInstance,
-          constructed but NOT Init'd               [maddy.go:L323-L345]
+          constructed but NOT Init'd             [maddy.go:L323-L345]
 
-      Reject if zero endpoints                     [maddy.go:L348-L350]
+      Reject if zero endpoints                   [maddy.go:L348-L350]
 
-      Pass 2: eager endp.Init for every endpoint   [maddy.go:L352-L356]
+      Pass 2: eager endp.Init for every endpoint [maddy.go:L352-L356]
         └─> endpoint Init builds pipeline,
-            resolves & via GetInstance             [modconfig.go:L54-L93]
+            resolves & via GetInstance           [internal/config/module/modconfig.go:L54-L93]
         └─> GetInstance lazily Init's regular
-            modules, at most once, breaks cycles    [instances.go:L53-L75]
+            modules, at most once, breaks cycles [internal/module/instances.go:L53-L75]
 
       Guard: every regular instance Initialized?
-        else "Unused configuration block"          [maddy.go:L358-L365]
+        else "Unused configuration block"        [maddy.go:L358-L365]
 
   └─> endpoints listening ─> the graph has settled
 ```
@@ -474,7 +480,7 @@ temporary files have since been deleted — nothing was ever written into the Ma
 tree:
 
 - The server was built to a temp path with CGO disabled:
-  `CGO_ENABLED=0 go build -o /tmp/maddy ./cmd/maddy`, using **go1.23.12** (the repository's
+  `CGO_ENABLED=0 go build -o <tmp>/maddy ./cmd/maddy`, using **go1.23.12** (the repository's
   declared minimum is `go 1.13` [go.mod:L3]).
 - Because CGO was disabled, the SQLite-backed `sql` storage module was not exercised; the
   CGO-free `dummy` module — which "implements AuthProvider and DeliveryTarget interfaces but
@@ -491,14 +497,15 @@ tree:
 The throwaway config declared two endpoints (`smtp` and `submission`), a nested `check{}`
 containing `require_mx_record`, and `deliver_to &remote_target` — where the `dummy
 remote_target` and `dummy local_authdb` blocks were declared **after** the endpoints that
-reference them (the out-of-order case). Run with `maddy -debug -log stderr`:
+reference them (the out-of-order case). Run with
+`maddy -debug -config <tmp>/success.conf -log stderr`:
 
 ```
-[debug] /tmp/.../success.conf:10: new module require_mx_record []
-[debug] /tmp/.../success.conf:12: reference &remote_target
+[debug] <tmp>/success.conf:17: new module require_mx_record []
+[debug] <tmp>/success.conf:19: reference &remote_target
 smtp: listening on tcp://127.0.0.1:10025
-[debug] /tmp/.../success.conf:18: reference &local_authdb
-[debug] /tmp/.../success.conf:20: reference &remote_target
+[debug] <tmp>/success.conf:26: reference &local_authdb
+[debug] <tmp>/success.conf:27: reference &remote_target
 [debug] submission: authentication provider: dummy local_authdb
 submission: listening on tcp://127.0.0.1:10587
 signal received (terminated), next signal will force immediate shutdown.
@@ -508,9 +515,10 @@ Mapping each line to verified source:
 
 | Log line | What it proves | Source |
 |---|---|---|
-| `new module require_mx_record []` | inline construction of a check with no args (the *inline* path) | [internal/config/module/modconfig.go:L70] |
-| `reference &remote_target` (config line 12) | an `&`-reference resolving **even though `remote_target` is declared later in the file** — out-of-order forward reference (Q3) | [internal/config/module/modconfig.go:L68] |
-| `reference &local_authdb` (config line 18) | resolution of an auth provider also declared after the endpoint | [internal/config/module/modconfig.go:L68] |
+| `new module require_mx_record []` (config line 17) | inline construction of a check with no args (the *inline* path) | [internal/config/module/modconfig.go:L70] |
+| `reference &remote_target` (config line 19) | an `&`-reference resolving **even though `remote_target` is declared later in the file** — out-of-order forward reference (Q3) | [internal/config/module/modconfig.go:L68] |
+| `reference &local_authdb` (config line 26) | resolution of an auth provider also declared after the endpoint | [internal/config/module/modconfig.go:L68] |
+| `reference &remote_target` (config line 27) | the `submission` endpoint resolving the *same* forward target — the lazy engine returns the already-initialized instance, not a second copy | [internal/config/module/modconfig.go:L68; internal/module/instances.go:L64-L67] |
 | `submission: authentication provider: dummy local_authdb` | the resolved auth provider attached to the endpoint | [internal/endpoint/smtp/smtp.go:L510] |
 | `smtp: listening on …` and `submission: listening on …` | **both** endpoints reached their listeners → the graph settled for a mixed-endpoint config (Q1) | [internal/endpoint/smtp/smtp.go:L619] |
 
@@ -520,23 +528,24 @@ two endpoint kinds assembled completely and the forward references resolved.
 ### Failure path — the unused-block guard
 
 The second throwaway config added a top-level `dummy orphan_block` that **nothing
-references**, alongside a valid `smtp` endpoint (so the "at least one endpoint should be
-configured" check [maddy.go:L348-L350] passes and execution actually reaches the guard).
-Run the same way, `maddy` exited with code **2**:
+references**, alongside a valid `smtp` endpoint whose `deliver_to &delivery_target` resolves
+normally (so the "at least one endpoint should be configured" check [maddy.go:L348-L350]
+passes and execution actually reaches the guard). Run the same way, `maddy` exited with
+code **2**:
 
 ```
-[debug] /tmp/.../unused_block.conf:12: reference &inline_target
+[debug] <tmp>/unused_block.conf:13: reference &delivery_target
 smtp: listening on tcp://127.0.0.1:10026
-Unused configuration block at /tmp/.../unused_block.conf:7 - orphan_block (dummy)
+Unused configuration block at <tmp>/unused_block.conf:9 - orphan_block (dummy)
 ```
 
 Mapping to source:
 
 | Log line | What it proves | Source |
 |---|---|---|
-| `reference &inline_target` | the endpoint's referenced target resolved normally | [internal/config/module/modconfig.go:L68] |
+| `reference &delivery_target` (config line 13) | the endpoint's referenced target resolved normally | [internal/config/module/modconfig.go:L68] |
 | `smtp: listening on …` | the endpoint bound — so the failure is *not* an endpoint error | [internal/endpoint/smtp/smtp.go:L619] |
-| `Unused configuration block at …:7 - orphan_block (dummy)` | the guard tripped because `module.Initialized["orphan_block"]` was false; the message is the exact format string `"Unused configuration block at %s:%d - %s (%s)"` rendered as `file:line - InstanceName (Name)` | [maddy.go:L358-L365] |
+| `Unused configuration block at …:9 - orphan_block (dummy)` | the guard tripped because `module.Initialized["orphan_block"]` was false; the message is the exact format string `"Unused configuration block at %s:%d - %s (%s)"` rendered as `file:line - InstanceName (Name)` | [maddy.go:L358-L365] |
 
 The non-zero exit reflects `Run` returning `2` whenever `moduleMain` reports an error
 [maddy.go:L157-L161]. This is the *active* runtime proof for Q6: Maddy will not start while
@@ -566,4 +575,69 @@ or the process aborts.
 - The graph is proven settled by **reference-resolution logs plus listeners coming up**, and
   guaranteed by the **unused-block guard** that hard-fails startup
   [maddy.go:L358-L365].
+
+
+---
+
+## Quick Citations Index
+
+A consolidated source map of every file this document draws on. All paths are
+repository-relative and every anchor below is also used inline in the body above; open any
+file at the cited line to verify the claim it supports. The 25 references are grouped by
+subsystem.
+
+### Server bootstrap & global configuration
+
+| File | Key anchors | What it establishes |
+|---|---|---|
+| `maddy.go` | L20-L38, L243, L267, L294-L375, L300-L346, L312-L321, L323-L345, L348-L350, L352-L356, L358-L365 | Entrypoint; side-effect imports that trigger constructor registration; `moduleMain`; the two-pass `instancesFromConfig` bootstrap (construct-all then eager-endpoint-`Init`); the unused-block startup guard. |
+| `config.go` | L25-L34 | Package-`maddy` config matcher (`logOutput`) for the `log` global directive consumed during global-directive processing. |
+
+### Module registration & lifecycle (`internal/module/`)
+
+| File | Key anchors | What it establishes |
+|---|---|---|
+| `internal/module/registry.go` | L7-L11, L18, L19-L28, L45-L65 | The *constructor* registry: `modules`/`endpoints` maps under one `RWMutex`; `Register`/`RegisterEndpoint` panic on duplicate names; "call from `func init()`". |
+| `internal/module/instances.go` | L9-L17, L23-L28, L53-L75, L64-L67, L69-L70 | The *instance* registry (`instances`/`aliases`/`Initialized`); `RegisterInstance`; `GetInstance`, the lazy at-most-once init engine that sets `Initialized` before `Init` to break cycles. |
+| `internal/module/module.go` | L30-L35, L57, L59-L71 | The `Module` interface and the decoupled-`Init` rationale; `FuncNewModule` vs. the `FuncNewEndpoint` endpoint contract. |
+| `internal/module/dummy.go` | L11-L12, L57 | The CGO-free `dummy` module (no-op `AuthProvider` + `DeliveryTarget`), used as the runtime-evidence auth/delivery target. |
+| `internal/module/check.go` | L14, L38 | The `Check` / `CheckState` interface contract. |
+| `internal/module/modifier.go` | L22, L26, L32 | The `Modifier` / `ModifierState` interface; "Calls on ModifierState are always strictly ordered." |
+| `internal/module/delivery_target.go` | L13, L22 | The `DeliveryTarget` / `Delivery` interface contract. |
+
+### Configuration parsing & `&`-reference resolution
+
+| File | Key anchors | What it establishes |
+|---|---|---|
+| `pkg/cfgparser/parse.go` | L18-L43, L294-L298 | The `Node` struct and `Read`, which returns the fully expanded node tree before any module logic runs. |
+| `pkg/cfgparser/imports.go` | L10 | `expandImports` — resolution of `import` includes during the parse. |
+| `pkg/cfgparser/env.go` | L9-L29 | `expandEnvironment` — environment-variable expansion called by `Read`. |
+| `internal/config/config.go` | L9-L11 | `config.Node` is a type alias of the parser node (`type ( Node = parser.Node )`). |
+| `internal/config/module/modconfig.go` | L54-L93, L59, L67-L68, L70-L71 | `ModuleFromNode`: the `&`-reference path (`GetInstance` + "reference" log) vs. the inline path ("new module" log + `createInlineModule`). |
+| `internal/config/tls_server.go` | L22 | The `tls off` option (`case "off"`) used to avoid certificate setup during runtime observation. |
+
+### Message pipeline — check/modifier coordination
+
+| File | Key anchors | What it establishes |
+|---|---|---|
+| `internal/msgpipeline/msgpipeline.go` | L34, L155 | Two-level source-then-destination routing through the pipeline. |
+| `internal/msgpipeline/config.go` | L17-L23, L25, L31-L32, L33, L43, L44, L54, L55 | Positional parsing of nested `check{}`/`modify{}`/`source` blocks into ordered `globalChecks`/`globalModifiers` groups. |
+| `internal/msgpipeline/check_runner.go` | L142, L144-L145, L149, L153, L161, L198 | Parallel check execution: a goroutine per check, results merged under `sync.Mutex`, first decision via `sync.Once`, joined on a `sync.WaitGroup`. |
+| `internal/modify/group.go` | L11-L24, L24 | The modifier `Group` that "runs them serially" — the ordered modifier chain. |
+
+### Endpoint modules
+
+| File | Key anchors | What it establishes |
+|---|---|---|
+| `internal/endpoint/smtp/smtp.go` | L488, L500, L510, L580, L619, L715-L717 | SMTP/submission/LMTP endpoint: `New`, `Init`, the auth-provider and `listening on` debug lines, `msgpipeline.New`, and `RegisterEndpoint` for all three personalities. |
+| `internal/endpoint/imap/imap.go` | L44, L53, L221 | IMAP endpoint: `New`, `Init`, and `RegisterEndpoint("imap", …)` — the same endpoint code path as SMTP. |
+
+### Documentation & worked-example references
+
+| File | Key anchors | What it establishes |
+|---|---|---|
+| `HACKING.md` | L54-L62, L60-L62, L113-L118 | Developer narrative: the `&` instances registry and lazy init, the special `smtp`/`imap` init path, and the parallel-checks / phase-ordering semantics. |
+| `maddy.conf` | L32, L53, L54-L66, L93, L98-L100, L111, L122, L149, L149-L152 | The worked mixed-endpoint, out-of-order example: `sql` instances, `smtp`/`submission`/`imap` endpoints, nested `check{}`/`modify{}`, and forward `&` references. |
+| `docs/man/maddy-config.5.scd` | L5-L6, L38-L41 | The config-syntax man page: newline-delimited directives with arguments and `{`-enclosed sub-directive blocks. |
+| `go.mod` | L1, L3 | Module identity (`github.com/foxcpp/maddy`) and the declared minimum toolchain (`go 1.13`). |
 
