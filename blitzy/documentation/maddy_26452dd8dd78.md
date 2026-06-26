@@ -74,7 +74,7 @@ sets `Debug: *debugLog` [internal/testutils/logger.go:39] from the `-test.debugl
 > MUST be placed **after** the package path (`... ./internal/target/queue/ -test.debuglog`),
 > or passed via `-args -test.debuglog`, or you can `cd` into the package directory first.
 
-> **Per-run variation.** Three things legitimately differ between runs and are **not** part
+> **Per-run variation.** Four things legitimately differ between runs and are **not** part
 > of the stable answer: (1) the SMTP `msg_id` is a fresh random 8-char hex value each run;
 > (2) the queue `next_try_delay` is a near-zero, possibly slightly-negative duration (a
 > timing artifact of the test's zero retry interval); (3) the precise *interleaving* of the
@@ -82,7 +82,11 @@ sets `Debug: *debugLog` [internal/testutils/logger.go:39] from the `-test.debugl
 > `delivery semaphore acquired`) relative to surrounding output could in principle shift with
 > goroutine scheduling — though their **presence** is deterministic, as is the unconditional
 > `failures: …` summary line emitted after every delivery attempt
-> [internal/target/queue/queue.go:370-371]. The required answer lines themselves are deterministic. The verbatim
+> [internal/target/queue/queue.go:370-371]; and (4) the **relative order of the two
+> `delivery attempt failed` lines**, which are emitted by ranging over a Go map
+> [internal/target/queue/queue.go:383] and therefore may swap between runs (see R2). Each
+> required answer line's **content and field set is deterministic** — only the relative order
+> of those two per-recipient failure lines is not. The verbatim
 > blocks below are the captured ground truth; an independent re-run confirmed every required
 > line (see the closing "Reproduction confirmation" note).
 
@@ -278,6 +282,20 @@ queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1
 [debug] queue: removed message from disk	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
 ```
 
+> **Ordering caveat (the two per-recipient failure lines).** The two `delivery attempt
+> failed` lines above are emitted by ranging over a Go **map**
+> (`for rcpt, rcptErr := range partialErr.Errs`) [internal/target/queue/queue.go:383], and Go
+> randomizes map-iteration order — so their **relative order is not guaranteed** and may swap
+> from run to run. The block above is one real captured run (it happens to show
+> `tester1@example.org` before `tester2@example.org`); other runs emit the same two lines in
+> the opposite order, and both orders were observed across repeated runs at this commit. What
+> **is** stable is: (a) the higher-level sequence — `delivery attempt #1` → the `failures: …`
+> summary → the two `delivery attempt failed` lines (in *either* order) → `will retry`;
+> (b) each failure line's message and field set (`msg_id`, `rcpt`, `reason`); and (c) the
+> `failures: …` summary line's own key ordering, which stays alphabetical because Go's `fmt`
+> sorts map keys when rendering `%v` [internal/target/queue/queue.go:370-371]. Only the raw
+> `range` at [internal/target/queue/queue.go:383] is unordered.
+
 ### The three required lines
 
 - **Delivery attempt (debug-gated):**
@@ -301,8 +319,13 @@ queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1
   `exterrors.WithTemporary(errors.New("you shall not pass"), true)`, which carries **no**
   structured fields, so the field set is **exactly** `msg_id`, `rcpt`, `reason` — there are no
   error-specific extras (e.g. no `smtp_code`). `reason` is injected by `Error()` from
-  `err.Error()` [internal/log/log.go:96-99]. Both recipients fail, so the line appears
-  **twice** (once for `tester1@example.org`, once for `tester2@example.org`).
+  `err.Error()` [internal/log/log.go:96-99]. Both recipients fail, so this line appears
+  **exactly twice** — once for `tester1@example.org` and once for `tester2@example.org`, with
+  an **identical field set** on each. Their **relative order is not deterministic**: the loop
+  ranges over a Go map (`for rcpt, rcptErr := range partialErr.Errs`)
+  [internal/target/queue/queue.go:383], and Go randomizes map iteration, so the two lines may
+  appear in either order from one run to the next (both orders were observed across repeated
+  runs at this commit).
 
 - **Retry scheduling:**
 
@@ -345,8 +368,21 @@ completes and before the per-recipient `delivered` / `delivery attempt failed` l
 `delivery semaphore acquired`) are emitted on every dispatch
 [internal/target/queue/queue.go:282, :299], so their **presence** on both attempts is
 deterministic too; only their precise *interleaving* with other concurrent goroutine output
-could in principle shift under different goroutine scheduling. Across repeated runs at this
-commit the entire sequence above reproduced identically.
+could in principle shift under different goroutine scheduling.
+
+One deliberate exception to "identical reproduction" must be called out: the **relative order
+of the two `delivery attempt failed` lines is not stable**. They are emitted by ranging over a
+Go map (`for rcpt, rcptErr := range partialErr.Errs`)
+[internal/target/queue/queue.go:383], and Go randomizes map iteration, so across runs the two
+lines may appear as `tester1` → `tester2` or `tester2` → `tester1` (both orders were observed
+at this commit). Everything else reproduces identically: each required line's message and
+field set, the higher-level sequence (`delivery attempt #1` → `failures: …` summary → the two
+`delivery attempt failed` lines, in either order → `will retry`), and — notably — the
+`failures: …` summary line's own key ordering, which stays alphabetical because Go's `fmt`
+sorts map keys when rendering `%v` [internal/target/queue/queue.go:370-371] (unlike the raw
+`range` at [internal/target/queue/queue.go:383]). In short, the *stable required lines and
+their field sets* reproduce identically; only the *relative order of the two per-recipient
+failure lines* is non-deterministic.
 
 ---
 
@@ -530,6 +566,7 @@ possibly slightly-negative duration under the test's zero-delay override.
 | `delivery attempt #N` (debug-gated) | internal/target/queue/queue.go:367 |
 | `delivered` (field `attempt`) | internal/target/queue/queue.go:378 |
 | `delivery attempt failed` (via `Error`) | internal/target/queue/queue.go:384 |
+| Per-recipient failure lines emitted by `range` over a map (relative order **not** guaranteed) | internal/target/queue/queue.go:383 |
 | `will retry` (`attempts_count`, `next_try_delay`, `rcpts`) | internal/target/queue/queue.go:415-418 |
 | Backoff formula + defaults (`15m`, `2`) | internal/target/queue/queue.go:121-122, :185-186 |
 | Test retry override (`0`, `1`) | internal/target/queue/queue_test.go:50-51 |
@@ -557,12 +594,18 @@ per-run variation:
 - **R1** — same line structure and field sets; the random 8-char `msg_id` values differed
   (e.g. `3a5eda68`, `2b4c0bf4`, `7ffcbadb`), confirming the 8-char lowercase-hex format.
 - **R2 / R4** — identical deterministic 40-char `msg_id`
-  (`af8090c7eb39f761862b1f027b4f2b0bb1ce86d1`); the **entire ordered sequence above reproduced
-  identically**, including the second-attempt semaphore lines and the unconditional
+  (`af8090c7eb39f761862b1f027b4f2b0bb1ce86d1`); every **required line and field set** above
+  reproduced identically, including the second-attempt semaphore lines and the unconditional
   `failures: permanently: [], temporary: [], errors: map[]` summary line
-  [internal/target/queue/queue.go:370-371]. The only run-dependent detail is the
-  `next_try_delay` timing artifact, which came out as a different near-zero negative value
-  (`"-806ns"` vs the captured `"-1.132µs"`).
+  [internal/target/queue/queue.go:370-371]. Two details are legitimately run-dependent and are
+  **not** asserted as a fixed value: (i) the `next_try_delay` timing artifact, which came out
+  as a different near-zero negative value (`"-806ns"` vs the captured `"-1.132µs"`); and
+  (ii) the **relative order of the two `delivery attempt failed` lines**, which is emitted by
+  ranging over a Go map [internal/target/queue/queue.go:383] — across repeated `-count=1`
+  re-runs at this commit the pair appeared in **both** orders (`tester1` → `tester2` and
+  `tester2` → `tester1`), confirming the order is not a stable contract. The higher-level
+  sequence (`delivery attempt #1` → `failures: …` summary → the two failure lines in either
+  order → `will retry`) and each line's field set are stable.
 - **R3** — the TLS-fallback line and the MX-authenticity error fields (including the verbatim
   "estabilish" message and `smtp_enchcode:[5 4 0]`) matched exactly, with the same
   deterministic 40-char `msg_id` (`2176ec5872ed2b87d832b4070e88232bd94ac7d3`).
