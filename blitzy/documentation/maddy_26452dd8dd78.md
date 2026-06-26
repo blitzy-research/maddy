@@ -34,11 +34,27 @@ go build ./...
 
 **Per-cluster test commands (verified):**
 
-| Cluster | Command |
-|---------|---------|
-| R1 — SMTP endpoint logging | `go test -v -run 'TestSMTPDelivery$\|TestSMTPDelivery_AbortData\|TestSMTPDelivery_AbortLogout' ./internal/endpoint/smtp/` |
-| R2 / R4 — Queue trace & retry | `go test -v -run 'TestQueueDelivery_TemporaryFail$' ./internal/target/queue/ -test.debuglog` |
-| R3 — Remote MX-auth & TLS fallback | `go test -v -run 'TestRemoteDelivery_AuthMX_Fail$\|TestRemoteDelivery_TLSErrFallback$' ./internal/target/remote/` |
+Each command is shown in its own fenced block so the literal `|` regex alternation is
+copy-paste-safe (inside a Markdown table the pipes would have to be backslash-escaped, and
+those escaped pipes select no tests when copied verbatim from the raw source).
+
+*R1 — SMTP endpoint logging:*
+
+```
+go test -v -run 'TestSMTPDelivery$|TestSMTPDelivery_AbortData|TestSMTPDelivery_AbortLogout' ./internal/endpoint/smtp/
+```
+
+*R2 / R4 — Queue trace & retry:*
+
+```
+go test -v -run 'TestQueueDelivery_TemporaryFail$' ./internal/target/queue/ -test.debuglog
+```
+
+*R3 — Remote MX-auth & TLS fallback:*
+
+```
+go test -v -run 'TestRemoteDelivery_AuthMX_Fail$|TestRemoteDelivery_TLSErrFallback$' ./internal/target/remote/
+```
 
 **Why `-v` is mandatory.** The test logger `testutils.Logger(t, name)` routes every log
 line to `t.Log` [internal/testutils/logger.go:28-34]. Go only prints `t.Log` output when
@@ -61,9 +77,12 @@ sets `Debug: *debugLog` [internal/testutils/logger.go:39] from the `-test.debugl
 > **Per-run variation.** Three things legitimately differ between runs and are **not** part
 > of the stable answer: (1) the SMTP `msg_id` is a fresh random 8-char hex value each run;
 > (2) the queue `next_try_delay` is a near-zero, possibly slightly-negative duration (a
-> timing artifact of the test's zero retry interval); (3) the exact set/order of the
-> surrounding `[debug]` queue lines on the *retry* attempt can vary slightly because of
-> goroutine scheduling. The required answer lines themselves are deterministic. The verbatim
+> timing artifact of the test's zero retry interval); (3) the precise *interleaving* of the
+> concurrency-related `[debug]` semaphore lines (`waiting on delivery semaphore` /
+> `delivery semaphore acquired`) relative to surrounding output could in principle shift with
+> goroutine scheduling — though their **presence** is deterministic, as is the unconditional
+> `failures: …` summary line emitted after every delivery attempt
+> [internal/target/queue/queue.go:370-371]. The required answer lines themselves are deterministic. The verbatim
 > blocks below are the captured ground truth; an independent re-run confirmed every required
 > line (see the closing "Reproduction confirmation" note).
 
@@ -244,6 +263,8 @@ queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86
 queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org","reason":"you shall not pass"}
 queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-1.132µs","rcpts":["tester1@example.org","tester2@example.org"]}
 [debug] queue: starting delivery for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1
+[debug] queue: waiting on delivery semaphore for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1
+[debug] queue: delivery semaphore acquired for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1
 [debug] queue: delivery attempt #2	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
 [debug] queue: using message ID = af8090c7eb39f761862b1f027b4f2b0bb1ce86d1-2	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
 [debug] queue: target.Start OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
@@ -251,6 +272,7 @@ queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0b
 [debug] queue: delivery.AddRcpt tester2@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
 [debug] queue: delivery.Body OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
 [debug] queue: delivery.Commit OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+[debug] queue: failures: permanently: [], temporary: [], errors: map[]	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
 queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org"}
 queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org"}
 [debug] queue: removed message from disk	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
@@ -308,9 +330,23 @@ carries `msg_id` because the queue uses a `DeliveryLogger`
 [internal/target/delivery.go:8-16]. `attempts_count` and (on the success tail) `attempt` are
 **numbers**, not strings, because they are passed as integers and `orderedjson` does not
 quote numeric values. The successful retry tail logs `delivered` with `attempt: 2`
-[internal/target/queue/queue.go:378] and finally `removed message from disk`. (The exact set
-and ordering of the surrounding `[debug]` semaphore lines on the *second* attempt can vary
-between runs due to goroutine scheduling; the three required lines above are deterministic.)
+[internal/target/queue/queue.go:378] and finally `removed message from disk`.
+
+Two debug lines on the success path are **source-deterministic**, not scheduling artifacts, and
+are an integral part of the stable ordered sequence above. First, immediately after each
+delivery attempt returns, `tryDelivery` **unconditionally** logs a failures summary via
+`dl.Debugf("failures: permanently: %v, temporary: %v, errors: %v", …)`
+[internal/target/queue/queue.go:370-371]: on the first (failed) attempt it lists both
+temporarily-failed recipients and their errors, and on the second (successful) attempt it shows
+empty containers — `failures: permanently: [], temporary: [], errors: map[]`. Because it is
+emitted on **every** attempt with no guard, this line always appears — right after the attempt
+completes and before the per-recipient `delivered` / `delivery attempt failed` lines — whenever
+`-test.debuglog` is on. Second, the semaphore lines (`waiting on delivery semaphore`,
+`delivery semaphore acquired`) are emitted on every dispatch
+[internal/target/queue/queue.go:282, :299], so their **presence** on both attempts is
+deterministic too; only their precise *interleaving* with other concurrent goroutine output
+could in principle shift under different goroutine scheduling. Across repeated runs at this
+commit the entire sequence above reproduced identically.
 
 ---
 
@@ -521,11 +557,12 @@ per-run variation:
 - **R1** — same line structure and field sets; the random 8-char `msg_id` values differed
   (e.g. `3a5eda68`, `2b4c0bf4`, `7ffcbadb`), confirming the 8-char lowercase-hex format.
 - **R2 / R4** — identical deterministic 40-char `msg_id`
-  (`af8090c7eb39f761862b1f027b4f2b0bb1ce86d1`); the three required lines matched exactly; the
-  `next_try_delay` came out as a different near-zero negative value (`"-806ns"` vs the
-  captured `"-1.132µs"`), confirming it is a timing artifact; a couple of additional
-  `[debug]` semaphore lines appeared on the second attempt (goroutine-scheduling
-  nondeterminism).
+  (`af8090c7eb39f761862b1f027b4f2b0bb1ce86d1`); the **entire ordered sequence above reproduced
+  identically**, including the second-attempt semaphore lines and the unconditional
+  `failures: permanently: [], temporary: [], errors: map[]` summary line
+  [internal/target/queue/queue.go:370-371]. The only run-dependent detail is the
+  `next_try_delay` timing artifact, which came out as a different near-zero negative value
+  (`"-806ns"` vs the captured `"-1.132µs"`).
 - **R3** — the TLS-fallback line and the MX-authenticity error fields (including the verbatim
   "estabilish" message and `smtp_enchcode:[5 4 0]`) matched exactly, with the same
   deterministic 40-char `msg_id` (`2176ec5872ed2b87d832b4070e88232bd94ac7d3`).
