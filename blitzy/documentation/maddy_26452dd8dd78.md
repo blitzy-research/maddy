@@ -169,9 +169,16 @@ submission: RCPT error {"reason":"reject directive used","smtp_code":501,"smtp_e
 - **Transcript (verbatim):**
 
 ```
-C: MAIL FROM:<userA@maddytest.local>   S: 250 ...
-C: RCPT TO:<userA@maddytest.local>     S: 250 ...
-C: DATA  S: 354 ...   (From: userA@maddytest.local)   C: .   S: 250 2.0.0 OK: queued
+S: 235 2.0.0 Authentication succeeded
+C: MAIL FROM:<userA@maddytest.local>
+S: 250 2.0.0 Roger, accepting mail from <userA@maddytest.local>
+C: RCPT TO:<userA@maddytest.local>
+S: 250 2.0.0 I'll make sure <userA@maddytest.local> gets this
+C: DATA
+S: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+... (From: userA@maddytest.local) ...
+C: .
+S: 250 2.0.0 OK: queued
 ==== E3 SUMMARY: MAIL=250 RCPT=250 DATA=354 FINAL=250 ====
 ```
 
@@ -208,9 +215,16 @@ Message-ID: <E3.1782503436@client.test>
 - **Transcript (verbatim):**
 
 ```
-C: MAIL FROM:<userA@maddytest.local>   S: 250 ...
-C: RCPT TO:<userA@maddytest.local>     S: 250 ...
-C: DATA  S: 354 ...   (From: someone@other-domain.example)   C: .   S: 250 2.0.0 OK: queued
+S: 235 2.0.0 Authentication succeeded
+C: MAIL FROM:<userA@maddytest.local>
+S: 250 2.0.0 Roger, accepting mail from <userA@maddytest.local>
+C: RCPT TO:<userA@maddytest.local>
+S: 250 2.0.0 I'll make sure <userA@maddytest.local> gets this
+C: DATA
+S: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+... (From: someone@other-domain.example) ...
+C: .
+S: 250 2.0.0 OK: queued
 ==== E4 SUMMARY: MAIL=250 RCPT=250 DATA=354 FINAL=250 ====
 ```
 
