@@ -67,7 +67,9 @@ Two **throwaway** test files (`blitzy_adhoc_offbyone_test.go`, `blitzy_adhoc_ond
 
 ---
 
-## Q1 — With a small `max_tries` pointed at a non-responsive SMTP destination that times out, what is the exact sequence of connection attempts?
+## Question 1 — Connection attempt sequence.
+
+> With a small `max_tries` pointed at a non-responsive SMTP destination that times out, what is the exact sequence of connection attempts?
 
 ### Answer
 
@@ -153,7 +155,7 @@ After attempt **#9** (`TriesCount == 8 == maxTries`) the message gives up. Total
 - Inner MX iteration & per‑MX dial: `internal/target/remote/connect.go:L113-L199` (`L154` loop, `L163` "trying" log, `L164` `Connect`, `L188` continue, `L262` sort, `L155-L160` null MX).
 - Default `max_tries` value: `internal/target/queue/queue.go:L204`; `maddy.conf:L125`.
 
-### Rationale / Thinking
+### Rationale/Thinking
 
 Within a single delivery attempt, the *connection* sequence is "one dial per MX host, in ascending preference order, until one succeeds or all are exhausted." Across attempts, the *delivery* sequence is the `N + 1` message‑level retries scheduled by the time wheel (Q6). The off‑by‑one is not a quirk of interpretation — it is a direct, provable consequence of evaluating `== maxTries` before the increment, and the captured 6‑attempt run makes it concrete. For an operator setting a *small* `max_tries` to fail fast against a dead destination, the practical takeaway is: you will see one more attempt than the number you configured, and each attempt re‑walks the full MX list, each unanswered MX costing a full OS‑level TCP timeout (quantified in Q2).
 
@@ -162,7 +164,9 @@ Within a single delivery attempt, the *connection* sequence is "one dial per MX 
 ---
 
 
-## Q2 — How long does each timeout actually take in real terms?
+## Question 2 — Timeout durations.
+
+> How long does each timeout actually take in real terms?
 
 ### Answer
 
@@ -208,14 +212,16 @@ Because each MX host is dialed **sequentially** and each unresponsive MX blocks 
 - go‑smtp pin: `go.mod:L19`, `go.sum:L60-L61`.
 - Inbound‑only 5 s timeout (do not conflate): `internal/endpoint/smtp/smtp.go:L118,L120,L123`.
 
-### Rationale / Thinking
+### Rationale/Thinking
 
 The key insight is that maddy delegates *all* connect/command timing to the kernel at this commit. That means the answer to "how long does a timeout take?" is not a maddy constant but an OS property: instantaneous for a refused connection (RST), and `tcp_syn_retries`‑bounded (≈127 s on default Linux, measured here at 134 s) for a silently dropped one. RFC 5321 specifies *minimum* client protocol timeouts (e.g. 5 minutes for the initial server greeting and for `MAIL`/`RCPT` replies) that maddy does **not** implement here, simply because the pinned go‑smtp `Client` exposes no fields to set them. The practical consequence — that a single blocked dial can hold a delivery worker for over two minutes with no way to abort sooner — is what makes the concurrency questions (Q7, Q8) matter.
 
 ---
 
 
-## Q3 — What specific log entries mark each retry attempt (fields, timestamp format, error detail)?
+## Question 3 — Retry log entries.
+
+> What specific log entries mark each retry attempt (fields, timestamp format, error detail)?
 
 ### Answer
 
@@ -271,14 +277,16 @@ Observe: the timestamp `2026-06-30T16:33:33.146Z` exactly matches the `2006-01-0
 - Line assembly (msg + tab + JSON): `internal/log/log.go:L138-L148`; name prefix `L181-L182`.
 - Timestamp format & `[debug]` prefix: `internal/log/writer.go:L19,L22,L25`.
 
-### Rationale / Thinking
+### Rationale/Thinking
 
 The retry story is fully reconstructable from the logs alone: count `delivery attempt #N` lines to see how many attempts ran; read `delivery attempt failed` for the per‑recipient `reason`; and read `will retry` for the schedule (`attempts_count` and `next_try_delay`). The structured, single‑line `<ts> [debug] <name>: <msg>\t<json>` format is machine‑parseable (split on the tab, parse the JSON), which is why the empirical captures above could be filtered so cleanly. The one caveat for operators — surfaced empirically — is that on a *pure‑temporary exhaustion* the expected final `not delivered, temporary error` line does **not** appear (Reconciliations §c); the last thing you see for such a message is its final `delivery attempt #N`, after which it is silently removed.
 
 ---
 
 
-## Q4 — Where does the queue store pending messages awaiting retry?
+## Question 4 — Queue storage location.
+
+> Where does the queue store pending messages awaiting retry?
 
 ### Answer
 
@@ -308,14 +316,16 @@ i.e. `/var/lib/maddy/<queue-instance-name>` in general.
 - `StateDirectory` default `/var/lib/maddy`: `maddy.go:L59,L189-L190,L245`.
 - Shipped queue instance name `remote_queue`: `maddy.conf:L122`.
 
-### Rationale / Thinking
+### Rationale/Thinking
 
 The queue is *durable*: messages awaiting retry survive a process restart precisely because they live on disk under `location` rather than in memory (the crash‑recovery path in Q5 repopulates the scheduler from these files at startup). The default lands under the OS‑level state directory `/var/lib/maddy`, consistent with maddy's convention of keeping mutable runtime state there. Operators who want the queue elsewhere set the `location` directive explicitly; everything downstream (the three‑file set in Q5) is written relative to this directory.
 
 ---
 
 
-## Q5 — After a first failure but before the second retry, what files exist, what is their naming pattern, and what metadata records retry counts?
+## Question 5 — On-disk artifacts and retry metadata.
+
+> After a first failure but before the second retry, what files exist, what is their naming pattern, and what metadata records retry counts?
 
 ### Answer
 
@@ -423,14 +433,16 @@ queue: removed dangling file c224cc0254b5e7ee69a27089c5ff8da698a797e4.body
 - Atomic update: `internal/target/queue/queue.go:L742-L767` (`L744`, `L754`, `L758`, `L762`).
 - Recovery & dangling pruning: `internal/target/queue/queue.go:L634-L662,L798-L803`. Unparsable `.meta` is skipped (not renamed) on startup: `L639-L642,L786-L787`. The `.meta_broken` rename happens only on dispatch panic recovery: `L292,L295,L267-L268`.
 
-### Rationale / Thinking
+### Rationale/Thinking
 
 The split into `.header` / `.body` / `.meta` separates the immutable message content (header, body) from the mutable delivery state (`.meta`). Only the small `.meta` file changes between retries, and it is updated atomically — so the expensive message bytes are written once while the retry counter and recipient set are rewritten cheaply and safely on every attempt. Inspecting `.meta` between the first failure and the second retry is the most direct way to "see" the retry counter, and the capture above shows `TriesCount` advancing to `1`, `To` narrowing to the still‑failing recipient, and `RcptErrs` preserving the `451` for a future bounce. The recovery logic guarantees that a half‑written set (e.g. process killed between writing `.header` and `.body`) is cleaned up rather than resurrected as a corrupt message.
 
 ---
 
 
-## Q6 — With multiple messages queued simultaneously to different destinations, how does the scheduler prioritize them?
+## Question 6 — Scheduler prioritization.
+
+> With multiple messages queued simultaneously to different destinations, how does the scheduler prioritize them?
 
 ### Answer
 
@@ -450,14 +462,16 @@ Because the comparison is purely on `Time`, **destination identity is irrelevant
 - Earliest‑time selection scan & comparison: `internal/target/queue/timewheel.go:L78-L84` (comparison at `L80`).
 - Single timer, remove, dispatch on fire: `internal/target/queue/timewheel.go:L99,L106,L109`.
 
-### Rationale / Thinking
+### Rationale/Thinking
 
 The scheduler is a *deadline* scheduler, not a *fairness* scheduler. Its job is simply "run the next thing that is due, when it is due," and it implements that with an O(n) scan for the minimum‑time slot plus a single armed timer. There is deliberately no notion of destination, tenant, or priority class — two messages to two different domains compete only on their `nextTryTime`. The practical implication, developed in Q7 and Q8, is that *prioritization* is decoupled from *execution capacity*: the wheel will happily declare many messages "due at once," and what happens next is governed entirely by the `max_parallelism` semaphore rather than by any scheduling policy.
 
 ---
 
 
-## Q7 — What happens to message A's retry timing when message B (to a different destination) blocks on a slow timeout?
+## Question 7 — Head-of-line blocking.
+
+> What happens to message A's retry timing when message B (to a different destination) blocks on a slow timeout?
 
 ### Answer
 
@@ -492,14 +506,16 @@ A large time delta between these two lines for message A is the direct signature
 - Wait/acquire debug logs: `internal/target/queue/queue.go:L282,L299`.
 - No timeout (slots held for full OS timeout): `internal/target/remote/remote.go:L81`; `internal/target/queue/queue.go:L442` (cross‑ref Q2).
 
-### Rationale / Thinking
+### Rationale/Thinking
 
 The goroutine‑per‑message design (reinforced by this commit's "allow more concurrency" rewrite of the remote target) means the *scheduler* is immune to head‑of‑line blocking: A's *due time* is honored no matter what B is doing. The head‑of‑line blocking that *can* occur is one level down, at the shared `max_parallelism` semaphore — a global concurrency cap with no per‑destination partitioning. Below the cap, A and B are fully independent; at the cap, the absence of any dial timeout (Q2) means slow destinations hog slots for minutes, and A's *execution* is pushed back until a slot frees. So the precise answer is: **A's scheduled time is never moved by B, but A's actual delivery can be delayed by B if and only if the semaphore is saturated by slow in‑flight deliveries.** This is the bridge to Q8 (starvation).
 
 ---
 
 
-## Q8 — Is queue starvation observable in logs or connection patterns?
+## Question 8 — Queue starvation.
+
+> Is queue starvation observable in logs or connection patterns?
 
 ### Answer
 
@@ -523,14 +539,14 @@ The widening gap (in time, and in count of "waiting" vs "acquired") is the log s
 - Starvation log signatures: `internal/target/queue/queue.go:L282` (`waiting on delivery semaphore for`), `L299` (`delivery semaphore acquired for`).
 - No timeout ⇒ slots held for full OS timeout (cross‑ref Q2): `internal/target/remote/remote.go:L81`; `internal/target/queue/queue.go:L442`.
 
-### Rationale / Thinking
+### Rationale/Thinking
 
 Starvation here is a direct composition of three earlier findings: the scheduler imposes no fairness and simply fires everything that is due (Q6); execution is bounded by a single global semaphore with no per‑destination partition (Q7); and a blocked dial cannot be aborted early because no timeout exists (Q2). Put together, *k* ≥ `max_parallelism` slow destinations will pin every slot for minutes at a time, and any other message — however unrelated its destination — is starved until a slot frees. It is observable both ways: in the logs as a backlog of `waiting on delivery semaphore for …` lines without matching `acquired` lines, and in connection patterns as a hard plateau of exactly `max_parallelism` concurrent, long‑hanging connections. The mitigation levers an operator actually has are `max_parallelism` (raise the cap) — the retry intervals and the (absent) dial timeout are *not* configurable at this commit.
 
 ---
 
 
-## Documentation‑vs‑Code Reconciliations
+## Documentation-vs-Code Reconciliations
 
 Where maddy's own documentation or naming could mislead a reader, the **code is authoritative**. Three points were reconciled during this investigation; each is documented as a *finding*, not a change to make.
 
