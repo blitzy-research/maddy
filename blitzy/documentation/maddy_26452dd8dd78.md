@@ -37,7 +37,7 @@ go test ./internal/target/queue/ -run TestQueueDelivery_TemporaryFail        -v 
 go test ./internal/target/queue/ -run TestQueueDelivery_MultipleAttempts     -v -test.debuglog -test.directlog
 go test ./internal/target/queue/ -run TestQueueDelivery_SerializationRoundtrip -v -test.debuglog -test.directlog
 go test ./internal/target/queue/ -run TestQueueDelivery_DeserlizationCleanUp   -v -test.debuglog -test.directlog   # note the misspelling in the real test name
-go test ./internal/target/queue/ -race -cover                                                                     # => PASS, 74.9% coverage, 0 data races
+go test ./internal/target/queue/ -race -cover                                                                     # => PASS, 74.7% coverage, 0 data races
 ```
 
 Two **throwaway** test files (`blitzy_adhoc_offbyone_test.go`, `blitzy_adhoc_ondisk_test.go`) and a standalone dial‑measurement program were created **outside** the repository tree to capture the off‑by‑one attempt count, the on‑disk file set, and the real TCP timeout durations. None of this scaffolding is part of, or committed to, the repository.
@@ -250,14 +250,16 @@ The full production line shape is:
 
 ### Real captured sample
 
-Captured from a verbose run with production‑style formatting (`-test.debuglog -test.directlog`):
+Captured from the committed `TestQueueDelivery_TemporaryFail` test with production‑style formatting (`go test ./internal/target/queue/ -run TestQueueDelivery_TemporaryFail -v -test.debuglog -test.directlog`). That message is addressed to two recipients that both fail *temporarily* on attempt #1, so the capture shows the full retry‑marking vocabulary for one message — `delivery attempt #1`, a per‑recipient `delivery attempt failed`, and the `will retry` reschedule:
 
 ```text
-2026-06-30T15:51:36.535Z [debug] queue: delivery attempt #1	{"msg_id":"44e9a8a49dabf3f7cc9fe7404b3f9194861af21a"}
-2026-06-30T15:51:36.562Z queue: will retry	{"attempts_count":1,"msg_id":"44e9a8a49dabf3f7cc9fe7404b3f9194861af21a","next_try_delay":"-738ns","rcpts":["tester1@example.org"]}
+2026-06-30T16:33:33.146Z [debug] queue: delivery attempt #1	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+2026-06-30T16:33:33.146Z queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org","reason":"you shall not pass"}
+2026-06-30T16:33:33.146Z queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org","reason":"you shall not pass"}
+2026-06-30T16:33:33.148Z queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-748ns","rcpts":["tester1@example.org","tester2@example.org"]}
 ```
 
-Observe: the timestamp `2026-06-30T15:51:36.535Z` exactly matches the `2006-01-02T15:04:05.000Z` layout; the debug line carries `[debug]`; the `queue: ` logger‑name prefix is present; the message is followed by a tab then the JSON field object; and `msg_id` is present on every line.
+Observe: the timestamp `2026-06-30T16:33:33.146Z` exactly matches the `2006-01-02T15:04:05.000Z` layout; the debug line carries `[debug]`; the `queue: ` logger‑name prefix is present; each message is followed by a tab then the JSON field object; `msg_id` is present on every line; and each `delivery attempt failed` line carries the per‑recipient `rcpt` plus the human‑readable `reason` (here `"you shall not pass"`, the temporary error injected by `unreliableTarget`).
 
 > **Production vs test `msg_id` length.** The `msg_id` in the sample above is **40 hex chars** because the test harness derives the ID from `sha1(t.Name())` (see Reconciliations §b). In *production*, `msg_id` is **8 hex chars** (`internal/msgpipeline/msgid.go:L12-L16`). Readers comparing test logs to production logs should expect this difference and not mistake it for a configuration change.
 
@@ -402,7 +404,7 @@ Metadata writes are crash‑safe via **write‑to‑`.meta.new`‑then‑rename*
 
 ### Crash recovery and dangling files
 
-On startup, `readDiskQueue` (`internal/target/queue/queue.go` from ~`L621`) scans the location for `.meta` files (`L634`), extracts the ID (`L637`), and stat‑checks that the matching `.header` (`L646`) and `.body` (`L658`) exist. If one is missing, the incomplete set is pruned via `tryRemoveDanglingFile` (`L649-L650` for a missing header, `L661-L662` for a missing body), which removes the file and logs `removed dangling file <name>` (`queue.go:L798-L803`). A `.meta` that cannot be parsed is renamed to `.meta_broken` rather than deleted (`queue.go:L268`). This was observed directly:
+On startup, `readDiskQueue` (`internal/target/queue/queue.go` from ~`L621`) scans the location for `.meta` files (`L634`), extracts the ID (`L637`), and stat‑checks that the matching `.header` (`L646`) and `.body` (`L658`) exist. If one is missing, the incomplete set is pruned via `tryRemoveDanglingFile` (`L649-L650` for a missing header, `L661-L662` for a missing body), which removes the file and logs `removed dangling file <name>` (`queue.go:L798-L803`). A `.meta` that **cannot be parsed** is handled differently from a dangling file: `readMessageMeta` returns the JSON decode error (`queue.go:L786-L787`), and `readDiskQueue` simply logs `failed to read meta-data, skipping` and `continue`s to the next entry (`queue.go:L639-L642`) — the unparsable `.meta` is **left in place, neither deleted nor renamed**, during startup scanning. The `.meta_broken` rename belongs to an entirely **different** code path: it occurs only when a `panic` happens while delivering a message, where the `dispatch` deferred `recover()` (`queue.go:L292`) calls `discardBroken` (`queue.go:L295`), which renames `<id>.meta` → `<id>.meta_broken` (`queue.go:L267-L268`; the function's own doc comment notes it "is called from panic handler"). The dangling file pruning above was observed directly:
 
 ```text
 queue: removed dangling file d2a3db819622e354ce399f7193234e8266b43894.meta
@@ -419,7 +421,7 @@ queue: removed dangling file c224cc0254b5e7ee69a27089c5ff8da698a797e4.body
 - `QueueMetadata` schema & `TriesCount`: `internal/target/queue/queue.go:L149-L170` (counter at `L166`).
 - Increment then persist after a non‑terminal attempt: `internal/target/queue/queue.go:L407,L409`.
 - Atomic update: `internal/target/queue/queue.go:L742-L767` (`L744`, `L754`, `L758`, `L762`).
-- Recovery & dangling pruning: `internal/target/queue/queue.go:L634-L662,L798-L803`; broken‑meta rename `L268`.
+- Recovery & dangling pruning: `internal/target/queue/queue.go:L634-L662,L798-L803`. Unparsable `.meta` is skipped (not renamed) on startup: `L639-L642,L786-L787`. The `.meta_broken` rename happens only on dispatch panic recovery: `L292,L295,L267-L268`.
 
 ### Rationale / Thinking
 
