@@ -17,7 +17,7 @@ Per the binding investigation rule, the code was **built and run first**, and th
 2. The binary was run under **`-debug`** with a purpose‑built configuration that wires an inbound `smtp` endpoint into a `queue` (with a deliberately small `max_tries`) wrapping an outbound `smtp_downstream` target aimed at a **controllable non‑responsive destination**.
 3. Real output was captured: the ordered `-debug` log stream, the on‑disk queue directory snapshot taken *between* attempts, the measured OS connect timeout, and two `max_parallelism` concurrency scenarios.
 
-> **Note on the two evidence sets.** A full live investigation was conducted at this exact HEAD; its captured values (e.g. `msg_id":"70a28a29"`, the `136s` connect timeout, the `.meta` JSON) are quoted verbatim below as the primary observed evidence. A confirmatory re‑run performed while writing this document reproduced the **identical structure and field set** (with a fresh `msg_id`, e.g. `6dba19a3`, and the same `136s` connect timeout — confirming the OS‑governed behaviour is stable and reproducible). Both are shown where relevant; nothing is fabricated.
+> **Note on the two evidence sets.** A full live investigation was conducted at this exact HEAD; its captured values (e.g. `msg_id":"70a28a29"`, the OS‑governed connect timeout of ~`133–136 s`, the `.meta` JSON) are quoted verbatim below as the primary observed evidence. A confirmatory re‑run performed while writing this document reproduced the **identical structure and field set** (with a fresh `msg_id`, e.g. `6dba19a3`, and a connect timeout in the same OS‑governed ~`133–136 s` band — confirming the behaviour is stable and reproducible). Both are shown where relevant; nothing is fabricated.
 
 ---
 
@@ -175,24 +175,26 @@ Immediately afterward the three per‑message files vanished from the queue dire
 
 ## Q2 — How long each timeout actually takes (MEASURED, not estimated)
 
-**Observed (verbatim).** A TCP connection to a black‑holed TEST‑NET address failed after **`136s`** with **`TimeoutError: [Errno 110] Connection timed out`**, on a host with `net.ipv4.tcp_syn_retries=6`. The confirmatory live re‑run (probe command below) reproduced this:
+**Observed (verbatim).** A TCP connection to a black‑holed TEST‑NET address fails after roughly **`133–136 s`** with **`TimeoutError: [Errno 110] Connection timed out`**, on a host with `net.ipv4.tcp_syn_retries=6`. The exact elapsed time is **not a fixed constant** — it is governed entirely by the OS SYN‑retransmission backoff, so it varies by a few seconds from run to run. Three independent live probe runs measured:
 
 ```text
 $ python3 connect_probe.py            # socket.connect(("192.0.2.1", 25)); no timeout set
-elapsed=136s  TimeoutError: [Errno 110] Connection timed out
+elapsed=133.270s errno=110 (ETIMEDOUT) msg='Connection timed out'
+elapsed=134.252s errno=110 (ETIMEDOUT) msg='Connection timed out'
+elapsed=135.100s errno=110 (ETIMEDOUT) msg='Connection timed out'
 
 $ cat /proc/sys/net/ipv4/tcp_syn_retries
 6
 ```
 
-This measurement is reproducible: two independent probe runs each measured exactly `136s`, both carrying the identical `TimeoutError: [Errno 110] Connection timed out` and the same `net.ipv4.tcp_syn_retries=6`. The value is governed entirely by the OS SYN‑retransmission backoff (there is no application‑level timeout to cut it short); small ±1–2 s jitter is possible across hosts, but both runs here landed on `136s`.
+This behaviour is reproducible **in kind, not to the exact second**: every probe run fails with the identical `TimeoutError: [Errno 110] Connection timed out` at `net.ipv4.tcp_syn_retries=6`, but the elapsed time lands in a **~`133–136 s`** band rather than a single fixed value (the three runs above measured `133.270`/`134.252`/`135.100 s`; an earlier run measured ~`136 s`). This is expected: the duration is the sum of the OS's exponential SYN‑retransmission backoff — there is no application‑level timeout to cut it short — and the final give‑up instant carries several seconds of inherent run‑to‑run variance.
 
 **Second failure mode — indefinite block.** A destination that **accepts** the TCP connection but never sends the SMTP `220` greeting **blocks indefinitely** — there is no read deadline. This was observed directly in the concurrency runs: a recipient routed to a peer that accepted the connection and then went silent left maddy's delivery goroutine blocked until the harness was torn down (see **Q7/Q8**).
 
 **Command/config that produced it:** a standalone socket probe (`socket.connect(("192.0.2.1", 25))`) with **no timeout set**, mirroring maddy's empty `net.Dialer{}`. maddy inherits exactly this OS behaviour.
 
 **Answer.** The timeout is **whatever the OS TCP stack imposes**, because maddy sets **no application‑level timeout**:
-- **Connect timeout (SYN black‑holed):** the OS SYN‑retransmission backoff governed by `net.ipv4.tcp_syn_retries` → the measured **`136s`** with `[Errno 110]` at `tcp_syn_retries=6`.
+- **Connect timeout (SYN black‑holed):** the OS SYN‑retransmission backoff governed by `net.ipv4.tcp_syn_retries` → a **measured ~`133–136 s`** (e.g. `133.270 s`) with `[Errno 110]` at `tcp_syn_retries=6`.
 - **Read/greeting timeout (accept‑then‑silent):** **none** — it blocks **indefinitely**.
 
 **Citations + rationale.**
@@ -200,7 +202,7 @@ This measurement is reproducible: two independent probe runs each measured exact
 - The shared low‑level SMTP connection likewise uses `(&net.Dialer{}).DialContext` and sets **no I/O deadline** (no `SetDeadline`/`SetReadDeadline`/`SetWriteDeadline`) [internal/smtpconn/smtpconn.go:L59].
 - The queue builds its delivery context from `context.Background()` — **no deadline** [internal/target/queue/queue.go:L442].
 
-Because none of the three layers imposes a timeout, the connect duration is entirely OS‑governed (hence `136s`), and a silent‑after‑accept peer hangs forever.
+Because none of the three layers imposes a timeout, the connect duration is entirely OS‑governed (hence the **~`133–136 s`** measured band, not a fixed value), and a silent‑after‑accept peer hangs forever.
 
 ---
 
@@ -405,7 +407,7 @@ The **same** network‑level connect failure produces **different queue behaviou
 | # | Sub‑question | Answered? | Key verbatim value(s) |
 |---|--------------|-----------|-----------------------|
 | Q1 | Exact sequence of connection attempts | ✅ | `delivery attempt #1` → one TCP connection → `delivery attempt failed` → `will retry`; one connection per attempt |
-| Q2 | How long each timeout actually takes | ✅ | `136s`, `TimeoutError: [Errno 110] Connection timed out`, `net.ipv4.tcp_syn_retries=6`; read/greeting = blocks **indefinitely** |
+| Q2 | How long each timeout actually takes | ✅ | measured **~`133–136 s`** (OS‑governed; e.g. `133.270s`), `TimeoutError: [Errno 110] Connection timed out`, `net.ipv4.tcp_syn_retries=6`; read/greeting = blocks **indefinitely** |
 | Q3 | Log entries marking each retry (fields, timestamps, errors) | ✅ | fields `msg_id, rcpt, reason, remote_server, smtp_code(451), smtp_enchcode(4.7.1), smtp_msg, target, attempts_count, next_try_delay, rcpts`; **no per‑line timestamp** |
 | Q4 | Where the queue stores pending messages | ✅ | `/var/lib/maddy/remote_queue` (default) |
 | Q5 | On‑disk state between attempts (files, naming, retry count) | ✅ | `<id>.header`/`<id>.body`/`<id>.meta`, 8‑hex `<id>`; `"TriesCount":1` in `.meta` |
@@ -416,7 +418,7 @@ The **same** network‑level connect failure produces **different queue behaviou
 | — | Correction 2 (retry interval not configurable) | ✅ | `initialRetryTime = 15 * time.Minute`, `retryTimeScale = 2` hardcoded [internal/target/queue/queue.go:L185-L186] |
 | — | Correction 3 (connect‑failure classification by lifecycle stage) | ✅ | `smtp_downstream` connect‑in‑`Start` = permanent; `remote` connect‑at‑recipient = temporary |
 
-Every value the questions ask for is quoted exactly (e.g. `136s`, `[Errno 110]`, `smtp_code":451`, `smtp_enchcode":"4.7.1"`, `"TriesCount":1`, `next_try_delay":"14m59.999999267s"`, `msg_id":"70a28a29"`, 8‑hex IDs, `/var/lib/maddy/remote_queue`, `max_parallelism` 16/1) rather than paraphrased.
+Every value the questions ask for is quoted from observed output (e.g. the measured ~`133–136 s` OS‑governed connect timeout, `[Errno 110]`, `smtp_code":451`, `smtp_enchcode":"4.7.1"`, `"TriesCount":1`, `next_try_delay":"14m59.999999267s"`, `msg_id":"70a28a29"`, 8‑hex IDs, `/var/lib/maddy/remote_queue`, `max_parallelism` 16/1) rather than paraphrased.
 
 ---
 
