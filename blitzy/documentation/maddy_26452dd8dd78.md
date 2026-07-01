@@ -74,10 +74,13 @@ smtp tcp://127.0.0.1:2525 {
 
 (The `smtp_downstream` bools must be `no`, not `off` — an `off` value produces the parse error `bool argument should be 'yes' or 'no'` and maddy refuses to start.)
 
-Launch (maddy logs to stderr by default — `internal/log/log.go:202` `var DefaultLogger = Logger{Out: WriterOutput(os.Stderr, false)}`; the `-debug` flag is `flag.BoolVar(&log.DefaultLogger.Debug, "debug", false, "enable debug logging early")` at `maddy.go:104`). At startup exactly two lines are printed; the `220` greeting is emitted per-connection (seen in O1's transcript):
+Launch (maddy logs to stderr by default — `internal/log/log.go:202` `var DefaultLogger = Logger{Out: WriterOutput(os.Stderr, false)}`; the `-debug` flag is `flag.BoolVar(&log.DefaultLogger.Debug, "debug", false, "enable debug logging early")` at `maddy.go:104`). Because the `-debug` flag makes the logger's `Debug` flag true, startup first prints one module-initialization `[debug]` line for each module instantiated from the config — `log.Debugf("%s:%d: new module %s %v", ...)` at `internal/config/module/modconfig.go:70` — plus the queue's `delivery target: %T` line (`internal/target/queue/queue.go:248`), and then the two `smtp:` lines: the `io_debug` warning (`smtp.go:605`) and the listener line (`smtp.go:619`). For this configuration that is the five lines below, all emitted before any connection is accepted; the `220` greeting is then emitted per-connection (seen in O1's transcript):
 
 ```console
 $ /tmp/maddy_investigation/maddy_bin -debug -config /tmp/maddy_investigation/maddy.conf
+[debug] /tmp/maddy_investigation/maddy.conf:11: new module queue []
+[debug] /tmp/maddy_investigation/maddy.conf:15: new module smtp_downstream []
+[debug] queue: delivery target: *smtp_downstream.Downstream
 smtp: I/O debugging is on! It may leak passwords in logs, be careful!
 smtp: listening on tcp://127.0.0.1:2525
 ```
