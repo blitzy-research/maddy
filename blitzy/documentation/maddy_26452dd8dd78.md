@@ -26,10 +26,11 @@ This commit predates Maddy's newer *namespaced* configuration syntax. Every lite
 this document is taken from **this** commit, which uses the **old non-namespaced module
 names**: `sql`, `smtp`, `submission`, `lmtp`, `imap`, `queue`, `remote`. The default
 config confirms this — for example `sql local_mailboxes local_authdb` and
-`smtp tcp://...` blocks in `maddy.conf`. This document deliberately does **not** use the
-newer upstream namespaced names such as `storage.imapsql` or `target.smtp`, nor the newer
-dedicated `checks`/`modifiers` blocks; those do not exist at HEAD `26452dd`. If you compare
-against the live upstream website, expect this version skew.
+`smtp tcp://...` blocks in `maddy.conf`. This document deliberately uses **only** those
+old names; it does **not** use the newer upstream *namespaced* configuration syntax (the
+dotted module names and dedicated configuration blocks introduced in later Maddy releases),
+because that syntax does not exist at HEAD `26452dd`. If you compare against the live
+upstream website, expect this version skew.
 
 ### The exact question, decomposed into five sub-parts
 
@@ -112,25 +113,30 @@ require TLS config — `smtp.go:L623` / `imap.go:L134`):
 31  }
 ```
 
-Command and captured `stderr` (verbatim; each maddy log line ends with a trailing **TAB** —
-its field separator — not shown here):
+Command, exit code, and the captured `stderr` shown **verbatim** via `cat -A`. Every maddy log
+line ends with a literal trailing **TAB** — the field separator emitted by `formatMsg`
+(`formatted.WriteRune('\t')` [`internal/log/log.go:L139`]) immediately before the newline written
+at [`internal/log/writer.go:L25`]. In the `cat -A` renderings below, that trailing TAB shows as
+`^I` and the line-ending newline as `$`, so every byte is accounted for. **This `^I`/`$` convention
+is used for every captured-log block throughout this document.**
 
 ```
-$ timeout -s TERM 8 /tmp/obs/maddy -debug -config /tmp/obs/valid.conf ; echo "EXIT=$?"
-[debug] sql: go-imap-sql version 0.4.0
-[debug] /tmp/obs/valid.conf:12: reference &local_mailboxes
-smtp: listening on tcp://127.0.0.1:2525
-[debug] /tmp/obs/valid.conf:17: reference &local_authdb
-[debug] /tmp/obs/valid.conf:18: reference &local_mailboxes
-[debug] submission: authentication provider: sql local_mailboxes
-submission: listening on tcp://127.0.0.1:2587
-[debug] /tmp/obs/valid.conf:23: reference &local_authdb
-[debug] /tmp/obs/valid.conf:24: reference &local_mailboxes
-imap: listening on tcp://127.0.0.1:2143
-imap: authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!
-imap: TLS is disabled, this is insecure configuration and should be used only for testing!
-signal received (terminated), next signal will force immediate shutdown.
+$ timeout -s TERM 8 /tmp/obs/maddy -debug -config /tmp/obs/valid.conf 2>/tmp/obs/valid.stderr ; echo "EXIT=$?"
 EXIT=124
+$ cat -A /tmp/obs/valid.stderr
+[debug] sql: go-imap-sql version 0.4.0^I$
+[debug] /tmp/obs/valid.conf:12: reference &local_mailboxes^I$
+smtp: listening on tcp://127.0.0.1:2525^I$
+[debug] /tmp/obs/valid.conf:17: reference &local_authdb^I$
+[debug] /tmp/obs/valid.conf:18: reference &local_mailboxes^I$
+[debug] submission: authentication provider: sql local_mailboxes^I$
+submission: listening on tcp://127.0.0.1:2587^I$
+[debug] /tmp/obs/valid.conf:23: reference &local_authdb^I$
+[debug] /tmp/obs/valid.conf:24: reference &local_mailboxes^I$
+imap: listening on tcp://127.0.0.1:2143^I$
+imap: authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!^I$
+imap: TLS is disabled, this is insecure configuration and should be used only for testing!^I$
+signal received (terminated), next signal will force immediate shutdown.^I$
 ```
 
 ### Observation config #2 — ORPHANED block (`/tmp/obs/orphan.conf`, outside the repo)
@@ -148,20 +154,22 @@ block (header at line 24) that no `&` points to anywhere:
 27  }
 ```
 
-Command and captured `stderr` (verbatim):
+Command, exit code, and captured `stderr` shown **verbatim** via `cat -A` (same `^I`/`$` convention:
+trailing `^I` is the field-separator TAB, `$` is the newline):
 
 ```
-$ timeout -s TERM 8 /tmp/obs/maddy -debug -config /tmp/obs/orphan.conf ; echo "EXIT=$?"
-[debug] sql: go-imap-sql version 0.4.0
-[debug] /tmp/obs/orphan.conf:9: reference &local_mailboxes
-smtp: listening on tcp://127.0.0.1:2525
-[debug] /tmp/obs/orphan.conf:14: reference &local_authdb
-[debug] /tmp/obs/orphan.conf:15: reference &local_mailboxes
-imap: listening on tcp://127.0.0.1:2143
-imap: authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!
-imap: TLS is disabled, this is insecure configuration and should be used only for testing!
-Unused configuration block at /tmp/obs/orphan.conf:24 - orphan_storage (sql)
+$ timeout -s TERM 8 /tmp/obs/maddy -debug -config /tmp/obs/orphan.conf 2>/tmp/obs/orphan.stderr ; echo "EXIT=$?"
 EXIT=2
+$ cat -A /tmp/obs/orphan.stderr
+[debug] sql: go-imap-sql version 0.4.0^I$
+[debug] /tmp/obs/orphan.conf:9: reference &local_mailboxes^I$
+smtp: listening on tcp://127.0.0.1:2525^I$
+[debug] /tmp/obs/orphan.conf:14: reference &local_authdb^I$
+[debug] /tmp/obs/orphan.conf:15: reference &local_mailboxes^I$
+imap: listening on tcp://127.0.0.1:2143^I$
+imap: authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!^I$
+imap: TLS is disabled, this is insecure configuration and should be used only for testing!^I$
+Unused configuration block at /tmp/obs/orphan.conf:24 - orphan_storage (sql)^I$
 ```
 
 These two runs — a clean settle (`EXIT=124`) and an aborted settle (`EXIT=2`) — are the
@@ -264,11 +272,12 @@ Two things remain unresolved after the config is read:
 
 The valid-run log is the proof. The **first** side-effect of *initializing* the `sql` module is
 its version line, emitted from within `sql`'s `Init` at
-`store.Log.Debugln("go-imap-sql version", imapsql.VersionStr)` [`internal/storage/sql/sql.go:L268`]:
+`store.Log.Debugln("go-imap-sql version", imapsql.VersionStr)` [`internal/storage/sql/sql.go:L268`]
+(same `cat -A` convention — trailing `^I` = TAB, `$` = newline):
 
 ```
-[debug] sql: go-imap-sql version 0.4.0
-[debug] /tmp/obs/valid.conf:12: reference &local_mailboxes
+[debug] sql: go-imap-sql version 0.4.0^I$
+[debug] /tmp/obs/valid.conf:12: reference &local_mailboxes^I$
 ```
 
 That `go-imap-sql version 0.4.0` line does **not** appear at "config read" time — it appears
@@ -379,14 +388,14 @@ The shared `Initialized` map is declared at `Initialized = make(map[string]bool)
 The valid run demonstrates both order-independence and at-most-once init:
 
 ```
-[debug] sql: go-imap-sql version 0.4.0
-[debug] /tmp/obs/valid.conf:12: reference &local_mailboxes
+[debug] sql: go-imap-sql version 0.4.0^I$
+[debug] /tmp/obs/valid.conf:12: reference &local_mailboxes^I$
 ...
-[debug] /tmp/obs/valid.conf:17: reference &local_authdb
-[debug] /tmp/obs/valid.conf:18: reference &local_mailboxes
+[debug] /tmp/obs/valid.conf:17: reference &local_authdb^I$
+[debug] /tmp/obs/valid.conf:18: reference &local_mailboxes^I$
 ...
-[debug] /tmp/obs/valid.conf:23: reference &local_authdb
-[debug] /tmp/obs/valid.conf:24: reference &local_mailboxes
+[debug] /tmp/obs/valid.conf:23: reference &local_authdb^I$
+[debug] /tmp/obs/valid.conf:24: reference &local_mailboxes^I$
 ```
 
 - **Out-of-order works:** `sql local_mailboxes local_authdb` is declared **last** (config lines
@@ -478,12 +487,13 @@ lazy `sql` init in Q1/Q2 gets triggered in the first place).
 ### Observed evidence + rationale
 
 Each endpoint's `Init` opens its listener and logs it via `endp.Log.Printf("listening on %v", addr)`
-(`internal/endpoint/smtp/smtp.go:L619`, `internal/endpoint/imap/imap.go:L130`). From the valid run:
+(`internal/endpoint/smtp/smtp.go:L619`, `internal/endpoint/imap/imap.go:L130`). From the valid run
+(`cat -A`; trailing `^I` = TAB, `$` = newline):
 
 ```
-smtp: listening on tcp://127.0.0.1:2525
-submission: listening on tcp://127.0.0.1:2587
-imap: listening on tcp://127.0.0.1:2143
+smtp: listening on tcp://127.0.0.1:2525^I$
+submission: listening on tcp://127.0.0.1:2587^I$
+imap: listening on tcp://127.0.0.1:2143^I$
 ```
 
 The three endpoints initialize in **config order** (`smtp` → `submission` → `imap`), all inside
@@ -584,15 +594,30 @@ Modifiers run as an ordered chain of three layers, each an independent module st
    [`internal/msgpipeline/msgpipeline.go:L488-L494`].
 
 At this commit modifiers are **header-only**: *"currently this is not possible to modify the body
-contents, only header can be modified."* [`HACKING.md:L120-L128`]. Along the way the pipeline preserves
-the original recipient mapping so downstream delivery keeps the correct address: it initializes
-`OriginalRcpts` (`if msgMeta.OriginalRcpts == nil { msgMeta.OriginalRcpts = map[string]string{}`
-[`internal/msgpipeline/msgpipeline.go:L90-L91`]), a `OriginalRcpts map[string]string`
-[`internal/module/msgmetadata.go:L89`] that maps the **final** recipient back to the **original** one.
-Downstream, the `sql` storage uses that to add a header via `userHeader.Add("Delivered-To", accountName)`
-[`internal/storage/sql/sql.go:L94`]. *(To be precise: `OriginalRcpts` preserves the final→original
-mapping so the correct original recipient is available downstream; it is not itself a direct write of the
-`Delivered-To` header.)*
+contents, only header can be modified."* [`HACKING.md:L120-L128`].
+
+Two recipient-related mechanisms are easy to conflate, so it is worth stating them **independently** —
+the source supports each on its own, and there is **no data flow from the first into the second**:
+
+- **`OriginalRcpts` — a final→original recipient mapping used for status/DSN reporting.** The pipeline
+  initializes it once per delivery (`if msgMeta.OriginalRcpts == nil { msgMeta.OriginalRcpts =
+  map[string]string{}` [`internal/msgpipeline/msgpipeline.go:L90-L91`]); it is declared as
+  `OriginalRcpts map[string]string` [`internal/module/msgmetadata.go:L89`] and documented as *"the
+  mapping from the final recipient to the recipient that was presented by the client"* that *"should be
+  used when reporting information back to client (via DSN, for example) to prevent disclosing information
+  about aliases which is usually unwanted"* [`internal/module/msgmetadata.go:L80-L88`]. It is populated
+  **only when a recipient modifier actually rewrites the address** — `if originalTo != to {
+  dd.msgMeta.OriginalRcpts[to] = originalTo }` [`internal/msgpipeline/msgpipeline.go:L288-L289`] — and its
+  **only** consumer is the pipeline's own `statusCollector.SetStatus`, which maps the effective recipient
+  back to the original before status is reported (`original, ok := sc.originalRcpts[rcptTo]` … `rcptTo =
+  original` [`internal/msgpipeline/msgpipeline.go:L351-L356`]).
+- **`Delivered-To` — added by `sql` storage from the *effective* account, independently of
+  `OriginalRcpts`.** The pipeline calls `delivery.AddRcpt(ctx, to)` with the **effective** recipient `to`
+  [`internal/msgpipeline/msgpipeline.go:L298`]. The storage's `AddRcpt` method
+  [`internal/storage/sql/sql.go:L71`] receives that as its `rcptTo` argument, derives `accountName, err :=
+  prepareUsername(rcptTo)` [`internal/storage/sql/sql.go:L74`], and adds `userHeader.Add("Delivered-To",
+  accountName)` [`internal/storage/sql/sql.go:L94`]. The `Delivered-To` value therefore comes from the
+  **effective account name**; the source does **not** read `OriginalRcpts` when building this header.
 
 ### Routing selects *which* block's checks/modifiers apply
 
@@ -647,13 +672,14 @@ and every endpoint is initialized and listening.*
 ### Positive evidence — the valid run settles and stays up
 
 In the valid run, all three endpoints reach their `listening on` lines and the process is still alive
-when `timeout` sends `SIGTERM` after 8 seconds:
+when `timeout` sends `SIGTERM` after 8 seconds (`cat -A`; trailing `^I` = TAB, `$` = newline; the
+final `EXIT=124` is the shell echo, not a maddy log line, so it carries no tab):
 
 ```
-imap: listening on tcp://127.0.0.1:2143
-imap: authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!
-imap: TLS is disabled, this is insecure configuration and should be used only for testing!
-signal received (terminated), next signal will force immediate shutdown.
+imap: listening on tcp://127.0.0.1:2143^I$
+imap: authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!^I$
+imap: TLS is disabled, this is insecure configuration and should be used only for testing!^I$
+signal received (terminated), next signal will force immediate shutdown.^I$
 EXIT=124
 ```
 
@@ -667,13 +693,14 @@ module/config error path returns `2` [`maddy.go:L160`].
 
 The orphan run adds an unreferenced `sql orphan_storage` block (header at config line 24). It is created
 in Loop 1 but never `&`-referenced, so it never reaches `GetInstance` and is absent from `Initialized`.
-Loop 3 catches it and aborts:
+Loop 3 catches it and aborts (`cat -A`; trailing `^I` = TAB, `$` = newline; the final `EXIT=2` is the
+shell echo, not a maddy log line, so it carries no tab):
 
 ```
-imap: listening on tcp://127.0.0.1:2143
-imap: authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!
-imap: TLS is disabled, this is insecure configuration and should be used only for testing!
-Unused configuration block at /tmp/obs/orphan.conf:24 - orphan_storage (sql)
+imap: listening on tcp://127.0.0.1:2143^I$
+imap: authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!^I$
+imap: TLS is disabled, this is insecure configuration and should be used only for testing!^I$
+Unused configuration block at /tmp/obs/orphan.conf:24 - orphan_storage (sql)^I$
 EXIT=2
 ```
 
@@ -712,14 +739,16 @@ graph is otherwise wired up. The two exit codes make the settle state unambiguou
   plus a C compiler, because the SQLite3 driver is gated by the build constraint `// +build !nosqlite3,cgo`
   [`internal/storage/sql/sqlite3.go:L1`] (which then does `import _ "github.com/mattn/go-sqlite3"` at
   [`internal/storage/sql/sqlite3.go:L5`]). Building **without** CGO still compiles, but the SQLite3 driver
-  is absent and `sql` init fails at runtime. Observed with a `CGO_ENABLED=0` build:
+  is absent and `sql` init fails at runtime. Observed with a `CGO_ENABLED=0` build (same `cat -A`
+  convention — trailing `^I` = TAB, `$` = newline):
 
   ```
   $ CGO_ENABLED=0 go build -o /tmp/obs/maddy_nocgo ./cmd/maddy       # still builds (exit 0)
-  $ timeout -s TERM 8 /tmp/obs/maddy_nocgo -debug -config /tmp/obs/valid.conf ; echo "EXIT=$?"
-  [debug] /tmp/obs/valid.conf:12: reference &local_mailboxes
-  sql: NewBackend (open): sql: unknown driver "sqlite3" (forgotten import?)
+  $ timeout -s TERM 8 /tmp/obs/maddy_nocgo -debug -config /tmp/obs/valid.conf 2>/tmp/obs/nocgo.stderr ; echo "EXIT=$?"
   EXIT=2
+  $ cat -A /tmp/obs/nocgo.stderr
+  [debug] /tmp/obs/valid.conf:12: reference &local_mailboxes^I$
+  sql: NewBackend (open): sql: unknown driver "sqlite3" (forgotten import?)^I$
   ```
 
   The stdlib error `sql: unknown driver "sqlite3" (forgotten import?)` (from `database/sql`) is wrapped by
