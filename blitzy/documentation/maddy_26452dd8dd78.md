@@ -653,8 +653,8 @@ The default config comments the `default_source` reject as an anti-spoofing meas
 
 ```
 # maddy.conf:L115-L116
-# Prevent local senders from using non-local sender addresses since
-# this is likely a spoofing attempt.
+# Prevent local senders from using non-local sender addresses since this is
+# likely a spoofing attempt.
 # maddy.conf:L117-L119
 default_source {
     reject 501 5.1.8 "Non-local sender domain"
@@ -680,7 +680,7 @@ But the code's config enum is a **different set**:
 // internal/modify/dkim/dkim.go:L151-L152
 cfg.EnumList("require_sender_match", false, false,
     []string{"envelope", "auth_domain", "auth_user", "off"},
-    []string{"envelope", "auth"}, &r.senderMatch)
+    []string{"envelope", "auth"}, &senderMatch)
 ```
 
 This produces two concrete, testable contradictions, both confirmed at runtime by config-load tests that differ **only** in the `require_sender_match` value — each placed on **line 18** of the `sign_dkim` block, so the comparison is exact:
