@@ -12,9 +12,9 @@ This document answers, from **observed runtime behavior**, how the Maddy email s
 |----------|----------------|
 | Repository commit | `26452dd8dd787dc455278b0fdd296f4a5432c768` (branch `maddy_26452dd8dd78`) |
 | Go toolchain (observed) | `go version go1.18.10 linux/amd64` — see note below |
-| C compiler / CGO | `gcc (Debian 10.2.1-6) 10.2.1 20210110`, `CGO_ENABLED=1` (required by `github.com/mattn/go-sqlite3`) |
+| C compiler / CGO | `gcc (Debian 10.2.1-6) 10.2.1 20210110`, `CGO_ENABLED=1` (required by `github.com/mattn/go-sqlite3 v1.11.0`, `go.mod:L26`) |
 | Module lower bound | `go 1.13` (`go.mod:L3`) |
-| CI baseline | `go build ./...` (`.build.yml:L11`), `go test ./... -cover -race` (`.build.yml:L13`) |
+| CI baseline | `go build ./...` (`.build.yml:L11`), `go test ./... -cover -race` (`.build.yml:L14`) |
 | Binaries | `maddy`, `maddyctl` (prebuilt in the pinned image; `maddy -v` → `maddy unknown (built from source tree)`) |
 | Storage/auth backend | one `sql` (SQLite) instance serving BOTH `local_mailboxes` and `local_authdb` |
 | Endpoints exercised | `submission tls://0.0.0.0:4650` (implicit TLS), `submission tcp://0.0.0.0:4655` (plaintext, for wire visibility), `imap tls://0.0.0.0:4930` |
@@ -30,13 +30,17 @@ This document answers, from **observed runtime behavior**, how the Maddy email s
 
 ### What was built and run
 
-`maddy` and `maddyctl` were built from this repository inside the provided Docker image (`andrewparkscaleai/coding-agent:foxcpp__maddy__26452dd8dd787dc455278b0fdd296f4a5432c768`, from `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_foxcpp_maddy_1.0`) with `CGO_ENABLED=1` and `CC=gcc`. CGO is mandatory because `github.com/mattn/go-sqlite3 v1.11.0` is a C-backed driver. The repository's own CI (`.build.yml`) uses the same two commands as its baseline:
+`maddy` and `maddyctl` were built from this repository inside the provided Docker image (`andrewparkscaleai/coding-agent:foxcpp__maddy__26452dd8dd787dc455278b0fdd296f4a5432c768`, from `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_foxcpp_maddy_1.0`) with `CGO_ENABLED=1` and `CC=gcc`. CGO is mandatory because `github.com/mattn/go-sqlite3 v1.11.0` (`go.mod:L26`) is a C-backed driver. The repository's own CI (`.build.yml`) runs each task after a `cd maddy`, so the build command is at `.build.yml:L11` and the test command at `.build.yml:L14`:
 
 ```
-# .build.yml:L11
-- go build ./...
-# .build.yml:L13
-- go test ./... -cover -race
+# .build.yml — build task (L9-L11)
+- build: |
+    cd maddy
+    go build ./...
+# .build.yml — test task (L12-L14)
+- test: |
+    cd maddy
+    go test ./... -cover -race
 ```
 
 The observed toolchain:
@@ -62,7 +66,7 @@ A **plaintext `submission tcp://` endpoint with `insecure_auth`** was added *onl
 
 ### DKIM key auto-generation on first run
 
-The `sign_dkim` modifier's `key_path` default is `dkim_keys/{domain}_{selector}.key` (`internal/modify/dkim/dkim.go:L137`); generation and the emitted log occur at `internal/modify/dkim/dkim.go:L182-L195`. On first start the server logged (verbatim):
+The `sign_dkim` modifier's `key_path` default is `dkim_keys/{domain}_{selector}.key` (`internal/modify/dkim/dkim.go:L137`); key generation is driven from `internal/modify/dkim/dkim.go:L182-L195`. The **first** log line below is emitted by `generateKey` at `internal/modify/dkim/keys.go:L82` (`m.log.Printf("generating a new %s keypair...")`); the **second** is the post-generation summary at `internal/modify/dkim/dkim.go:L192-L195` (`"generated a new %s keypair, private key is in %s..."`). On first start the server logged (verbatim):
 
 ```
 sign_dkim: generating a new rsa2048 keypair...
@@ -83,6 +87,8 @@ $ maddyctl --config maddy-test.conf users list
 alice@example.org
 bob@example.org
 ```
+
+> **Ephemeral test credential (security note).** Both accounts use the throwaway password `AlicePass123` (and `bob`'s equivalent), created **only** inside the `/tmp/maddy-exp` sandbox and removed with the rest of the state afterward. It is a synthetic, test-only credential with **no validity outside the removed environment** — it is quoted verbatim in the AUTH transcripts below solely so those exchanges reproduce exactly.
 
 ### Startup banner (verbatim, `maddy -debug`)
 
@@ -132,11 +138,35 @@ The three sender constructions were driven over a live SMTP session (Python `smt
 | Unauthenticated `MAIL FROM` | *(none)* | `MAIL FROM:<alice@example.org>` before AUTH | `502 5.7.0 Please authenticate first` | Submission forces auth: `authAlwaysRequired = true` (`smtp.go:L589-L593`); `AnonymousLogin` → `smtp.ErrAuthRequired` (`smtp.go:L663`); library text `errors.New("Please authenticate first")` (`go-smtp/backend.go:9`) surfaced as `502` via the non-`SMTPError` fallback (`go-smtp/conn.go:270`) |
 | Bad credentials | *(bad login)* | `AUTH PLAIN` with wrong password | `454 4.7.0 Invalid credentials` | `Login` → `if !endp.Auth.CheckPlain(...) { … errors.New("Invalid credentials") }` (`smtp.go:L653-L655`), log `"authentication failed"` (`smtp.go:L654`); surfaced as `454` via `go-smtp/conn.go:438` |
 | **#1 same-domain impersonation** | `alice@example.org` | `MAIL FROM:<bob@example.org>` | `250 2.0.0 OK: queued` — **ACCEPTED** | Source block matched at **domain** level; local-part never compared to auth user (`msgpipeline.go:L155-L199`) |
-| **#2 non-local domain** | `alice@example.org` | `MAIL FROM:<user@notlocal.test>` | `501 5.1.8 Non-local sender domain` (at `RCPT TO`) | Falls through to `default_source` reject (`maddy.conf:L117-L119`); `rejectErr` returned in the sender phase (`msgpipeline.go:L117-L119`) |
+| **#2 non-local domain** | `alice@example.org` | `MAIL FROM:<user@notlocal.test>` | `501 5.1.8 Non-local sender domain (msg ID = 474fc532)` (at `RCPT TO`) | Falls through to `default_source` reject (`maddy.conf:L117-L119`); `rejectErr` returned in the sender phase (`msgpipeline.go:L117-L119`) |
 | **#3 legitimate signed** | `alice@example.org` | `MAIL FROM:<alice@example.org>`, `From: alice@example.org` | `250 2.0.0 OK: queued` — **ACCEPTED & signed** | Domain match + `shouldSign` all checks pass (`dkim.go:L264-L330`) |
 | Missing `From` header | `alice@example.org` | valid envelope, DATA lacks `From:` | `554 5.6.0 Message does not contains a From header field` *(source-derived, see note)* | `submissionPrepare` (`submission.go:L39-L48`, message text at `:L43`, grammatical quirk "contains" preserved) |
 
 > **Source-derived (not observed) entries.** The missing/invalid/malformed-header rows quote the **exact source string** with its `file:line`, clearly labeled — they were not separately captured in the transcript set. All other rows are **observed** verbatim wire lines. Additional header-fault strings from the same routine: `554 5.6.0 "Invalid address in <hdr>"` for a bad `Sender`/`To`/`Cc`/`Bcc`/`Reply-To` (`submission.go:L50-L81`), `554 5.6.0 "Invalid address in From"` (`submission.go:L83-L95`), `554 5.6.0 "Missing Sender header field"` (`submission.go:L99-L109`), and `554 "Malformed Date header"` **with no enhanced code** (`submission.go:L111-L123`).
+
+### Required exact reply literals (fenced)
+
+The two **observed** auth-gate wire responses (producing command: the `smtplib` client with `set_debuglevel(1)`; complete transcripts in R6):
+
+```
+send: b'MAIL FROM:<alice@example.org>'
+reply: b'502 5.7.0 Please authenticate first\r\n'
+```
+
+```
+send: b'AUTH PLAIN AGFsaWNlQGV4YW1wbGUub3JnAFdST05HcGFzc3dvcmQ='
+reply: b'454 4.7.0 Invalid credentials\r\n'
+```
+
+The **source-derived** header-fault replies — exact `Message` string literals from `submissionPrepare`, quoted from source and **not** separately captured on the wire (cited respectively at `submission.go:L43`, `:L56`/`:L72`, `:L88`, `:L103`, `:L116`; the last carries **no** enhanced code; the grammatical quirk "contains" is preserved verbatim):
+
+```
+554 5.6.0 Message does not contains a From header field
+554 5.6.0 Invalid address in <hdr>
+554 5.6.0 Invalid address in From
+554 5.6.0 Missing Sender header field
+554 Malformed Date header
+```
 
 ### The core answer: acceptance is **domain-scoped**, not user-scoped
 
@@ -151,13 +181,13 @@ The matched block's `rejectErr` is returned in the **MAIL FROM (sender) phase** 
 The server's own debug log makes the domain-level match explicit (verbatim):
 
 ```
-[debug] smtp/pipeline: sender bob@example.org matched by domain rule 'example.org'	{"msg_id":"7a820cc8"}
+[debug] smtp/pipeline: sender bob@example.org matched by domain rule 'example.org'	{"msg_id":"58dee01a"}
 ```
 
 and for the non-local case:
 
 ```
-[debug] smtp/pipeline: sender user@notlocal.test matched by default rule	{"msg_id":"67e1552f"}
+[debug] smtp/pipeline: sender user@notlocal.test matched by default rule	{"msg_id":"474fc532"}
 ```
 
 ### Reply-timing nuance — the `501` is **deferred to `RCPT TO`**
@@ -165,24 +195,24 @@ and for the non-local case:
 `defer_sender_reject` (default `true`) defers a sender rejection to the `RCPT TO` phase to limit information leakage. The transcript confirms this precisely: the non-local `MAIL FROM` is first **accepted** with a `250`, and the `501` only appears **after `RCPT TO`** (verbatim client/server trace):
 
 ```
-send: 'MAIL FROM:<user@notlocal.test>\r\n'
-reply: '250 2.0.0 Roger, accepting mail from <user@notlocal.test>\r\n'
-send: 'RCPT TO:<alice@example.org>\r\n'
-reply: '501 5.1.8 Non-local sender domain\r\n'
+send: b'MAIL FROM:<user@notlocal.test>'
+reply: b'250 2.0.0 Roger, accepting mail from <user@notlocal.test>\r\n'
+send: b'RCPT TO:<alice@example.org>'
+reply: b'501 5.1.8 Non-local sender domain (msg ID = 474fc532)\r\n'
 ```
 
 The matching server-side debug log:
 
 ```
 submission: RCPT error	{"effective_rcpt":"alice@example.org","rcpt":"alice@example.org","reason":"reject directive used","smtp_code":501,"smtp_enchcode":"5.1.8","smtp_msg":"Non-local sender domain"}
-submission: aborted	{"msg_id":"67e1552f"}
+submission: aborted	{"msg_id":"474fc532"}
 ```
 
-For contrast, the accepted legitimate message ends with the queued acknowledgment (verbatim):
+For contrast, the accepted legitimate message ends with the DATA payload send and the queued acknowledgment (verbatim):
 
 ```
-send: '.\r\n'
-reply: '250 2.0.0 OK: queued\r\n'
+send: b'From: alice@example.org\r\nTo: alice@example.org\r\nSubject: Scenario3 legitimate signed\r\n\r\nHello from scenario 3, this should be DKIM signed.\r\n.\r\n'
+reply: b'250 2.0.0 OK: queued\r\n'
 ```
 
 ### Rationale
@@ -193,9 +223,30 @@ Authentication is mandatory on the submission endpoint (`smtp.go:L589-L593`), bu
 
 ## R4 — Actual stored headers (quoted verbatim, not summarized)
 
-For an accepted/delivered message the raw RFC822 was fetched from `alice`'s `INBOX` (via IMAP `FETCH` over `imap tls://…:4930`, cross-checked against the on-disk store read with Python's `sqlite3` module — `maddyctl imap-msgs` at `cmd/maddyctl/main.go:L307` is the equivalent CLI path). The stored headers are quoted **exactly** below.
+For an accepted/delivered message the raw RFC822 was fetched from `alice`'s `INBOX` via IMAP `FETCH (BODY.PEEK[])` over `imap tls://…:4930` (exactly what a recipient's client retrieves), and cross-checked against the on-disk store read with Python's `sqlite3` module. The equivalent CLI path is `maddyctl imap-msgs … dump` (subcommand defined at `cmd/maddyctl/main.go:L534-L556`; the `imap-msgs` command group is registered at `cmd/maddyctl/main.go:L307`). The stored headers are quoted **exactly** below.
+
+**Producing command** (the IMAP fetch client; full script `fetch_imap.py`):
+
+```python
+import imaplib, ssl, re
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+M = imaplib.IMAP4_SSL("127.0.0.1", 4930, ssl_context=ctx)
+M.login("alice@example.org", "AlicePass123")   # ephemeral test-only credential
+typ, data = M.select("INBOX")
+for i in range(1, int(data[0]) + 1):
+    typ, msgdata = M.fetch(str(i), "(BODY.PEEK[])")
+    print(msgdata[0][1].decode("utf-8", "replace"))   # raw RFC822 bytes
+```
+
+```
+$ python3 fetch_imap.py
+### IMAP SELECT INBOX -> 4 message(s)
+```
 
 ### The legitimate, signed message (Scenario 3) — full stored header block
+
+The raw `BODY.PEEK[]` bytes for the Scenario-3 message, quoted verbatim (fetched by the command above; identical bytes were also dumped to `s3_raw.eml` and read back with `sqlite3`):
 
 ```
 Delivered-To: alice@example.org
@@ -203,30 +254,32 @@ Return-Path: <alice@example.org>
 Dkim-Signature: a=rsa-sha256;
  bh=PaB//6aGE2gmBdiR2saRJtAdGopzAmohJeW/w1DOtQc=; c=relaxed/relaxed;
  d=example.org;
- h=Subject:Subject:Sender:To:To:Cc:From:From:Date:Date:MIME-Version:MIME-Version:Content-Type:Content-Type:Content-Transfer-Encoding:Reply-To:In-Reply-To:Message-Id:Message-Id:References:Autocrypt:Openpgp; i=alice@example.org; s=default; t=1782883915; v=1; x=1783315915; b=LTbnnqOlgHGaQDfiqcL5wLc8VeRUYUtxoKmR5wkLd+cGymJ8bYwuldlKmglORu3H1VkpBfWYmIYoQp8hPyrmAlqZ8rh03SXDkRW0UVGGsYIvKePJy8qoHJFLN8QEb93VU1DUfDrjNjTiKteNh91d+YojlMeN2UbdkNEtSr5DbAOqHib9dd4ujcHyrlh9JSCoXVF3kN8kIeg4WfEy8pN2RHCwPW3jzbBdEYFRMUOtmozqy2dQD15NdHNNykL2ziO4KbG6fGbmB2HqVeMVjrs7m9BsrxUTDVtONaUnC4DeiaUSpFULLvGkckBjv0IJm5hltHs4rCKlrqJGHOeBQ/YxyA==;
-Received:  by example.org (envelope-sender <alice@example.org>) with ESMTP id 098774b5; Wed, 01 Jul 2026 05:31:55 +0000
-Date: Wed, 1 Jul 2026 05:31:55 +0000
-Message-Id: <46bf47e9-5bc8-4bcc-a36e-48ccc6020814@example.org>
+ h=Subject:Subject:Sender:To:To:Cc:From:From:Date:Date:MIME-Version:Content-Type:Content-Transfer-Encoding:Reply-To:In-Reply-To:Message-Id:Message-Id:References:Autocrypt:Openpgp; i=alice@example.org; s=default; t=1782888142; v=1; x=1783320142; b=3WxR3q9eWLGEjngkav1XV2fLi1+9PK4yey5SeGw4Q1ygUtHiGhvgMwbm7qEwCZhu43+vpOyW+xsJ2E6bZyWbVT9I5pBNF7CO02OK8WUZHyUawSgg+OnLKiSRmbkdeZ3cZdz9Z1PxYPrDFUxO/E5craPeIDR42RkRQIIt4s6xSH5wr9tcFzG33Wl/vOKa473xuAXPdupJDw0ZRNNbTrDspHo0IB8BQjagnAwt/PRfINu38GiUUlRISNYGl4s8RufFAYRsty0YDogzv+/SL1+x3meAR/LwcIwKmvr25G27mSPxnxpltesG+2GlT2ZmN8yzIQeXDLYasP25FQiXPzZvIA==;
+Received:  by example.org (envelope-sender <alice@example.org>) with ESMTP
+ id 3366387b; Wed, 01 Jul 2026 06:42:22 +0000
+Date: Wed, 1 Jul 2026 06:42:22 +0000
+Message-Id: <89ba16c0-8a6d-40ba-bf95-850f2969d663@example.org>
 From: alice@example.org
 To: alice@example.org
 Subject: Scenario3 legitimate signed
-MIME-Version: 1.0
-Content-Type: text/plain
 ```
+
+(This client submitted no `MIME-Version`/`Content-Type`, so those fields are absent from the stored message — and, as noted below, they appear only **once** in the `h=` tag rather than doubled.)
 
 ### `DKIM-Signature` — observations
 
 - The full `b=` and `bh=` base64 values above are reproduced **character-for-character** as stored.
-- **The header is stored as `Dkim-Signature:`**, not `DKIM-Signature:` — the storage layer (`go-imap-sql`) re-cased the field name on write. This exact re-casing matters for R5 (it is one of the two reasons the signature does not verify).
+- **The header is stored as `Dkim-Signature:`**, not `DKIM-Signature:` — the storage layer (`go-imap-sql`) re-cased the field name on write. This re-casing is a visible symptom of the header set being re-serialized after signing, but it is **not, by itself, a cause of verification failure**: DKIM relaxed *header* canonicalization lower-cases field names before hashing (RFC 6376 §3.4.2), so `Dkim-Signature` and `DKIM-Signature` canonicalize identically. The actual verification outcome and its causes are established empirically in R5.
 - Tags appear in **alphabetical order** (`a`, `bh`, `c`, `d`, `h`, `i`, `s`, `t`, `v`, `x`, `b`) — `v=1` is **not** first.
-- The `h=` tag contains **`From:From`** (doubled), i.e. `From` is **over-signed**, so a verifier sees `From` covered by the signature. This follows from `From` being present in `oversignDefault` (`internal/modify/dkim/dkim.go:L30-L38`, `From` at `:L37`). (Over-signing lists each name twice so that adding a second instance of that header post-signing breaks the signature.)
+- The `h=` tag contains **`From:From`** (doubled), i.e. `From` is **over-signed**, so a verifier sees `From` covered by the signature. This follows from `From` being present in `oversignDefault` (`internal/modify/dkim/dkim.go:L30-L38`, `From` at `:L37`). Over-signing lists a header name a second time so that *adding* a later instance of that header breaks the signature. Note the mechanics observed here: a header actually **present** in the message is listed **twice** (`From:From`, `Subject:Subject`, `To:To`, `Date:Date`, `Message-Id:Message-Id`), whereas a header the client did **not** send appears **once** (`MIME-Version`, `Content-Type`, `Content-Transfer-Encoding`) — which is exactly why this run's `h=` tag shows those three singly (the client omitted them), unlike a client that supplies them.
 
 ### `Received` — client-origin stripping and the double-space quirk
 
-Quoted exactly (note the **double space** after `Received:` and the **absence of any `from <client>` clause**):
+Quoted exactly (note the **double space** after `Received:`, the **absence of any `from <client>` clause**, and the header folding onto a continuation line before `id`):
 
 ```
-Received:  by example.org (envelope-sender <alice@example.org>) with ESMTP id 098774b5; Wed, 01 Jul 2026 05:31:55 +0000
+Received:  by example.org (envelope-sender <alice@example.org>) with ESMTP
+ id 3366387b; Wed, 01 Jul 2026 06:42:22 +0000
 ```
 
 The shape is `Received:  by <hostname> (envelope-sender <…>) with <PROTO> id <id>; <RFC1123Z date>`. The client origin is stripped because the submission path sets `msgMeta.DontTraceSender = true` (`internal/endpoint/smtp/submission.go:L28`), and `GenerateReceived` gates the `from <client>` clause on `!msgMeta.DontTraceSender && (…SMTP/LMTP…)` (`internal/target/received.go:L30-L31`). With that clause omitted, the assembled value **begins with a leading space** (` by …`, written as `builder.WriteString(" by ")` at `received.go:L62`), which serializes to the visible **double space** after `Received:`.
@@ -234,25 +287,46 @@ The shape is `Received:  by <hostname> (envelope-sender <…>) with <PROTO> id <
 A companion message submitted over the **implicit-TLS** endpoint (port 4650) shows the protocol token differs — `with ESMTPS` instead of `ESMTP` — while the double-space/stripped-origin shape is identical (verbatim):
 
 ```
-Received:  by example.org (envelope-sender <alice@example.org>) with ESMTPS id a69c6a16; Wed, 01 Jul 2026 05:47:29 +0000
+Received:  by example.org (envelope-sender <alice@example.org>) with ESMTPS
+ id da0add66; Wed, 01 Jul 2026 06:42:22 +0000
 ```
 
-This matches the endpoint setting the session protocol to `ESMTPS` when TLS is active vs `ESMTP` otherwise (`internal/endpoint/smtp/smtp.go`, `newSession`).
+This matches the endpoint setting the session protocol string to `ESMTPS` when TLS is active vs `ESMTP` otherwise — `newSession` sets `Proto = "ESMTPS"` (`internal/endpoint/smtp/smtp.go:L692`) or `"ESMTP"` (`:L694`) based on `state.TLS.HandshakeComplete` (`internal/endpoint/smtp/smtp.go:L691-L694`).
 
 ### `Message-Id` and `Date` — inserted by the submission modifier
 
 Both were **inserted by Maddy** because the client omitted them. Message-ID insertion is at `internal/endpoint/smtp/submission.go:L30-L37`; Date insertion at `:L124-L127`. The stored values (verbatim):
 
 ```
-Date: Wed, 1 Jul 2026 05:31:55 +0000
-Message-Id: <46bf47e9-5bc8-4bcc-a36e-48ccc6020814@example.org>
+Date: Wed, 1 Jul 2026 06:42:22 +0000
+Message-Id: <89ba16c0-8a6d-40ba-bf95-850f2969d663@example.org>
 ```
 
 Note the inserted `Date` uses a **non-zero-padded day** (`Wed, 1 Jul`) — a direct consequence of the Go layout `"Mon, 2 Jan 2006 15:04:05 -0700"` used at `submission.go:L126` — whereas the `Received` header's own date is RFC1123Z with a **zero-padded** day (`Wed, 01 Jul`). The two dates in the same message are formatted differently.
 
 ### `Authentication-Results` — explicitly **ABSENT**
 
-There is **no** `Authentication-Results` header on the submitted/locally-delivered mail — confirmed by grepping every stored message (zero matches). This is expected: that header is produced only by **inbound checks** — `internal/check/dkim/dkim.go:L115-L187` builds an `authres.DKIMResult` and `internal/check/spf/spf.go:L117-L156` builds an `authres.SPFResult` — and the **submission path has no `check{}` block** (contrast the port-25 `smtp` pipeline's `check { … }` at `maddy.conf:L53-L66`). Submission signs outbound mail; it does not verify it, so it writes no authentication-results.
+There is **no** `Authentication-Results` header on the submitted/locally-delivered mail — confirmed two independent ways, each shown with its producing command and verbatim output.
+
+**(a) Scan every message fetched over IMAP.** `fetch_imap.py` counts case-insensitive `^Authentication-Results:` occurrences across all fetched messages and prints the tally. The capture below is **abridged**: between the `SELECT` line and the final tally, `fetch_imap.py` prints the four per-message header dumps — those are exactly the headers already quoted verbatim in R4 above — so only the first and last lines are reproduced here, with the omission marked by an explicit editorial bracket (not literal script output):
+
+```
+$ python3 fetch_imap.py
+### IMAP SELECT INBOX -> 4 message(s)
+[... 4 per-message header dumps omitted here — each is quoted verbatim in R4 above ...]
+### Authentication-Results scan: 0 match(es) across 4 stored message(s)
+```
+
+**(b) Grep the on-disk store directly.** Across Maddy's SQLite state directory (external body blobs included) and, separately, across every full IMAP-fetched body:
+
+```
+$ grep -ric "authentication-results" /exp/state | grep -v ":0$"
+(no files with matches under /exp/state)
+$ python3 fetch_imap.py "" --full | grep -ic "^authentication-results:"
+0
+```
+
+Both methods return **zero**. This is expected: that header is produced only by **inbound checks** — `internal/check/dkim/dkim.go:L115-L187` builds an `authres.DKIMResult` and `internal/check/spf/spf.go:L117-L156` builds an `authres.SPFResult` — and the **submission path has no `check{}` block** (contrast the port-25 `smtp` pipeline's `check { … }` at `maddy.conf:L53-L66`). Submission signs outbound mail; it does not verify it, so it writes no authentication-results.
 
 ### Rationale
 
@@ -273,7 +347,7 @@ This was implemented as Scenario 4: authenticate as `alice@example.org`, `MAIL F
 The message was **accepted** (`250 2.0.0 OK: queued`) and stored, but with **no** `DKIM-Signature` header. The server's debug log states exactly why (verbatim):
 
 ```
-sign_dkim: not signing, From domain is not key domain	{"from_domain":"otherdomain.test","key_domain":"example.org","msg_id":"e68d904d"}
+sign_dkim: not signing, From domain is not key domain	{"from_domain":"otherdomain.test","key_domain":"example.org","msg_id":"e0ea3e6d"}
 ```
 
 This is the branch `if !dns.Equal(fromDomain, m.domain) { … return "", false }` in `shouldSign()` (`internal/modify/dkim/dkim.go:L287-L291`). `RewriteBody` then does `id, ok := s.m.shouldSign(...); if !ok { return nil }` — returning **without** adding a signature (`internal/modify/dkim/dkim.go:L340-L351`, silent-skip at `:L349-L351`). There is **no rejection path here**: a signing failure never becomes an SMTP error.
@@ -283,15 +357,16 @@ The stored Scenario 4 message confirms the absence (verbatim header block):
 ```
 Delivered-To: alice@example.org
 Return-Path: <alice@example.org>
-Received:  by example.org (envelope-sender <alice@example.org>) with ESMTP id e68d904d; Wed, 01 Jul 2026 05:31:56 +0000
-Date: Wed, 1 Jul 2026 05:31:56 +0000
-Message-Id: <03f5fed1-edd4-4f3c-b962-e6694600f1ce@example.org>
+Received:  by example.org (envelope-sender <alice@example.org>) with ESMTP
+ id e0ea3e6d; Wed, 01 Jul 2026 06:42:22 +0000
+Date: Wed, 1 Jul 2026 06:42:22 +0000
+Message-Id: <bbab0466-7368-4506-9844-b2c381197330@example.org>
 From: mallory@otherdomain.test
 To: alice@example.org
 Subject: Scenario4 DKIM From-mismatch
-MIME-Version: 1.0
-Content-Type: text/plain
 ```
+
+(No `DKIM-Signature` header is present — the message was delivered unsigned.)
 
 ### Both non-signing branches were observed
 
@@ -301,7 +376,7 @@ There are two distinct reasons `shouldSign` can decline, and **both** were captu
 - **`From` ≠ authenticated identity** (Scenario 1: auth `alice`, `From: bob@example.org` — same domain, different user): the message was still **accepted and delivered unsigned**, with the log:
 
 ```
-sign_dkim: not signing, From address is not authenticated identity	{"auth_id":"alice@example.org","from_addr":"bob@example.org","msg_id":"7a820cc8"}
+sign_dkim: not signing, From address is not authenticated identity	{"auth_id":"alice@example.org","from_addr":"bob@example.org","msg_id":"58dee01a"}
 ```
 
 This is the `auth` check at `dkim.go:L299-L310`. It confirms that the **same-domain impersonation** that R2/R3 showed is *accepted at the SMTP layer* is *also not signed* — the two mechanisms are independent.
@@ -322,27 +397,62 @@ The `require_sender_match` policy — default `["envelope","auth"]` (`internal/m
 
 ### What a verifying recipient actually sees: **DKIM `FAIL`, for two independent reasons**
 
-The most consequential run-first finding: **even the *legitimate* signed message does not verify.** This was established with the **authoritative** verifier — `github.com/emersion/go-msgauth/dkim`, the *same library Maddy signs with* — built into a tiny containerized checker that injected the generated public key via `go-mockdns` and called `dkim.Verify` on the stored message.
+The most consequential run-first finding: **even the *legitimate* signed message does not verify.** This was established with the **authoritative** verifier — `github.com/emersion/go-msgauth/dkim`, the *same library Maddy signs with* — built into a tiny checker that injects the generated public key via `go-mockdns` and calls `dkim.Verify` on the stored message. **Producing code and command** (the verifier's core; `verifier/main.go`), run fully offline (`--network none`) so no real DNS is consulted:
+
+```go
+// verify a stored message against a DKIM TXT record served from an in-process mock resolver.
+// (DKIM TXT records exceed a single 255-byte DNS character-string, so the record is split into
+//  <=255-byte chunks; go-msgauth rejoins them — otherwise the mock resolver cannot serve it.)
+func chunk255(s string) []string {
+    var out []string
+    for len(s) > 255 { out = append(out, s[:255]); s = s[255:] }
+    return append(out, s)
+}
+srv, _ := mockdns.NewServer(map[string]mockdns.Zone{
+    "default._domainkey.example.org.": {TXT: chunk255(txtRecord)},
+})
+srv.PatchNet(net.DefaultResolver)                 // route go-msgauth's lookups to the mock
+f, _ := os.Open(msgPath)
+verifs, err := dkim.Verify(f)                      // github.com/emersion/go-msgauth/dkim
+for _, v := range verifs {
+    if v.Err == nil { fmt.Printf("PASS: domain=%s\n", v.Domain) } else { fmt.Printf("FAIL: %v\n", v.Err) }
+}
+```
+
+```
+$ GOFLAGS=-mod=readonly GOPROXY=off go build -o verifier .
+$ ./verifier s3_raw.eml dkim_keys/example.org_default.dns dkim_keys/example.org_default.key
+```
 
 The generated public-key TXT record (`dkim_keys/example.org_default.dns`, verbatim):
 
 ```
-v=DKIM1; k=rsa; p=MIIBCgKCAQEAvP4z7qigv4UE08+/FkOz9g1WO7Unf/+IdJF6TJmkAwgs8/sf7/bRDhkU+Zzd7d+UWUP998EkAoqKZJWQkFDL4Hj6VqcgxhdkrUB6kpX7M10bCRZAXNMZHH+lzbgWaNsc2GZw/dhgCfsBskBR+MuzN31C276UKtwkCY+ko/SP1+M40W3DkIb3lWnlhjtPwL0ppDxi6DHxtFFNYRSrWROJMwox2UoeO8teikJd2C5XzX3Q+w6DT8XBLSw12mzg1EahZozCXn2shgMV5qmSBbx9QjpYps7JbKjkByqRk1oRq0EFR3kqs91MuhqFT4LrS3ZhzpdaULp0AmBDK99lNlgWfQIDAQAB
+v=DKIM1; k=rsa; p=MIIBCgKCAQEA5lvUrehaSTsEDez9FHSRlKcb/3Mev8fLRpuIsR8RYIpsOppTLTi2CA9ugYT1qKkBIUI/wOr4G2Wt1nWy6FhVLkWQfdtRYHEVipcZe/y4KAIYK2GBKtqEs72VQYzvVD5OC/2848UI2sLyShJMv43bbHc9Msooj7vFodA6cLi8i+qQ4wi9gRoExK1yTovfaSTAggMcZYd4xA3MTeoe6+WCUKBXDjJhprIQzcxEB7Q8oaH+j72muRRi25o0nYo7z5c+FBR1L9FJCOx3V73MYDP5750S6IPDzaLY2BC/4IxoE3ki0H9SSBzX2PEov20zwD925WkIBlVvj+O1+GH2zFhO+QIDAQAB
 ```
 
-**Defect A — PKCS#1 vs PKIX public-key encoding.** The `p=` value decodes to a DER blob beginning `3082010a0282010100…` = `SEQUENCE { INTEGER(257 bytes), … }`, i.e. a **bare PKCS#1 `RSAPublicKey`**. A proper DKIM record carries a **SubjectPublicKeyInfo (PKIX/SPKI)** structure, which would begin `MIIBIjANBgkqhkiG9w0BAQEF…`. Maddy writes the key with `x509.MarshalPKCS1PublicKey` (`internal/modify/dkim/keys.go:L143`), but go-msgauth's verifier parses it with `x509.ParsePKIXPublicKey`. The verifier's verdict on Maddy's own record (verbatim, identical for both bare-LF and CRLF message variants):
+The verifier's **verbatim** output on the stored Scenario-3 message (`s3_raw.eml`) — two records tested against the same signed message — was:
 
 ```
-FAIL: dkim: key syntax error: x509: failed to parse public key (use ParsePKCS1PublicKey instead for this key format)
+TEST 1 record (Maddy .dns, PKCS#1): v=DKIM1; k=rsa; p=MIIBCg ...
+[TEST1 maddy-key] FAIL: dkim: key syntax error: x509: failed to parse public key (use ParsePKCS1PublicKey instead for this key format)
+TEST 2 record (re-encoded PKIX): v=DKIM1; k=rsa; p=MIIBIj ...
+[TEST2 pkix-key] FAIL: dkim: signature did not verify: crypto/rsa: verification error
 ```
 
-**Defect B — post-signing re-serialization.** To prove the failure is not *only* the key encoding, the same key was re-encoded as proper SPKI and the verification retried. It **still failed** — now at the signature check itself (verbatim, both variants):
+**Defect A — PKCS#1 vs PKIX public-key encoding (TEST 1).** The `p=` value decodes to a DER blob beginning `30 82 01 0a 02 82 01 01 00 …` (its base64 prefix is `MIIBCg`), i.e. a `SEQUENCE { INTEGER(257 bytes), … }` — a **bare PKCS#1 `RSAPublicKey`**. A proper DKIM record carries a **SubjectPublicKeyInfo (PKIX/SPKI)** structure, whose base64 begins `MIIBIjANBgkqhkiG9w0BAQEF…`. Maddy writes the key with `x509.MarshalPKCS1PublicKey` (`internal/modify/dkim/keys.go:L143`), but go-msgauth's verifier parses it with `x509.ParsePKIXPublicKey`. Hence, against Maddy's own record, the verifier fails at the **key-parse** step (the `[TEST1 maddy-key]` line above) — a `permerror` a strict verifier would treat as "cannot evaluate this signature."
+
+**Defect B — the signature does not verify even with a parseable key (TEST 2).** To look *past* the key-encoding defect, the exact same RSA key was re-encoded as proper SPKI (`x509.MarshalPKIXPublicKey`, base64 begins `MIIBIj`) and the verification retried against the identical message. It **still failed**, now at the signature check itself: `[TEST2 pkix-key] FAIL: dkim: signature did not verify: crypto/rsa: verification error`.
+
+Crucially, go-msgauth checks the **body hash first** and only then the **signature (header hash)** — the body-hash check precedes the RSA verification in `verify.go`. So a `crypto/rsa: verification error` (rather than a "body hash did not verify" error) proves the **body hash already matched** and the failure is isolated to the **header hash**. That was confirmed independently by recomputing the relaxed body hash in Python and comparing it to the stored `bh=` (**producing command** `bodyhash.py`):
 
 ```
-FAIL: dkim: signature did not verify: crypto/rsa: verification error
+$ python3 bodyhash.py s3_raw.eml
+recomputed bh = PaB//6aGE2gmBdiR2saRJtAdGopzAmohJeW/w1DOtQc=
+stored     bh = PaB//6aGE2gmBdiR2saRJtAdGopzAmohJeW/w1DOtQc=
+MATCH = True
 ```
 
-An independent Python reproduction isolated the cause: the **body hash** recomputes and **matches** the stored `bh=` value (`PaB//6aGE2gmBdiR2saRJtAdGopzAmohJeW/w1DOtQc=`, `MATCH=True`), so the body canonicalization is fine — but the **header hash** fails, consistent with the storage layer re-serializing the header set (notably re-casing `DKIM-Signature` → `Dkim-Signature`, as shown in R4) so the delivered header bytes differ from the bytes that were signed.
+Therefore the cause is **post-signing re-serialization of the header set by the storage layer**: the header bytes the recipient hashes differ from the bytes Maddy signed. **This is *not* attributable to the `DKIM-Signature` → `Dkim-Signature` field-name re-casing** — DKIM relaxed header canonicalization lower-cases field names before hashing (RFC 6376 §3.4.2), so that specific change is canonicalized away and cannot itself break the signature. The re-casing is merely a *visible marker* that the stored headers were re-serialized after signing; the byte-level drift in the signed header set (established by the matching body hash but failing signature) is the operative cause.
 
 ### Rationale and the bottom line for R5
 
@@ -356,15 +466,26 @@ An independent Python reproduction isolated the cause: the **body hash** recompu
 
 ### Why raw `tcpdump` is not viable for the default endpoint
 
-The default submission endpoint uses **implicit TLS on port 465**, so a packet sniffer sees only encrypted, opaque payload bytes. Byte-level capture of the *plaintext* protocol therefore requires either client-side tracing inside the TLS session or a temporary plaintext endpoint. That the default endpoint is genuinely implicit-TLS was confirmed directly (verbatim):
+The default submission endpoint uses **implicit TLS on port 465**, so a packet sniffer sees only encrypted, opaque payload bytes. Byte-level capture of the *plaintext* protocol therefore requires either client-side tracing inside the TLS session or a temporary plaintext endpoint. That the default endpoint is genuinely implicit-TLS was confirmed directly with `openssl s_client`. **Producing command and full verbatim output** (`openssl -brief`, which prints the handshake summary rather than eliding it):
 
 ```
-$ echo Q | openssl s_client -connect 127.0.0.1:4650 -quiet
-...(TLS handshake)...
+$ printf 'QUIT\r\n' | openssl s_client -connect 127.0.0.1:4650 -brief -crlf
+Can't use SSL_get_servername
+depth=0 CN = example.org
+verify error:num=18:self signed certificate
+CONNECTION ESTABLISHED
+Protocol version: TLSv1.3
+Ciphersuite: TLS_AES_128_GCM_SHA256
+Peer certificate: CN = example.org
+Hash used: SHA256
+Signature type: RSA-PSS
+Verification error: self signed certificate
+Server Temp Key: X25519, 253 bits
 220 example.org ESMTP Service Ready
+DONE
 ```
 
-The `220` banner arrives **only after** the TLS handshake completes — proof the endpoint speaks TLS immediately, with no `STARTTLS` step.
+The `220 example.org ESMTP Service Ready` banner arrives **only after** `CONNECTION ESTABLISHED` (a completed `TLSv1.3` handshake, self-signed cert `CN = example.org`) — proof the endpoint speaks TLS immediately, with no `STARTTLS` step. (A `-quiet` capture was also taken; it shows the same self-signed-certificate verify lines followed by `220 example.org ESMTP Service Ready` then `221 2.0.0 Goodnight and good luck` on `QUIT`.)
 
 ### Methods actually used
 
@@ -372,30 +493,58 @@ The `220` banner arrives **only after** the TLS handshake completes — proof th
 2. **Maddy `debug` logging** to expose pipeline decisions — the msgpipeline "matched by … rule" lines (`internal/msgpipeline/msgpipeline.go:L194,L196,L199`) and the `sign_dkim: not signing …` lines.
 3. **The documented fallback** — a temporary **plaintext `submission tcp://` endpoint with `insecure_auth`** in the ephemeral config, which makes the exact protocol bytes observable (and would allow a `tcpdump` byte capture). The startup banner explicitly warned about it: `submission: authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!`
 
-The producing client (abridged to the essentials):
+The producing client is `client.py` — a raw-socket client that reads the `220` greeting on connect and traces every `send:`/`reply:` line, including the DATA payload as its own traced send. Its core and the Scenario-3 driver (verbatim excerpt):
 
 ```python
-import socket, base64
-s = socket.create_connection(("127.0.0.1", 4655))
-def cmd(line):
-    s.sendall(line + b"\r\n"); print("send:", line); 
-    data = s.recv(4096); print("reply:", data)
-cmd(b"EHLO client.test")
-authz = b"\x00alice@example.org\x00AlicePass123"
-cmd(b"AUTH PLAIN " + base64.b64encode(authz))
-cmd(b"MAIL FROM:<alice@example.org>")
-cmd(b"RCPT TO:<alice@example.org>")
-cmd(b"DATA")
-s.sendall(b"From: alice@example.org\r\nTo: alice@example.org\r\n"
-          b"Subject: Scenario3 legitimate signed\r\n\r\n"
-          b"Hello from scenario 3, this should be DKIM signed.\r\n.\r\n")
-print("reply:", s.recv(4096))
-cmd(b"QUIT")
+import socket, ssl, base64
+class Conn:
+    def __init__(self, port, use_tls=False):
+        self.trace = []
+        raw = socket.create_connection(("127.0.0.1", port), timeout=10)
+        if use_tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+            self.s = ctx.wrap_socket(raw, server_hostname="example.org")
+        else:
+            self.s = raw
+        self.f = self.s.makefile("rb")
+        self._read_reply()                        # 220 greeting (traced as reply:)
+    def _read_reply(self):
+        lines = []
+        while True:
+            line = self.f.readline()
+            if not line: break
+            lines.append(line)
+            if len(line) >= 4 and line[3:4] == b" ": break   # "250 " ends; "250-" continues
+        data = b"".join(lines); self.trace.append(("reply", data)); return data
+    def cmd(self, line):
+        self.s.sendall(line + b"\r\n"); self.trace.append(("send", line)); return self._read_reply()
+    def data(self, payload):
+        self.s.sendall(payload); self.trace.append(("send", payload)); return self._read_reply()
+
+def auth_plain(u, p):
+    return b"AUTH PLAIN " + base64.b64encode(b"\x00" + u.encode() + b"\x00" + p.encode())
+
+# Scenario 3 (ACCEPTED): auth alice, MAIL FROM alice, From alice -> signed
+c = Conn(4655)
+c.cmd(b"EHLO client.test")
+c.cmd(auth_plain("alice@example.org", "AlicePass123"))    # ephemeral test-only credential
+c.cmd(b"MAIL FROM:<alice@example.org>")
+c.cmd(b"RCPT TO:<alice@example.org>")
+c.cmd(b"DATA")
+c.data(b"From: alice@example.org\r\nTo: alice@example.org\r\n"
+       b"Subject: Scenario3 legitimate signed\r\n\r\n"
+       b"Hello from scenario 3, this should be DKIM signed.\r\n.\r\n")
+c.cmd(b"QUIT")
+print("\n".join("%s: %r" % (d, b) for d, b in c.trace))
 ```
 
 ### Verbatim ACCEPTED transaction (Scenario 3 — the legitimate, signed message)
 
+The complete transaction from the `220` greeting through `QUIT`, **including the DATA payload send** (`$ python3 client.py s3 4655`):
+
 ```
+reply: b'220 example.org ESMTP Service Ready\r\n'
 send: b'EHLO client.test'
 reply: b'250-Hello client.test\r\n250-PIPELINING\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-STARTTLS\r\n250-AUTH PLAIN\r\n250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
 send: b'AUTH PLAIN AGFsaWNlQGV4YW1wbGUub3JnAEFsaWNlUGFzczEyMw=='
@@ -406,6 +555,7 @@ send: b'RCPT TO:<alice@example.org>'
 reply: b"250 2.0.0 I'll make sure <alice@example.org> gets this\r\n"
 send: b'DATA'
 reply: b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+send: b'From: alice@example.org\r\nTo: alice@example.org\r\nSubject: Scenario3 legitimate signed\r\n\r\nHello from scenario 3, this should be DKIM signed.\r\n.\r\n'
 reply: b'250 2.0.0 OK: queued\r\n'
 send: b'QUIT'
 reply: b'221 2.0.0 Goodnight and good luck\r\n'
@@ -414,22 +564,41 @@ reply: b'221 2.0.0 Goodnight and good luck\r\n'
 Matching server-side debug log (verbatim):
 
 ```
-[debug] smtp/pipeline: sender alice@example.org matched by domain rule 'example.org'	{"msg_id":"098774b5"}
+[debug] smtp/pipeline: sender alice@example.org matched by domain rule 'example.org'	{"msg_id":"3366387b"}
+submission: RCPT ok	{"msg_id":"3366387b","rcpt":"alice@example.org"}
 submission: adding missing Message-ID
 submission: adding missing Date header
 [debug] sign_dkim: signed	{"identifier":"alice@example.org"}
-submission: accepted	{"msg_id":"098774b5"}
+submission: accepted	{"msg_id":"3366387b"}
 ```
 
 ### Verbatim REJECTED transaction (Scenario 2 — the non-local domain)
 
+**Producing command/snippet** for the rejected flow (`$ python3 client.py s2 4655`; the `scenario2_rejected` driver, using the same `Conn`/`auth_plain` helpers shown above):
+
+```python
+# Scenario 2 (REJECTED): auth alice, MAIL FROM user@notlocal.test (non-local domain)
+c = Conn(4655)
+c.cmd(b"EHLO client.test")
+c.cmd(auth_plain("alice@example.org", "AlicePass123"))     # ephemeral test-only credential
+c.cmd(b"MAIL FROM:<user@notlocal.test>")
+c.cmd(b"RCPT TO:<alice@example.org>")                       # 501 surfaces here (deferred)
+c.cmd(b"QUIT")
+print("\n".join("%s: %r" % (d, b) for d, b in c.trace))
 ```
+
+The complete transaction from the `220` greeting through `QUIT` (note the `501` carries a run-specific `(msg ID = …)` suffix):
+
+```
+reply: b'220 example.org ESMTP Service Ready\r\n'
+send: b'EHLO client.test'
+reply: b'250-Hello client.test\r\n250-PIPELINING\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-STARTTLS\r\n250-AUTH PLAIN\r\n250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
 send: b'AUTH PLAIN AGFsaWNlQGV4YW1wbGUub3JnAEFsaWNlUGFzczEyMw=='
 reply: b'235 2.0.0 Authentication succeeded\r\n'
 send: b'MAIL FROM:<user@notlocal.test>'
 reply: b'250 2.0.0 Roger, accepting mail from <user@notlocal.test>\r\n'
 send: b'RCPT TO:<alice@example.org>'
-reply: b'501 5.1.8 Non-local sender domain\r\n'
+reply: b'501 5.1.8 Non-local sender domain (msg ID = 474fc532)\r\n'
 send: b'QUIT'
 reply: b'221 2.0.0 Goodnight and good luck\r\n'
 ```
@@ -437,10 +606,12 @@ reply: b'221 2.0.0 Goodnight and good luck\r\n'
 Matching server-side debug log (verbatim):
 
 ```
-[debug] smtp/pipeline: sender user@notlocal.test matched by default rule	{"msg_id":"67e1552f"}
+[debug] smtp/pipeline: sender user@notlocal.test matched by default rule	{"msg_id":"474fc532"}
 submission: RCPT error	{"effective_rcpt":"alice@example.org","rcpt":"alice@example.org","reason":"reject directive used","smtp_code":501,"smtp_enchcode":"5.1.8","smtp_msg":"Non-local sender domain"}
-submission: aborted	{"msg_id":"67e1552f"}
+submission: aborted	{"msg_id":"474fc532"}
 ```
+
+(The internal `smtp_msg` context value is `Non-local sender domain`; the run-specific `(msg ID = 474fc532)` suffix seen on the wire is appended when the reply is written. The debug `msg_id` `474fc532` matches that wire suffix and the `Received`-header `id` of the aborted transaction.)
 
 ### Rationale
 
@@ -512,33 +683,38 @@ cfg.EnumList("require_sender_match", false, false,
     []string{"envelope", "auth"}, &r.senderMatch)
 ```
 
-This produces two concrete, testable contradictions, both confirmed at runtime:
+This produces two concrete, testable contradictions, both confirmed at runtime by config-load tests that differ **only** in the `require_sender_match` value — each placed on **line 18** of the `sign_dkim` block, so the comparison is exact:
 
-- **The documented value `auth` FAILS enum validation.** Starting maddy with `require_sender_match auth` in a `sign_dkim` block aborts at load time (verbatim):
+- **The documented value `auth` FAILS enum validation.** Loading a config whose line 18 is `require_sender_match auth` aborts at startup. **Producing command and verbatim output:**
 
 ```
-/tmp/maddy-exp/enum-test.conf:18: invalid argument, valid values are: [envelope auth_domain auth_user off]
+$ maddy -config enum-auth.conf          # line 18: require_sender_match auth
+/exp/enum-auth.conf:18: invalid argument, valid values are: [envelope auth_domain auth_user off]
 ```
 
   Note the irony: `auth` is the **default** (and IS honored by `shouldSign` at `dkim.go:L299`), yet it cannot be set **explicitly** because it is absent from the validator's allowed list.
 
-- **`auth_domain` / `auth_user` PASS validation but are inert.** Starting maddy with `require_sender_match auth_user` loaded successfully (the endpoint came up and listened), yet these tokens are **never consulted** — `shouldSign` honors only `envelope` (`dkim.go:L293`), `auth` (`:L299`), and `off`. They are accepted-but-dead configuration.
+- **`auth_domain` / `auth_user` PASS validation but are inert.** A config identical except that line 18 is `require_sender_match auth_user` **loads successfully and the endpoint listens** (it was then signalled to stop). **Producing command and verbatim output:**
+
+```
+$ maddy -config enum-authuser.conf      # line 18: require_sender_match auth_user
+submission: listening on tcp://0.0.0.0:4657
+submission: authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!
+signal received (terminated), next signal will force immediate shutdown.
+```
+
+  The contrast is decisive: the **same line 18**, one value (`auth`, the *documented default*) is rejected by the validator, the other (`auth_user`, an *undocumented* enum member) is accepted. Yet `auth_domain`/`auth_user` are **never consulted** at signing time — `shouldSign` honors only `envelope` (`dkim.go:L293`), `auth` (`:L299`), and `off`. They are accepted-but-dead configuration.
 
 ### Divergence 3 — DKIM is configured and a signature IS emitted, yet it fails to verify
 
-A reasonable config reading is "`sign_dkim` on ⇒ recipients get `dkim=pass`." Runtime contradicts it. As shown in R5, the legitimate message was signed (`sign_dkim: signed`), a full `DKIM-Signature` was stored, and yet the authoritative go-msgauth verifier returned:
+A reasonable config reading is "`sign_dkim` on ⇒ recipients get `dkim=pass`." Runtime contradicts it. As shown in R5, the legitimate message was signed (`sign_dkim: signed`), a full `DKIM-Signature` was stored, and yet the authoritative go-msgauth verifier (invocation and code shown in R5) returned — testing Maddy's own PKCS#1 record (TEST 1) and the same key re-encoded as PKIX (TEST 2):
 
 ```
-FAIL: dkim: key syntax error: x509: failed to parse public key (use ParsePKCS1PublicKey instead for this key format)
+[TEST1 maddy-key] FAIL: dkim: key syntax error: x509: failed to parse public key (use ParsePKCS1PublicKey instead for this key format)
+[TEST2 pkix-key] FAIL: dkim: signature did not verify: crypto/rsa: verification error
 ```
 
-and, even after correcting the key encoding:
-
-```
-FAIL: dkim: signature did not verify: crypto/rsa: verification error
-```
-
-So "DKIM configured" does **not** imply "recipients see `dkim=pass`" — the emitted signature is unverifiable for two independent reasons (key-encoding at `keys.go:L143`; post-signing re-serialization by the storage layer).
+So "DKIM configured" does **not** imply "recipients see `dkim=pass`." The emitted signature is unverifiable for two independent reasons established empirically in R5: (a) the public key is written as PKCS#1 while go-msgauth parses PKIX (`internal/modify/dkim/keys.go:L143`), and (b) even with a parseable key the signature fails `crypto/rsa` verification because the header set was re-serialized after signing — the body hash matches (`bodyhash.py`, `MATCH = True`), so the drift is confined to the signed **header** bytes. It is **not** the `DKIM-Signature`→`Dkim-Signature` field-name re-casing: relaxed header canonicalization lower-cases field names before hashing (RFC 6376 §3.4.2), so that change is canonicalized away.
 
 ### Bonus divergence — reply codes: spec-idealized vs. library-actual
 
@@ -571,7 +747,7 @@ $ git status --porcelain
 ?? blitzy/documentation/maddy_26452dd8dd78.md
 ```
 
-No file in the Maddy source tree was modified, added, or deleted.
+The `??` marker reflects the **implementation-time** working-tree state — at the moment of capture this document was the single *untracked* addition, and nothing in the Maddy source tree was modified, added, or deleted. In the **delivered** repository this file is committed, so it appears tracked at `HEAD` rather than as `??`; either way it is the only change to the repository.
 
 ### Coverage pass — every sub-part answered
 
@@ -615,6 +791,7 @@ Every `file:line` below was verified against the source at commit `26452dd8dd787
 | `internal/endpoint/smtp/smtp.go:L653-L655` | `Login` → `errors.New("Invalid credentials")` |
 | `internal/endpoint/smtp/smtp.go:L661-L663` | `AnonymousLogin` → `smtp.ErrAuthRequired` |
 | `internal/endpoint/smtp/smtp.go:L680` | `AuthUser: username` (propagated, never compared for acceptance) |
+| `internal/endpoint/smtp/smtp.go:L691-L694` | `Proto = "ESMTPS"` (`:L692`) / `"ESMTP"` (`:L694`) by `state.TLS.HandshakeComplete` |
 | `go-smtp/backend.go:9` | `ErrAuthRequired = errors.New("Please authenticate first")` |
 | `go-smtp/conn.go:270` | `WriteResponse(502, {5,7,0}, …)` |
 | `go-smtp/conn.go:438` | `WriteResponse(454, {4,7,0}, …)` |
@@ -625,7 +802,8 @@ Every `file:line` below was verified against the source at commit `26452dd8dd787
 | `internal/modify/dkim/dkim.go:L30-L38` | `oversignDefault` (incl. `From` at `:L37`) |
 | `internal/modify/dkim/dkim.go:L137` | `key_path` default `dkim_keys/{domain}_{selector}.key` |
 | `internal/modify/dkim/dkim.go:L151-L152` | `require_sender_match` enum `[envelope,auth_domain,auth_user,off]`, default `[envelope,auth]` |
-| `internal/modify/dkim/dkim.go:L182-L195` | key generation + log |
+| `internal/modify/dkim/dkim.go:L182-L195` | key-generation driver + post-generation log (`"generated a new %s keypair, private key is in %s..."`, at `:L192-L195`) |
+| `internal/modify/dkim/keys.go:L82` | `generateKey` initial log (`"generating a new %s keypair..."`) |
 | `internal/modify/dkim/dkim.go:L287-L291` | `shouldSign` — "From domain is not key domain" |
 | `internal/modify/dkim/dkim.go:L299-L310` | `shouldSign` — "From address is not authenticated identity" |
 | `internal/modify/dkim/dkim.go:L340-L351` | `RewriteBody` silent-skip `if !ok { return nil }` |
@@ -635,12 +813,15 @@ Every `file:line` below was verified against the source at commit `26452dd8dd787
 | `internal/storage/sql/sql.go:L424` | `module.Register("sql", New)` |
 | `internal/auth/auth.go` | auth interfaces (`CheckPlain`/`CheckDomainAuth`) |
 | `cmd/maddyctl/main.go:L47,L71` | `users` / `create` |
-| `cmd/maddyctl/main.go:L307` | `imap-msgs` (raw stored-message inspection) |
+| `cmd/maddyctl/main.go:L307` | `imap-msgs` command group |
+| `cmd/maddyctl/main.go:L534-L556` | `imap-msgs … dump` subcommand (raw message body; `Name:"dump"`@L534 → `msgsDump`@L556) |
 | `docs/man/maddy-filters.5.scd:L518-L535` | documented `require_sender_match` (default `envelope auth`; values `off`/`envelope`/`auth`) |
 | `docs/tutorials/setting-up.md:L132` | `maddyctl users create postmaster@example.org` |
 | `examples/multitentant-dkim.conf:L23-L26` | `source … { modify { sign_dkim <domain> default } }` |
 | `go.mod:L3` | `go 1.13` (module lower bound) |
-| `.build.yml:L11,L13` | `go build ./...` / `go test ./... -cover -race` |
+| `go.mod:L26` | `github.com/mattn/go-sqlite3 v1.11.0` (CGO SQLite driver) |
+| `.build.yml:L11` | `go build ./...` (build task, L9-L11) |
+| `.build.yml:L14` | `go test ./... -cover -race` (test task, L12-L14) |
 
 ### Key insights (woven throughout)
 
