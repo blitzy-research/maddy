@@ -60,22 +60,21 @@ empty at the end).
 
 ### Toolchain
 
-The verbatim evidence quoted throughout this document was captured on the **reference run**
-with **Go 1.21.9** (`go version go1.21.9 linux/amd64`), which satisfies the module's declared
+The verbatim evidence quoted throughout this document was captured in **this environment**
+with **Go 1.18.10** (`go version go1.18.10 linux/amd64`), which satisfies the module's declared
 floor `go 1.13` [`go.mod:L3`]. **CGO was enabled** (`CGO_ENABLED=1`) with a C compiler present,
 because the default `sql`/SQLite3 storage backend is gated behind a build constraint (see the
-Reproducibility note). Every reference-run log line below was **independently reproduced
-byte-for-byte in this environment** on **Go 1.18.10** (`go version go1.18.10 linux/amd64`,
-which also satisfies `go 1.13`), with only the Go version string naturally differing; the
-observed log lines and exit codes were identical.
+Reproducibility note). Every log line and exit code quoted below was captured from this build;
+the Go point release affects only the `go version` string itself, not the observed runtime
+output, which derives from the source at HEAD `26452dd`.
 
 ### Build
 
 ```
 $ go version
-go version go1.21.9 linux/amd64          # satisfies go.mod floor "go 1.13" (go.mod:L3)
+go version go1.18.10 linux/amd64         # satisfies go.mod floor "go 1.13" (go.mod:L3)
 $ CGO_ENABLED=1 GOPATH=/tmp/gopath GOCACHE=/tmp/gocache \
-    go build -o /tmp/obs/maddy ./cmd/maddy      # exit 0; ~20 MB binary (sqlite3 compiled via CGO)
+    go build -o /tmp/obs/maddy ./cmd/maddy      # exit 0; ~19 MB binary (sqlite3 compiled via CGO)
 ```
 
 > **Why `./cmd/maddy` and not `.`?** The repository root is `package maddy` — a *library*
@@ -87,7 +86,7 @@ $ CGO_ENABLED=1 GOPATH=/tmp/gopath GOCACHE=/tmp/gocache \
 The `sql` block is declared **last** (lines 28–31) even though the endpoints above it reference
 it — this deliberately demonstrates out-of-order `&`-resolution. Endpoints use `tcp://` with a
 global `tls off` and a `hostname` so no TLS certificate is needed (`tls://` would otherwise
-require TLS config — `smtp.go:L623` / `imap.go:L134`):
+require TLS config — `internal/endpoint/smtp/smtp.go:L623` / `internal/endpoint/imap/imap.go:L134`):
 
 ```
  5  state /tmp/obs/state
@@ -141,17 +140,36 @@ signal received (terminated), next signal will force immediate shutdown.^I$
 
 ### Observation config #2 — ORPHANED block (`/tmp/obs/orphan.conf`, outside the repo)
 
-Same endpoints plus a referenced `sql` block, **plus** an unreferenced `sql orphan_storage`
-block (header at line 24) that no `&` points to anywhere:
+The **same endpoint set as the valid config** — `smtp`, `submission`, and `imap` — plus the
+referenced `sql local_mailboxes local_authdb` block, **plus** an unreferenced `sql orphan_storage`
+block (header at line 34) that no `&` points to anywhere:
 
 ```
- 8  smtp tcp://127.0.0.1:2525 { deliver_to &local_mailboxes }
-12  imap tcp://127.0.0.1:2143 { insecure_auth; auth &local_authdb; storage &local_mailboxes }
-18  sql local_mailboxes local_authdb { driver sqlite3; dsn all.db }
-24  sql orphan_storage {          # <-- never referenced by any & anywhere
-25      driver sqlite3
-26      dsn orphan.db
-27  }
+ 5  state /tmp/obs/state
+ 6  runtime /tmp/obs/runtime
+ 8  hostname mx.observe.test
+ 9  tls off
+11  smtp tcp://127.0.0.1:2525 {
+12      deliver_to &local_mailboxes
+13  }
+15  submission tcp://127.0.0.1:2587 {
+16      insecure_auth
+17      auth &local_authdb
+18      deliver_to &local_mailboxes
+19  }
+21  imap tcp://127.0.0.1:2143 {
+22      insecure_auth
+23      auth &local_authdb
+24      storage &local_mailboxes
+25  }
+28  sql local_mailboxes local_authdb {
+29      driver sqlite3
+30      dsn all.db
+31  }
+34  sql orphan_storage {
+35      driver sqlite3
+36      dsn orphan.db
+37  }
 ```
 
 Command, exit code, and captured `stderr` shown **verbatim** via `cat -A` (same `^I`/`$` convention:
@@ -162,18 +180,22 @@ $ timeout -s TERM 8 /tmp/obs/maddy -debug -config /tmp/obs/orphan.conf 2>/tmp/ob
 EXIT=2
 $ cat -A /tmp/obs/orphan.stderr
 [debug] sql: go-imap-sql version 0.4.0^I$
-[debug] /tmp/obs/orphan.conf:9: reference &local_mailboxes^I$
+[debug] /tmp/obs/orphan.conf:12: reference &local_mailboxes^I$
 smtp: listening on tcp://127.0.0.1:2525^I$
-[debug] /tmp/obs/orphan.conf:14: reference &local_authdb^I$
-[debug] /tmp/obs/orphan.conf:15: reference &local_mailboxes^I$
+[debug] /tmp/obs/orphan.conf:17: reference &local_authdb^I$
+[debug] /tmp/obs/orphan.conf:18: reference &local_mailboxes^I$
+[debug] submission: authentication provider: sql local_mailboxes^I$
+submission: listening on tcp://127.0.0.1:2587^I$
+[debug] /tmp/obs/orphan.conf:23: reference &local_authdb^I$
+[debug] /tmp/obs/orphan.conf:24: reference &local_mailboxes^I$
 imap: listening on tcp://127.0.0.1:2143^I$
 imap: authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!^I$
 imap: TLS is disabled, this is insecure configuration and should be used only for testing!^I$
-Unused configuration block at /tmp/obs/orphan.conf:24 - orphan_storage (sql)^I$
+Unused configuration block at /tmp/obs/orphan.conf:34 - orphan_storage (sql)^I$
 ```
 
 These two runs — a clean settle (`EXIT=124`) and an aborted settle (`EXIT=2`) — are the
-backbone of the evidence below. Both were reproduced byte-for-byte locally on Go 1.18.10.
+backbone of the evidence below. Both were captured in this environment on Go 1.18.10.
 
 ---
 
@@ -353,9 +375,9 @@ log.Debugf("%s:%d: reference %s", inlineCfg.File, inlineCfg.Line, args[0])  // L
 Note the **ordering**: `GetInstance` (L67) runs **before** the `reference %s` debug line (L68).
 So if resolving a reference triggers a module's lazy `Init`, that module's *own* init logs print
 **before** the `reference &name` line. (The non-reference path instead constructs an inline module:
-`log.Debugf("%s:%d: new module %s %v", ...)` [`L70`], `createInlineModule(args[0], args[1:])` [`L71`],
+`log.Debugf("%s:%d: new module %s %v", ...)` [`internal/config/module/modconfig.go:L70`], `createInlineModule(args[0], args[1:])` [`internal/config/module/modconfig.go:L71`],
 and inline modules are initialized in place via `initInlineModule` under
-`if !referenceExisting { ... }` [`L86-L90`].)
+`if !referenceExisting { ... }` [`internal/config/module/modconfig.go:L86-L90`].)
 
 ### Lazy, at-most-once initialization with cycle-breaking
 
@@ -405,10 +427,10 @@ The valid run demonstrates both order-independence and at-most-once init:
 - **At-most-once:** `&local_mailboxes`/`&local_authdb` are referenced **five** times (lines
   12, 17, 18, 23, 24), but `sql: go-imap-sql version 0.4.0` prints **exactly once** — at the very
   first resolution (line 12). This is `Initialized[name]` short-circuiting on every subsequent
-  reference (`instances.go:L65`), after the first pass set it `true` (`instances.go:L69`).
+  reference (`internal/module/instances.go:L65`), after the first pass set it `true` (`internal/module/instances.go:L69`).
 - **Ordering of logs:** the `go-imap-sql version 0.4.0` line appears **before** the
-  `reference &local_mailboxes` line, exactly because `GetInstance` (`modconfig.go:L67`) runs before
-  the `reference` debug line (`modconfig.go:L68`).
+  `reference &local_mailboxes` line, exactly because `GetInstance` (`internal/config/module/modconfig.go:L67`) runs before
+  the `reference` debug line (`internal/config/module/modconfig.go:L68`).
 
 **Rationale:** lazy resolution keeps parsing dumb (no link resolution) and defers the expensive
 work (`Init`) to first use, deduplicated via `Initialized`. The authors describe this design
@@ -575,10 +597,10 @@ if data.quarantineErr != nil {
 
 Coordination across the message phases is handled by **replay**. When a check's state is created lazily
 (logged as `cr.log.Debugf("initializing state for %v (%p)", objectName(check), check)`
-[`check_runner.go:L67`]), any earlier phases are replayed for it. The code comment says exactly why:
+[`internal/msgpipeline/check_runner.go:L67`]), any earlier phases are replayed for it. The code comment says exactly why:
 *"Here we replay previous CheckConnection/CheckSender/CheckRcpt calls for any newly initialized checks so
-they all get change to see all these things."* [`check_runner.go:L82-L83`] — replaying `CheckConnection`
-[`L89`], `CheckSender` [`L97`], and `CheckRcpt` [`L123`]. So every check observes the same
+they all get change to see all these things."* [`internal/msgpipeline/check_runner.go:L82-L83`] — replaying `CheckConnection`
+[`internal/msgpipeline/check_runner.go:L89`], `CheckSender` [`internal/msgpipeline/check_runner.go:L97`], and `CheckRcpt` [`internal/msgpipeline/check_runner.go:L123`]. So every check observes the same
 connection/sender/recipient events even though states are created at different times. The documented
 execution order is *"CheckConnection, CheckSender, CheckRcpt, CheckBody"* [`HACKING.md:L117-L118`].
 
@@ -587,7 +609,7 @@ execution order is *"CheckConnection, CheckSender, CheckRcpt, CheckBody"* [`HACK
 Modifiers run as an ordered chain of three layers, each an independent module state:
 
 1. **Global** modifiers — `dd.d.globalModifiers.ModStateForMsg(...)` inside `initRunGlobalModifiers`
-   [`internal/msgpipeline/msgpipeline.go:L141-L153`], invoked at [`L109`].
+   [`internal/msgpipeline/msgpipeline.go:L141-L153`], invoked at [`internal/msgpipeline/msgpipeline.go:L109`].
 2. **Source-block** modifiers — `sourceBlock.modifiers.ModStateForMsg(...)`
    [`internal/msgpipeline/msgpipeline.go:L127`].
 3. **Per-recipient** modifiers — `rcptBlock.modifiers.ModStateForMsg(...)` inside `getRcptModifiers`
@@ -625,11 +647,11 @@ Which source block and recipient block apply is decided by **two-level routing**
 domain → default:
 
 - **Source** (`srcBlockForAddr`, [`internal/msgpipeline/msgpipeline.go:L155-L202`]): full address
-  `dd.d.perSource[cleanFrom]` [`L171`] → domain `dd.d.perSource[domain]` [`L190`] →
-  `dd.d.defaultSource` [`L193`].
+  `dd.d.perSource[cleanFrom]` [`internal/msgpipeline/msgpipeline.go:L171`] → domain `dd.d.perSource[domain]` [`internal/msgpipeline/msgpipeline.go:L190`] →
+  `dd.d.defaultSource` [`internal/msgpipeline/msgpipeline.go:L193`].
 - **Destination** (`rcptBlockForAddr`, [`internal/msgpipeline/msgpipeline.go:L446-L486`]): full
-  `dd.sourceBlock.perRcpt[cleanRcpt]` [`L458`] → domain `perRcpt[domain]` [`L474`] →
-  `dd.sourceBlock.defaultRcpt` [`L477`].
+  `dd.sourceBlock.perRcpt[cleanRcpt]` [`internal/msgpipeline/msgpipeline.go:L458`] → domain `perRcpt[domain]` [`internal/msgpipeline/msgpipeline.go:L474`] →
+  `dd.sourceBlock.defaultRcpt` [`internal/msgpipeline/msgpipeline.go:L477`].
 
 ### Rationale
 
@@ -691,35 +713,42 @@ module/config error path returns `2` [`maddy.go:L160`].
 
 ### Negative / confirming evidence — the orphan run aborts
 
-The orphan run adds an unreferenced `sql orphan_storage` block (header at config line 24). It is created
-in Loop 1 but never `&`-referenced, so it never reaches `GetInstance` and is absent from `Initialized`.
-Loop 3 catches it and aborts (`cat -A`; trailing `^I` = TAB, `$` = newline; the final `EXIT=2` is the
-shell echo, not a maddy log line, so it carries no tab):
+The orphan run uses the **same endpoint set as the valid config** (`smtp`, `submission`, `imap`) and
+adds an unreferenced `sql orphan_storage` block (header at config line 34). It is created in Loop 1 but
+never `&`-referenced, so it never reaches `GetInstance` and is absent from `Initialized`. All three
+endpoints reach their `listening on` lines first, and only then does Loop 3 catch the orphan and abort.
+The tail below (`cat -A`; trailing `^I` = TAB, `$` = newline; the final `EXIT=2` is the shell echo, not a
+maddy log line, so it carries no tab) shows the `submission` and `imap` listeners settling immediately
+before the abort:
 
 ```
+submission: listening on tcp://127.0.0.1:2587^I$
+[debug] /tmp/obs/orphan.conf:23: reference &local_authdb^I$
+[debug] /tmp/obs/orphan.conf:24: reference &local_mailboxes^I$
 imap: listening on tcp://127.0.0.1:2143^I$
 imap: authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!^I$
 imap: TLS is disabled, this is insecure configuration and should be used only for testing!^I$
-Unused configuration block at /tmp/obs/orphan.conf:24 - orphan_storage (sql)^I$
+Unused configuration block at /tmp/obs/orphan.conf:34 - orphan_storage (sql)^I$
 EXIT=2
 ```
 
-The final line matches the format string exactly, with `File=/tmp/obs/orphan.conf`, `Line=24`
+The final line matches the format string exactly, with `File=/tmp/obs/orphan.conf`, `Line=34`
 (the orphan block's header line), `InstanceName=orphan_storage`, and `Name=sql`. `EXIT=2` comes from the
 top-level error path returning `2` [`maddy.go:L160`], which `os.Exit`s in
 `cmd/maddy/main.go:L10`.
 
 ### The ordering is itself evidence
 
-Note that in the orphan run the endpoints log `listening on` **before** the `Unused configuration block`
-abort. That ordering is observable proof that **Loop 2 (eager endpoint init + listeners) runs before
+Note that in the orphan run all three endpoints (`smtp`, `submission`, `imap`) log `listening on`
+**before** the `Unused configuration block` abort. That ordering is observable proof that **Loop 2
+(eager endpoint init + listeners) runs before
 Loop 3 (settle guard)** — the unused-block check is the *last* startup step, the final gate after the
 graph is otherwise wired up. The two exit codes make the settle state unambiguous:
 
 | Run | Final observable | Exit code | Meaning |
 |-----|------------------|-----------|---------|
 | Valid | all `listening on` lines, then `signal received (terminated)...` | `EXIT=124` | Settled; still running when SIGTERM arrived (`timeout`) |
-| Orphan | `Unused configuration block at /tmp/obs/orphan.conf:24 - orphan_storage (sql)` | `EXIT=2` | Did **not** settle; aborted by Loop 3 (`maddy.go:L160`,`L363-L364`) |
+| Orphan | `Unused configuration block at /tmp/obs/orphan.conf:34 - orphan_storage (sql)` | `EXIT=2` | Did **not** settle; aborted by Loop 3 (`maddy.go:L160`,`maddy.go:L363-L364`) |
 
 ---
 
@@ -729,9 +758,10 @@ graph is otherwise wired up. The two exit codes make the settle state unambiguou
   Run: `timeout -s TERM 8 /tmp/obs/maddy -debug -config <cfg>`. The `-debug` flag corresponds to
   `flag.BoolVar(&log.DefaultLogger.Debug, "debug", ...)` [`maddy.go:L104`] and is what makes the
   `[debug]`-prefixed lines (e.g. `reference &...`) appear.
-- **Toolchain.** Reference-run toolchain was **Go 1.21.9**; the module's declared floor is `go 1.13`
-  [`go.mod:L3`]. The evidence was independently reproduced byte-for-byte in this environment on
-  **Go 1.18.10** (also ≥ `go 1.13`); only the `go version` string differs.
+- **Toolchain.** Evidence was captured in this environment with **Go 1.18.10**
+  (`go version go1.18.10 linux/amd64`); the module's declared floor is `go 1.13` [`go.mod:L3`], which
+  Go 1.18.10 satisfies. Only the `go version` string is toolchain-specific; the log lines and exit
+  codes derive from the source at HEAD `26452dd`.
 - **Out-of-tree, working tree clean.** All configs, state/runtime directories, databases, and the compiled
   binaries lived under `/tmp/obs` (outside the repository) and were removed afterward, so
   `git status --porcelain` on the repository is empty.
@@ -756,8 +786,8 @@ graph is otherwise wired up. The two exit codes make the settle state unambiguou
   [`internal/storage/sql/sql.go:L265`] (the failure occurs inside `imapsql.New(...)`
   [`internal/storage/sql/sql.go:L263`], *before* the version log at
   [`internal/storage/sql/sql.go:L268`] — which is why no `go-imap-sql version` line appears in the no-CGO
-  run). The `reference &local_mailboxes` line still prints first because `modconfig.go:L68` runs before the
-  error is returned at `modconfig.go:L73`.
+  run). The `reference &local_mailboxes` line still prints first because `internal/config/module/modconfig.go:L68` runs before the
+  error is returned at `internal/config/module/modconfig.go:L73`.
 - **Version string distinction.** The runtime prints `go-imap-sql version 0.4.0` — this is the dependency's
   compiled-in constant `const VersionStr = "0.4.0"`
   (`github.com/foxcpp/go-imap-sql@v0.3.2-0.20191208094750-8b4ec6b19a78/version.go:L7`). It is **distinct**
@@ -775,11 +805,11 @@ Re-reading the original question, every sub-part — including the specific nuan
 
 | # | Sub-question (and nuance) | Answered in | Status |
 |---|---------------------------|-------------|--------|
-| Q1 | Immediate vs. deferred: what is registered *immediately* vs. left *unresolved* | [§ Q1](#q1--immediate-vs-deferred) — constructors register at package-init (`maddy.go:L20-L38`, `registry.go:L7-L11`); Loop 1 creates+registers instances but does **not** `Init` (`maddy.go:L338`); `Init` and `&name` resolution are deferred | ✅ |
-| Q2 | Lazy init & `&`; what happens during *parsing*; **even when declared out of order** | [§ Q2](#q2--lazy-initialization-and-the--ampersand-syntax) — parser stores `&name` as a plain `Node.Args` token (`parse.go:L97`); `ModuleFromNode` resolves later (`modconfig.go:L59,L67-L68`); `GetInstance` is lazy + at-most-once with cycle-break (`instances.go:L65,L69-L70`); proven by `sql` declared last/resolved first and version line printing once | ✅ |
-| Q3 | Endpoint divergence, **and why** | [§ Q3](#q3--endpoint-lifecycle-divergence) — `FuncNewEndpoint` contract (`module.go:L59-L71`); Loop 1 skips registration (`maddy.go:L319-L320`); Loop 2 initializes eagerly/directly (`maddy.go:L352-L356`); *why* = endpoints are unreferenced roots that must open listeners (`HACKING.md:L60-L62`); evidenced by the three `listening on` lines | ✅ |
-| Q4 | Check/modifier coordination **without explicit wiring** | [§ Q4](#q4--check--modifier-coordination-no-explicit-wiring) — pipeline owns checks/modifiers per block (no cross-reference); parallel checks + `WaitGroup` + replay (`check_runner.go:L82-L83,L155-L161,L199-L206`); three-layer modifier chain (`msgpipeline.go:L109,L127,L488-L494`); routing by full→domain→default; **code-grounded, startup-only observation (caveat stated)** | ✅ |
-| Q5 | Runtime evidence the graph *settled* | [§ Q5](#q5--runtime-evidence-the-module-graph-has-settled) — Loop 3 settle guard (`maddy.go:L358-L365`); positive: valid run `listening on` + `EXIT=124`; negative: orphan run `Unused configuration block at /tmp/obs/orphan.conf:24 - orphan_storage (sql)` + `EXIT=2`; listeners log before the abort → Loop 2 precedes Loop 3 | ✅ |
+| Q1 | Immediate vs. deferred: what is registered *immediately* vs. left *unresolved* | [§ Q1](#q1--immediate-vs-deferred) — constructors register at package-init (`maddy.go:L20-L38`, `internal/module/registry.go:L7-L11`); Loop 1 creates+registers instances but does **not** `Init` (`maddy.go:L338`); `Init` and `&name` resolution are deferred | ✅ |
+| Q2 | Lazy init & `&`; what happens during *parsing*; **even when declared out of order** | [§ Q2](#q2--lazy-initialization-and-the--ampersand-syntax) — parser stores `&name` as a plain `Node.Args` token (`pkg/cfgparser/parse.go:L97`); `ModuleFromNode` resolves later (`internal/config/module/modconfig.go:L59,L67-L68`); `GetInstance` is lazy + at-most-once with cycle-break (`internal/module/instances.go:L65,L69-L70`); proven by `sql` declared last/resolved first and version line printing once | ✅ |
+| Q3 | Endpoint divergence, **and why** | [§ Q3](#q3--endpoint-lifecycle-divergence) — `FuncNewEndpoint` contract (`internal/module/module.go:L59-L71`); Loop 1 skips registration (`maddy.go:L319-L320`); Loop 2 initializes eagerly/directly (`maddy.go:L352-L356`); *why* = endpoints are unreferenced roots that must open listeners (`HACKING.md:L60-L62`); evidenced by the three `listening on` lines | ✅ |
+| Q4 | Check/modifier coordination **without explicit wiring** | [§ Q4](#q4--check--modifier-coordination-no-explicit-wiring) — pipeline owns checks/modifiers per block (no cross-reference); parallel checks + `WaitGroup` + replay (`internal/msgpipeline/check_runner.go:L82-L83,L155-L161,L199-L206`); three-layer modifier chain (`internal/msgpipeline/msgpipeline.go:L109,L127,L488-L494`); routing by full→domain→default; **code-grounded, startup-only observation (caveat stated)** | ✅ |
+| Q5 | Runtime evidence the graph *settled* | [§ Q5](#q5--runtime-evidence-the-module-graph-has-settled) — Loop 3 settle guard (`maddy.go:L358-L365`); positive: valid run `listening on` + `EXIT=124`; negative: orphan run `Unused configuration block at /tmp/obs/orphan.conf:34 - orphan_storage (sql)` + `EXIT=2`; listeners log before the abort → Loop 2 precedes Loop 3 | ✅ |
 
 All five sub-questions are answered explicitly, each pairing exact `file:line` citations with observed
 output (or, for Q4's message-flow internals, explicit code-only grounding with the verifiability caveat)
