@@ -51,7 +51,7 @@ The questions ask about the observed `msg_id`. There are **two distinct shapes**
 
    4 random bytes → 8 hex characters. Because the bytes come from `crypto/rand`, **the value changes on every run.** On the run quoted here the endpoint ids were `fe0157be` (success), `b9847559` (abort-in-DATA), and `71bf4a8d` (abort-at-logout). Your run will show different 8-hex values.
 
-2. **Queue / remote id — deterministic 40-hex SHA-1.** The queue and remote tests drive `testutils.Target`, whose synthetic messages carry a fixed **40-hex-character SHA-1** id. These are **stable across runs** and therefore quotable as constants: `af8090c7eb39f761862b1f027b4f2b0bb1ce86d1` (queue temporary-fail test) and `2176ec5872ed2b87d832b4070e88232bd94ac7d3` (remote TLS-fallback test).
+2. **Queue / remote id — deterministic 40-hex SHA-1.** The queue and remote tests drive delivery through the `testutils.DoTestDelivery*` helpers, which assign a deterministic `msg_id` computed as the **SHA-1 of the test name** — `IDRaw := sha1.Sum([]byte(t.Name()))` then `hex.EncodeToString(IDRaw[:])`, stored as `msgMeta.ID` [internal/testutils/target.go:L239-L245]. The id therefore comes from the *helper*, not from any particular target: the queue test drives a queue backed by an in-test `unreliableTarget`, and the remote test instantiates a `remote.Target`, yet both receive a name-derived id. Because it is a hash of the fixed test name, the id is a **40-hex-character** value that is **stable across runs** and therefore quotable as a constant: `af8090c7eb39f761862b1f027b4f2b0bb1ce86d1` = `SHA1("TestQueueDelivery_TemporaryFail")` (queue temporary-fail test) and `2176ec5872ed2b87d832b4070e88232bd94ac7d3` = `SHA1("TestRemoteDelivery_TLSErrFallback")` (remote TLS-fallback test).
 
 > Throughout, endpoint `msg_id` values are flagged as **run-varying**, while queue/remote SHA-1 ids are flagged as **deterministic**.
 
@@ -265,12 +265,76 @@ All Group-3 output comes from the remote-delivery test package `internal/target/
 
 ### About the MX-authenticity observation (why a temporary harness was needed)
 
-The existing test `TestRemoteDelivery_AuthMX_Fail` [internal/target/remote/mxauth_test.go:L16] asserts **only that an error occurred** — it does `if err == nil { t.Fatal("Expected an error, got none") }` and never inspects the error's code, enhanced code, or reply text. To capture the *exact* reply (items 3a–3c), a **temporary** observation test was authored, run once, and then **deleted** (the repository is left byte-for-byte unchanged; see the closing "Repository cleanliness" note). The temporary test lived at `internal/target/remote/zzobserve_test.go`, was modeled on `TestRemoteDelivery_AuthMX_Fail`, set `requireMXAuth: true`, called `testutils.DoTestDeliveryErr(t, &tgt, "test@example.com", []string{"test@example.invalid"})` [internal/testutils/target.go:L232], and printed `err.Error()` plus `exterrors.Fields(err)` (which exposes `smtp_code`, `smtp_enchcode`, `smtp_msg` [internal/exterrors/smtp.go:L77-79]).
+The existing test `TestRemoteDelivery_AuthMX_Fail` [internal/target/remote/mxauth_test.go:L16] asserts **only that an error occurred** — it does `if err == nil { t.Fatal("Expected an error, got none") }` and never inspects the error's code, enhanced code, or reply text. To capture the *exact* reply (items 3a–3c), a **temporary** observation test was authored, run once, and then **deleted** (the repository is left byte-for-byte unchanged; see the closing "Repository cleanliness" note). The temporary test was modeled on `TestRemoteDelivery_AuthMX_Fail`, set `requireMXAuth: true`, called `testutils.DoTestDeliveryErr(t, &tgt, "test@example.com", []string{"test@example.invalid"})` [internal/testutils/target.go:L232], and printed `err.Error()` plus `exterrors.Fields(err)` (which exposes `smtp_code`, `smtp_enchcode`, `smtp_msg` [internal/exterrors/smtp.go:L77-79]).
 
-Command used to run the temporary harness:
+The **exact** temporary test is reproduced below in full so the observed output is reproducible. It was created at `internal/target/remote/zzobserve_test.go`, run once, and then **deleted** — it is **never committed** to the repository. It deliberately prints through `fmt.Printf` (not `t.Logf`) so the `OBSERVE` lines appear on stdout **without** the `t.Log` `file:line` prefix and can therefore be quoted verbatim. Because it is in `package remote`, it can read the unexported `Target` fields directly, and it re-uses the package-level `smtpPort` variable [internal/target/remote/remote.go:L41]:
+
+```go
+package remote
+
+import (
+	"fmt"
+	"net"
+	"testing"
+
+	"github.com/foxcpp/go-mockdns"
+	"github.com/foxcpp/maddy/internal/exterrors"
+	"github.com/foxcpp/maddy/internal/testutils"
+)
+
+// TestZZObserve_AuthMXFailReply is a TEMPORARY observation harness (not part of
+// the repository). It reproduces the MX-authenticity failure exercised by
+// TestRemoteDelivery_AuthMX_Fail and prints the returned error's Error() string
+// plus exterrors.Fields(err), so the exact reply (items 3a-3c) can be captured.
+// It is created, run once, and then deleted; the working tree is left clean.
+func TestZZObserve_AuthMXFailReply(t *testing.T) {
+	be, srv := testutils.SMTPServer(t, "127.0.0.1:"+smtpPort)
+	defer srv.Close()
+	defer testutils.CheckSMTPConnLeak(t, srv)
+
+	zones := map[string]mockdns.Zone{
+		"example.invalid.": {
+			MX: []net.MX{{Host: "mx.example.invalid.", Pref: 10}},
+		},
+		"mx.example.invalid.": {
+			A: []string{"127.0.0.1"},
+		},
+	}
+	resolver := &mockdns.Resolver{Zones: zones}
+
+	tgt := Target{
+		name:          "remote",
+		hostname:      "mx.example.com",
+		resolver:      &mockdns.Resolver{Zones: zones},
+		dialer:        resolver.DialContext,
+		extResolver:   nil,
+		requireMXAuth: true,
+		Log:           testutils.Logger(t, "remote"),
+	}
+
+	_, err := testutils.DoTestDeliveryErr(t, &tgt, "test@example.com", []string{"test@example.invalid"})
+	if err == nil {
+		t.Fatal("Expected an error, got none")
+	}
+	if be.MailFromCounter != 0 {
+		t.Fatal("MAIL FROM issued for server failing authentication")
+	}
+
+	f := exterrors.Fields(err)
+	ench := f["smtp_enchcode"].(exterrors.EnhancedCode)
+	fmt.Printf("OBSERVE err.Error()=%q\n", err.Error())
+	fmt.Printf("OBSERVE smtp_code=%v\n", f["smtp_code"])
+	fmt.Printf("OBSERVE smtp_enchcode=%v\n", f["smtp_enchcode"])
+	fmt.Printf("OBSERVE smtp_msg=%q\n", f["smtp_msg"])
+	fmt.Printf("OBSERVE reply_line=%v %s %v\n", f["smtp_code"], ench.FormatLog(), f["smtp_msg"])
+}
+```
+
+Command used to run the temporary harness (create the file above, run it, then delete it):
 
 ```
 go test -count=1 -v -run '^TestZZObserve_AuthMXFailReply$' ./internal/target/remote/ -test.debuglog 2>&1 | tee /tmp/remote_mxauth.txt
+rm -f internal/target/remote/zzobserve_test.go        # remove the temporary harness immediately after capture
 ```
 
 Verbatim observed output (`PASS`):
@@ -443,5 +507,5 @@ All fifteen items (1a, 1b, 1c, 1d, 1e, 1f, 1g, 2a, 2b, 2c, 3a, 3b, 3c, 3d, 4a/4b
 
 ### Repository cleanliness
 
-This document is the **only** persistent new file. The temporary observation test (`internal/target/remote/zzobserve_test.go`) used to capture items 3a–3c was deleted immediately after use; `git status --porcelain` shows only this untracked document and no other change. No existing source, test, dependency, or build file was modified.
+This document is the **only** persistent new file. The temporary observation test (`internal/target/remote/zzobserve_test.go`) used to capture items 3a–3c was deleted immediately after use, so it is **absent** from the repository. In the final state the working tree is **clean**, and the only path that differs between the baseline and `HEAD` is this document — `blitzy/documentation/maddy_26452dd8dd78.md`. No existing source, test, dependency, or build file was modified.
 
