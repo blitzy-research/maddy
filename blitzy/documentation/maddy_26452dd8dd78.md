@@ -119,7 +119,7 @@ On the implicit-TLS endpoint (`tls://…:4650`) the `250-STARTTLS` line is **abs
 
 ### Rationale
 
-A single `sql` instance underlies both `local_mailboxes` and `local_authdb`: the module registers once as `module.Register("sql", New)` (`internal/storage/sql/sql.go:L424`) and exposes credential checking (`CheckPlain`, consumed by the submission endpoint's `Login`) alongside mailbox storage; the auth interfaces live in `internal/auth/auth.go`. This is why **one** backend both authenticates the SMTP session and stores the delivered mail — the authenticated identity and the delivery target are validated against the same user table.
+A single `sql` instance underlies both `local_mailboxes` and `local_authdb`: the module registers once as `module.Register("sql", New)` (`internal/storage/sql/sql.go:L424`) and exposes credential checking (`CheckPlain`, consumed by the submission endpoint's `Login`) alongside mailbox storage; `CheckPlain` is the method of the `AuthProvider` interface declared in `internal/module/auth.go:L6` (the interface `endp.Auth` satisfies, per `smtp.go:L459`), while the helper **function** `CheckDomainAuth`, not an interface, lives in `internal/auth/auth.go:L5`. This is why **one** backend both authenticates the SMTP session and stores the delivered mail — the authenticated identity and the delivery target are validated against the same user table.
 
 ---
 
@@ -824,7 +824,8 @@ Every `file:line` below was verified against the source at commit `26452dd8dd787
 | `internal/check/dkim/dkim.go:L115-L187` | inbound `authres.DKIMResult` (Authentication-Results producer) |
 | `internal/check/spf/spf.go:L117-L156` | inbound `authres.SPFResult` (Authentication-Results producer) |
 | `internal/storage/sql/sql.go:L424` | `module.Register("sql", New)` |
-| `internal/auth/auth.go` | auth interfaces (`CheckPlain`/`CheckDomainAuth`) |
+| `internal/module/auth.go:L6` | `AuthProvider` interface method `CheckPlain(username, password string) bool` |
+| `internal/auth/auth.go:L5` | `CheckDomainAuth` helper function |
 | `cmd/maddyctl/main.go:L47,L71` | `users` / `create` |
 | `cmd/maddyctl/main.go:L307` | `imap-msgs` command group |
 | `cmd/maddyctl/main.go:L534-L556` | `imap-msgs … dump` subcommand (raw message body; `Name:"dump"`@L534 → `msgsDump`@L556) |
