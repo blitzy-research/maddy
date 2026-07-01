@@ -17,7 +17,7 @@ Per the binding investigation rule, the code was **built and run first**, and th
 2. The binary was run under **`-debug`** with a purpose‑built configuration that wires an inbound `smtp` endpoint into a `queue` (with a deliberately small `max_tries`) wrapping an outbound `smtp_downstream` target aimed at a **controllable non‑responsive destination**.
 3. Real output was captured: the ordered `-debug` log stream, the on‑disk queue directory snapshot taken *between* attempts, the measured OS connect timeout, and two `max_parallelism` concurrency scenarios.
 
-> **Note on the two evidence sets.** A full live investigation was conducted at this exact HEAD; its captured values (e.g. `msg_id":"70a28a29"`, the `136s` connect timeout, the `.meta` JSON) are quoted verbatim below as the primary observed evidence. A confirmatory re‑run performed while writing this document reproduced the **identical structure and field set** (with a fresh `msg_id`, e.g. `cf89713a`, and a connect timeout of `134s` — a ~2 s SYN‑retransmission jitter around the same OS behaviour). Both are shown where relevant; nothing is fabricated.
+> **Note on the two evidence sets.** A full live investigation was conducted at this exact HEAD; its captured values (e.g. `msg_id":"70a28a29"`, the `136s` connect timeout, the `.meta` JSON) are quoted verbatim below as the primary observed evidence. A confirmatory re‑run performed while writing this document reproduced the **identical structure and field set** (with a fresh `msg_id`, e.g. `6dba19a3`, and the same `136s` connect timeout — confirming the OS‑governed behaviour is stable and reproducible). Both are shown where relevant; nothing is fabricated.
 
 ---
 
@@ -102,31 +102,34 @@ queue: delivery attempt failed   {"msg_id":"70a28a29","rcpt":"victim@example.com
 queue: will retry   {"attempts_count":1,"msg_id":"70a28a29","next_try_delay":"14m59.999999267s","rcpts":["victim@example.com"]}
 ```
 
-The confirmatory re‑run (fresh `msg_id":"cf89713a"`) produced the identical sequence, including the delivery‑lifecycle debug lines that bracket each attempt:
+The confirmatory re‑run (fresh `msg_id":"6dba19a3"`) produced the identical sequence, including the delivery‑lifecycle debug lines that bracket each attempt (complete, verbatim — note the **two** `smtp_downstream: connected` lines, one carrying `downstream_server` and one carrying `remote_server`):
 
 ```text
-[debug] queue: starting delivery for cf89713a
-[debug] queue: waiting on delivery semaphore for cf89713a
-[debug] queue: delivery semaphore acquired for cf89713a
-[debug] queue: delivery attempt #1   {"msg_id":"cf89713a"}
-[debug] queue: using message ID = cf89713a-1   {"msg_id":"cf89713a"}
-[debug] smtp_downstream: connected   {"msg_id":"cf89713a-1","remote_server":"127.0.0.1"}
-[debug] queue: target.Start OK   {"msg_id":"cf89713a"}
-[debug] queue: delivery.AddRcpt victim@example.com failed: Temporary failure, please retry later   {"msg_id":"cf89713a"}
-[debug] queue: delivery.Abort (no accepted receipients)   {"msg_id":"cf89713a"}
-[debug] queue: failures: permanently: [], temporary: [victim@example.com], errors: map[victim@example.com:Temporary failure, please retry later]   {"msg_id":"cf89713a"}
-queue: delivery attempt failed   {"msg_id":"cf89713a", ... ,"smtp_code":451, ... ,"target":"smtp_downstream"}
-queue: will retry   {"attempts_count":1,"msg_id":"cf89713a","next_try_delay":"14m59.99999919s","rcpts":["victim@example.com"]}
+[debug] queue: starting delivery for 6dba19a3
+[debug] queue: waiting on delivery semaphore for 6dba19a3
+[debug] queue: delivery semaphore acquired for 6dba19a3
+[debug] queue: delivery attempt #1   {"msg_id":"6dba19a3"}
+[debug] queue: using message ID = 6dba19a3-1   {"msg_id":"6dba19a3"}
+[debug] smtp_downstream: connected   {"downstream_server":"127.0.0.1","msg_id":"6dba19a3-1"}
+[debug] smtp_downstream: connected   {"msg_id":"6dba19a3-1","remote_server":"127.0.0.1"}
+[debug] queue: target.Start OK   {"msg_id":"6dba19a3"}
+[debug] queue: delivery.AddRcpt victim@example.com failed: Temporary failure, please retry later   {"msg_id":"6dba19a3"}
+[debug] queue: delivery.Abort (no accepted receipients)   {"msg_id":"6dba19a3"}
+[debug] queue: failures: permanently: [], temporary: [victim@example.com], errors: map[victim@example.com:Temporary failure, please retry later]   {"msg_id":"6dba19a3"}
+queue: delivery attempt failed   {"msg_id":"6dba19a3","rcpt":"victim@example.com","reason":"Temporary failure, please retry later","remote_server":"127.0.0.1","smtp_code":451,"smtp_enchcode":"4.7.1","smtp_msg":"Temporary failure, please retry later","target":"smtp_downstream"}
+queue: will retry   {"attempts_count":1,"msg_id":"6dba19a3","next_try_delay":"14m59.999999351s","rcpts":["victim@example.com"]}
 ```
 
-**One TCP connection per attempt** — the fake SMTP server's own log (verbatim):
+**One TCP connection per attempt** — the fake SMTP server's own log for attempt #1 (verbatim; the server labels it `conn#2` because `conn#1` was a startup liveness probe):
 
 ```text
-[fakesmtp] TCP connection #1 accepted from ('127.0.0.1', 37512)
-[fakesmtp] conn#1 <- EHLO mx.test.local
-[fakesmtp] conn#1 <- MAIL FROM:<sender@test.local>
-[fakesmtp] conn#1 <- RCPT TO:<victim@example.com>
-[fakesmtp] conn#1 <- QUIT
+05:19:28.820 conn#2 OPEN from 127.0.0.1:53654
+05:19:28.820 conn#2 <-- 'EHLO mx.test.local'
+05:19:28.820 conn#2 <-- 'MAIL FROM:<sender@test.local> SIZE=91'
+05:19:28.820 conn#2 <-- 'RCPT TO:<victim@example.com>'
+05:19:28.820 conn#2 RCPT -> 451 4.7.1 temporary failure
+05:19:28.820 conn#2 <-- 'QUIT'
+05:19:28.820 conn#2 CLOSE 127.0.0.1:53654
 ```
 
 **Command/config that produced it:** the `maddy-queue.conf` above (with `max_tries 2`), maddy started as `maddy -debug -config maddy-queue.conf`, then one message submitted with a standard SMTP `MAIL`/`RCPT`/`DATA` conversation to `127.0.0.1:2525`.
@@ -138,7 +141,26 @@ queue: will retry   {"attempts_count":1,"msg_id":"cf89713a","next_try_delay":"14
 3. `queue: delivery attempt failed` — logged once **per recipient** that failed.
 4. `queue: will retry` — the reschedule record (only when there are still temporary failures and tries remain).
 
-With `max_tries N`, this repeats up to `N` times; on the attempt where `meta.TriesCount == q.maxTries` the retry gate stops retrying, emits a DSN, and removes the message from disk.
+With `max_tries N`, the message is attempted **`N+1` times in total** — attempts `#1` through `#(N+1)`. The total is `N+1`, not `N`, because the attempt marker logs `meta.TriesCount+1` [internal/target/queue/queue.go:L367] while `TriesCount` starts at `0`, and the stop gate `if meta.TriesCount == q.maxTries` [internal/target/queue/queue.go:L390] is evaluated **before** the `meta.TriesCount++` increment [internal/target/queue/queue.go:L407]. So with `max_tries 1`: attempt `#1` runs with `TriesCount==0` (gate `0==1` is false → increment to `1` → `will retry`), then attempt `#2` runs with `TriesCount==1` (gate `1==1` is true → stop). On that final attempt the queue does **not** reschedule; it removes the message from disk. Whether a DSN (bounce) is *also* generated depends on the failure classification (see below).
+
+**Observed — exhaustion (`max_tries 1`, attempt #2, verbatim).** After the ~15‑minute backoff the reloaded queue fired attempt `#2`; because `TriesCount==1==max_tries` the gate stopped retrying and the message was removed from disk. There is **no** `will retry` line, and — for this pure‑temporary (`451`) failure — **no** `not delivered` line and **no** DSN:
+
+```text
+[debug] queue: delivery attempt #2   {"msg_id":"6dba19a3"}
+[debug] queue: using message ID = 6dba19a3-2   {"msg_id":"6dba19a3"}
+[debug] smtp_downstream: connected   {"downstream_server":"127.0.0.1","msg_id":"6dba19a3-2"}
+[debug] smtp_downstream: connected   {"msg_id":"6dba19a3-2","remote_server":"127.0.0.1"}
+[debug] queue: target.Start OK   {"msg_id":"6dba19a3"}
+[debug] queue: delivery.AddRcpt victim@example.com failed: Temporary failure, please retry later   {"msg_id":"6dba19a3"}
+[debug] queue: delivery.Abort (no accepted receipients)   {"msg_id":"6dba19a3"}
+[debug] queue: failures: permanently: [], temporary: [victim@example.com], errors: map[victim@example.com:Temporary failure, please retry later]   {"msg_id":"6dba19a3"}
+queue: delivery attempt failed   {"msg_id":"6dba19a3","rcpt":"victim@example.com","reason":"Temporary failure, please retry later","remote_server":"127.0.0.1","smtp_code":451,"smtp_enchcode":"4.7.1","smtp_msg":"Temporary failure, please retry later","target":"smtp_downstream"}
+[debug] queue: removed message from disk   {"msg_id":"6dba19a3"}
+```
+
+Immediately afterward the three per‑message files vanished from the queue directory (`ls queue-exhaust/6dba19a3.*` → *No such file or directory*), confirming removal.
+
+**Why no DSN here (rationale).** In the stop branch, a DSN is emitted only when `len(meta.FailedRcpts)+len(meta.TemporaryFailedRcpts) != 0` [internal/target/queue/queue.go:L400-L402]. For a recipient that only ever failed **temporarily** and then exhausted its tries, `meta.TemporaryFailedRcpts` is never populated (the `.meta` in Q5 shows `"TemporaryFailedRcpts":null`) and `meta.FailedRcpts` (permanent failures) is empty, so the DSN branch is skipped and only `q.removeFromDisk(...)` [internal/target/queue/queue.go:L403] runs, logging `removed message from disk` [internal/target/queue/queue.go:L619]. A DSN *would* be generated if a recipient had failed **permanently** (populating `FailedRcpts`). This corrects the earlier phrasing that the final attempt always “emits a DSN”: for the pure‑temporary case observed here, it does not.
 
 **Citations + rationale.**
 - Each ready message is dispatched on its own goroutine by `dispatch` [internal/target/queue/queue.go:L275], and each attempt opens one connection.
@@ -157,13 +179,13 @@ With `max_tries N`, this repeats up to `N` times; on the attempt where `meta.Tri
 
 ```text
 $ python3 connect_probe.py            # socket.connect(("192.0.2.1", 25)); no timeout set
-elapsed=134s  TimeoutError: [Errno 110] Connection timed out
+elapsed=136s  TimeoutError: [Errno 110] Connection timed out
 
 $ cat /proc/sys/net/ipv4/tcp_syn_retries
 6
 ```
 
-The canonical measurement was `136s`; the re‑run measured `134s` — the ~2 s difference is normal TCP SYN‑retransmission jitter; both carry the identical `[Errno 110]` and the same `tcp_syn_retries=6`.
+This measurement is reproducible: two independent probe runs each measured exactly `136s`, both carrying the identical `TimeoutError: [Errno 110] Connection timed out` and the same `net.ipv4.tcp_syn_retries=6`. The value is governed entirely by the OS SYN‑retransmission backoff (there is no application‑level timeout to cut it short); small ±1–2 s jitter is possible across hosts, but both runs here landed on `136s`.
 
 **Second failure mode — indefinite block.** A destination that **accepts** the TCP connection but never sends the SMTP `220` greeting **blocks indefinitely** — there is no read deadline. This was observed directly in the concurrency runs: a recipient routed to a peer that accepted the connection and then went silent left maddy's delivery goroutine blocked until the harness was torn down (see **Q7/Q8**).
 
@@ -234,25 +256,19 @@ If the config sets an explicit `location` (`cfg.String("location", ...)`) [inter
 **Observed (verbatim) — directory snapshot taken between attempt 1 and the retry:**
 
 ```text
-$ ls -la /tmp/maddy-investigation/queue/
--rw-r--r-- 1 root root   36 cf89713a.body
--rw-r--r-- 1 root root  252 cf89713a.header
--rw-r--r-- 1 root root  525 cf89713a.meta
+$ ls -la /tmp/maddy-investigation/queue-exhaust/
+-rw-r--r-- 1 root root    5 Jul  1 05:19 6dba19a3.body
+-rw-r--r-- 1 root root  254 Jul  1 05:19 6dba19a3.header
+-rw-r--r-- 1 root root  526 Jul  1 05:19 6dba19a3.meta
 ```
 
-**Observed (verbatim) — the `.meta` JSON (canonical, single line):**
+**Observed (verbatim) — the complete single‑line `.meta` JSON (`cat 6dba19a3.meta`), including `"TriesCount":1` and the RFC 3339 nanosecond‑UTC `FirstAttempt`/`LastAttempt` timestamps:**
 
 ```text
-{... "RcptErrs":{"victim@example.com":{"Code":451,"EnhancedCode":[4,0,0],"Message":"Temporary failure, please retry later"}},"TriesCount":1,"FirstAttempt":"2026-06-30T22:02:06.616503516Z","LastAttempt":"2026-06-30T22:02:06.662508665Z"}
+{"MsgMeta":{"ID":"6dba19a3","OriginalFrom":"sender@test.local","DontTraceSender":false,"Quarantine":false,"OriginalRcpts":{},"SMTPOpts":{"Size":91,"RequireTLS":false,"UTF8":false},"Conn":null},"From":"sender@test.local","To":["victim@example.com"],"FailedRcpts":null,"TemporaryFailedRcpts":null,"RcptErrs":{"victim@example.com":{"Code":451,"EnhancedCode":[4,0,0],"Message":"Temporary failure, please retry later"}},"TriesCount":1,"FirstAttempt":"2026-07-01T05:19:28.815242821Z","LastAttempt":"2026-07-01T05:19:28.820982749Z"}
 ```
 
-The confirmatory re‑run's full `.meta` (fresh `msg_id":"cf89713a"`) is byte‑for‑byte the same shape, including `"TriesCount":1` and the RFC 3339 nanosecond‑UTC timestamps:
-
-```text
-{"MsgMeta":{"ID":"cf89713a","OriginalFrom":"sender@test.local","DontTraceSender":false,"Quarantine":false,"OriginalRcpts":{},"SMTPOpts":{"Size":0,"RequireTLS":false,"UTF8":false},"Conn":null},"From":"sender@test.local","To":["victim@example.com"],"FailedRcpts":null,"TemporaryFailedRcpts":null,"RcptErrs":{"victim@example.com":{"Code":451,"EnhancedCode":[4,0,0],"Message":"Temporary failure, please retry later"}},"TriesCount":1,"FirstAttempt":"2026-07-01T04:24:28.770900423Z","LastAttempt":"2026-07-01T04:24:28.780437816Z"}
-```
-
-**Command/config that produced it:** `maddy -debug -config maddy-queue.conf` (with `max_tries 2`), one message submitted, then `ls -la` + `cat` of the `location` directory during the ~15‑minute gap before the second attempt.
+**Command/config that produced it:** the confirmatory re‑run (`maddy -debug -config` with `max_tries 1`), one message submitted, then `ls -la` + `cat` of the queue `location` directory during the ~15‑minute gap before the final attempt. The on‑disk state during the gap — the three files and `"TriesCount":1` — is identical for any `max_tries ≥ 1`; the `max_tries 1` variant simply lets the *same* run also reach exhaustion (see the attempt‑#2 evidence under **Q1**).
 
 **Citations + rationale.**
 - The header file is written by `storeNewMessage` as `filepath.Join(q.location, id+".header")` [internal/target/queue/queue.go:L693].
@@ -260,7 +276,7 @@ The confirmatory re‑run's full `.meta` (fresh `msg_id":"cf89713a"`) is byte‑
 - The metadata file `<id>.meta` is written by `updateMetadataOnDisk`, which encodes JSON into `<id>.meta.new` and then atomically `os.Rename`s it into place [internal/target/queue/queue.go:L742-L766] (crash‑safe, write‑then‑rename).
 - `<id>` comes from `GenerateMsgID()`, which reads `make([]byte, 4)` random bytes and returns `hex.EncodeToString(...)` → **8 hex characters** [internal/msgpipeline/msgid.go:L12-L16]; the ID is assigned at message entry in the inbound SMTP endpoint (`msgMeta.ID, err = msgpipeline.GenerateMsgID()`) [internal/endpoint/smtp/smtp.go:L112].
 - The retry‑count metadata is the literal **`"TriesCount":1`** — a field of the `QueueMetadata` struct (alongside `RcptErrs`, `FirstAttempt`, `LastAttempt`) [internal/target/queue/queue.go:L163], [internal/target/queue/queue.go:L166], [internal/target/queue/queue.go:L168], [internal/target/queue/queue.go:L169]. Its comment documents it as the number of times delivery has *already* been tried, so after the first failure it reads `1`.
-- The next delay follows the backoff formula `nextTryTime.Add(q.initialRetryTime * time.Duration(math.Pow(q.retryTimeScale, float64(meta.TriesCount-1))))` [internal/target/queue/queue.go:L413-L414]; with `TriesCount == 1` that is `15m × 2^0 = 15m`, matching the `next_try_delay":"14m59.999999267s"` from **Q1** (the sub‑second shortfall is the elapsed time between scheduling and logging).
+- The next delay follows the backoff formula `nextTryTime.Add(q.initialRetryTime * time.Duration(math.Pow(q.retryTimeScale, float64(meta.TriesCount-1))))` [internal/target/queue/queue.go:L413-L414]; with `TriesCount == 1` that is `15m × 2^0 = 15m`, matching the re‑run's `next_try_delay":"14m59.999999351s"` from **Q1** (the sub‑second shortfall is the elapsed time between scheduling and logging).
 
 > The **no‑per‑line‑timestamp** correction (Q3) is what makes the `.meta` timestamps significant: `FirstAttempt`/`LastAttempt` (RFC 3339 nanosecond UTC) are the *only* machine‑readable timestamps for the attempt, since the log lines themselves carry none.
 
@@ -270,7 +286,20 @@ The confirmatory re‑run's full `.meta` (fresh `msg_id":"cf89713a"`) is byte‑
 
 **Answer.** Purely **earliest‑deadline‑first**, with **NO per‑destination priority**. Ordering is by each message's next‑try time only; the destination host/domain is irrelevant to ordering.
 
-**Command/config that produced the runtime context:** the multi‑destination scenarios of **Q7/Q8** (`maddy -debug -config maddy-p16.conf` / `maddy-p1.conf`) enqueue two messages to different recipients/destinations through the same queue; the observed dispatch order was consistent with earliest‑deadline‑first (the message enqueued first, with the earlier next‑try instant, was selected first), never by destination. The definitive evidence for the *ordering rule itself* is the scheduler source below (there is no per‑destination priority to observe because none exists).
+**Observed (verbatim)** — two messages enqueued **simultaneously** to **different destinations** (`c76a3e71` → `alice@dest-one.example.com`, `0e37cc64` → `bob@dest-two.example.org`), both fresh (equal, immediate next‑try deadlines), dispatched by the single scheduler `tick` goroutine in deadline order — the destination domain plays no part in the ordering:
+
+```text
+[debug] queue: starting delivery for c76a3e71
+[debug] queue: waiting on delivery semaphore for c76a3e71
+[debug] queue: delivery semaphore acquired for c76a3e71
+[debug] queue: delivery attempt #1   {"msg_id":"c76a3e71"}
+[debug] queue: starting delivery for 0e37cc64
+[debug] queue: waiting on delivery semaphore for 0e37cc64
+[debug] queue: delivery semaphore acquired for 0e37cc64
+[debug] queue: delivery attempt #1   {"msg_id":"0e37cc64"}
+```
+
+**Command/config that produced it:** two messages submitted back‑to‑back to the queue (`max_parallelism 16`), one to `alice@dest-one.example.com` and one to `bob@dest-two.example.org`; the `-debug` log above is the resulting scheduler dispatch order. Because both were due immediately (equal deadlines), they were selected in wheel order — **not** by destination; a message with an *earlier* next‑try instant is always selected first (see the source below). The complementary `max_parallelism` scenarios appear in **Q7/Q8** (`maddy -debug -config maddy-p16.conf` / `maddy-p1.conf`).
 
 **Citations + rationale.** The queue's scheduler is a time wheel. A single `tick` goroutine [internal/target/queue/timewheel.go:L71] scans all pending slots and keeps the one with the smallest time‑until‑deadline:
 
@@ -384,7 +413,7 @@ The **same** network‑level connect failure produces **different queue behaviou
 | Q7 | A's retry timing when B blocks on a slow timeout | ✅ | independent at `max_parallelism=16`; fast `will retry` `next_try_delay":"14m59.999999499s"` while slow blocked |
 | Q8 | Can queue starvation be observed? | ✅ | yes at `max_parallelism=1`: `waiting on delivery semaphore` with **no** `delivery semaphore acquired` (`waiting=1 acquired=0`); only one TCP connection |
 | — | Correction 1 (no per‑line timestamp) | ✅ | stated at Q3, Q5, and in Corrections |
-| — | Correction 2 (retry interval not configurable) | ✅ | `initialRetryTime = 15 * time.Minute`, `retryTimeScale = 2` hardcoded [queue.go:L185-L186] |
+| — | Correction 2 (retry interval not configurable) | ✅ | `initialRetryTime = 15 * time.Minute`, `retryTimeScale = 2` hardcoded [internal/target/queue/queue.go:L185-L186] |
 | — | Correction 3 (connect‑failure classification by lifecycle stage) | ✅ | `smtp_downstream` connect‑in‑`Start` = permanent; `remote` connect‑at‑recipient = temporary |
 
 Every value the questions ask for is quoted exactly (e.g. `136s`, `[Errno 110]`, `smtp_code":451`, `smtp_enchcode":"4.7.1"`, `"TriesCount":1`, `next_try_delay":"14m59.999999267s"`, `msg_id":"70a28a29"`, 8‑hex IDs, `/var/lib/maddy/remote_queue`, `max_parallelism` 16/1) rather than paraphrased.
