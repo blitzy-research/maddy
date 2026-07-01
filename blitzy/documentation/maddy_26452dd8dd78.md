@@ -140,9 +140,9 @@ The three sender constructions were driven over a live SMTP session (Python `smt
 | **#1 same-domain impersonation** | `alice@example.org` | `MAIL FROM:<bob@example.org>` | `250 2.0.0 OK: queued` — **ACCEPTED** | Source block matched at **domain** level; local-part never compared to auth user (`msgpipeline.go:L155-L199`) |
 | **#2 non-local domain** | `alice@example.org` | `MAIL FROM:<user@notlocal.test>` | `501 5.1.8 Non-local sender domain (msg ID = 474fc532)` (at `RCPT TO`) | Falls through to `default_source` reject (`maddy.conf:L117-L119`); `rejectErr` returned in the sender phase (`msgpipeline.go:L117-L119`) |
 | **#3 legitimate signed** | `alice@example.org` | `MAIL FROM:<alice@example.org>`, `From: alice@example.org` | `250 2.0.0 OK: queued` — **ACCEPTED & signed** | Domain match + `shouldSign` all checks pass (`dkim.go:L264-L330`) |
-| Missing `From` header | `alice@example.org` | valid envelope, DATA lacks `From:` | `554 5.6.0 Message does not contains a From header field` *(source-derived, see note)* | `submissionPrepare` (`submission.go:L39-L48`, message text at `:L43`, grammatical quirk "contains" preserved) |
+| Missing `From` header | `alice@example.org` | valid envelope, DATA lacks `From:` | `554 5.6.0 Message does not contains a From header field` *(observed; see note)* | `submissionPrepare` (`submission.go:L39-L48`, message text at `:L43`, grammatical quirk "contains" preserved) |
 
-> **Source-derived (not observed) entries.** The missing/invalid/malformed-header rows quote the **exact source string** with its `file:line`, clearly labeled — they were not separately captured in the transcript set. All other rows are **observed** verbatim wire lines. Additional header-fault strings from the same routine: `554 5.6.0 "Invalid address in <hdr>"` for a bad `Sender`/`To`/`Cc`/`Bcc`/`Reply-To` (`submission.go:L50-L81`), `554 5.6.0 "Invalid address in From"` (`submission.go:L83-L95`), `554 5.6.0 "Missing Sender header field"` (`submission.go:L99-L109`), and `554 "Malformed Date header"` **with no enhanced code** (`submission.go:L111-L123`).
+> **Header-fault rows (captured on the wire).** The missing/invalid/malformed-header replies were driven with the `client.py` harness (see R6) and captured verbatim; each is shown with its `file:line`. All other rows are likewise **observed** verbatim wire lines. Additional header-fault strings from the same routine: `554 5.6.0 "Invalid address in <hdr>"` for a bad `Sender`/`To`/`Cc`/`Bcc`/`Reply-To` (`submission.go:L50-L81`), `554 5.6.0 "Invalid address in From"` (`submission.go:L83-L95`), `554 5.6.0 "Missing Sender header field"` (`submission.go:L99-L109`), and `554 5.0.0 "Malformed Date header"` (`submission.go:L111-L123`). The `Date` reply is the one case where the source `SMTPError` omits the `EnhancedCode` field (`submission.go:L114-L122`) — its `smtp_enchcode` field logs the unset zero value `0.0.0` — yet the observed wire still carries `5.0.0`, because go-smtp substitutes a generic `X.0.0` for any unset enhanced code (`go-smtp/conn.go:663-667`), turning `554` into `554 5.0.0` (see R8's bonus divergence for the full mechanism).
 
 ### Required exact reply literals (fenced)
 
@@ -158,14 +158,14 @@ send: b'AUTH PLAIN AGFsaWNlQGV4YW1wbGUub3JnAFdST05HcGFzc3dvcmQ='
 reply: b'454 4.7.0 Invalid credentials\r\n'
 ```
 
-The **source-derived** header-fault replies — exact `Message` string literals from `submissionPrepare`, quoted from source and **not** separately captured on the wire (cited respectively at `submission.go:L43`, `:L56`/`:L72`, `:L88`, `:L103`, `:L116`; the last carries **no** enhanced code; the grammatical quirk "contains" is preserved verbatim):
+The header-fault replies — the exact `Message` string literals from `submissionPrepare` (cited respectively at `submission.go:L43`, `:L56`/`:L72`, `:L88`, `:L103`, `:L116`; the grammatical quirk "contains" is preserved verbatim). All five were **captured on the wire** with the `client.py` harness above (driving `AUTH → MAIL → RCPT → DATA` and then a header block that trips each check); the first four set `EnhancedCode{5, 6, 0}` in source and reach the client unchanged, while the last — the `Date` reply — sets **no** `EnhancedCode` in source (`submission.go:L114-L122`), yet its wire form is **not** bare: go-smtp fills the unset code with a generic `5.0.0` derived from the `554` category (mechanism detailed in R8's bonus divergence). The observed wire literals (the run-specific `(msg ID = …)` suffix omitted):
 
 ```
 554 5.6.0 Message does not contains a From header field
 554 5.6.0 Invalid address in <hdr>
 554 5.6.0 Invalid address in From
 554 5.6.0 Missing Sender header field
-554 Malformed Date header
+554 5.0.0 Malformed Date header
 ```
 
 ### The core answer: acceptance is **domain-scoped**, not user-scoped
@@ -716,9 +716,22 @@ A reasonable config reading is "`sign_dkim` on ⇒ recipients get `dkim=pass`." 
 
 So "DKIM configured" does **not** imply "recipients see `dkim=pass`." The emitted signature is unverifiable for two independent reasons established empirically in R5: (a) the public key is written as PKCS#1 while go-msgauth parses PKIX (`internal/modify/dkim/keys.go:L143`), and (b) even with a parseable key the signature fails `crypto/rsa` verification because the header set was re-serialized after signing — the body hash matches (`bodyhash.py`, `MATCH = True`), so the drift is confined to the signed **header** bytes. It is **not** the `DKIM-Signature`→`Dkim-Signature` field-name re-casing: relaxed header canonicalization lower-cases field names before hashing (RFC 6376 §3.4.2), so that change is canonicalized away.
 
-### Bonus divergence — reply codes: spec-idealized vs. library-actual
+### Bonus divergence — reply & enhanced codes: idealized / source-suggested vs. library-actual
 
 A spec-level reading predicts unauthenticated `MAIL` → `530` and bad credentials → `535`. Maddy + go-smtp actually return **`502 5.7.0 Please authenticate first`** and **`454 4.7.0 Invalid credentials`** — these are the go-smtp library's fallback branches (`go-smtp/conn.go:270` for `502`, `:438` for `454`), not the RFC-idealized codes. A reader expecting `530`/`535` from the SMTP standards would be surprised by the observed `502`/`454`.
+
+A closely related divergence concerns the **enhanced status code** of the malformed-`Date` rejection — and it is a textbook case of the source misleading about runtime. Read in isolation, `submissionPrepare` suggests a bare `554 Malformed Date header`: unlike its four sibling header-fault errors, the `Date` `SMTPError` sets **no** `EnhancedCode` field (`submission.go:L114-L122` — contrast the explicit `EnhancedCode{5, 6, 0}` at `:L42`, `:L55`, `:L71`, `:L87`, `:L102`). The wire tells a different story. Maddy's `wrapErr` copies the unset code through unchanged (`smtp.go:L402-L422`) as `{0, 0, 0}` — logged in the `smtp_enchcode` field as `0.0.0` — which is exactly go-smtp's `EnhancedCodeNotSet` (`go-smtp/data.go:28`: `var EnhancedCodeNotSet = EnhancedCode{0, 0, 0}`). `WriteResponse` then refuses to emit a bare reply — its comment reads *"All responses must include an enhanced code, if it is missing - use a generic code X.0.0"* — and substitutes `{code/100, 0, 0}` = `{5, 0, 0}` for the `554` category (`go-smtp/conn.go:663-667`). The **observed** reply is therefore `554 5.0.0 Malformed Date header`, never the source-suggested bare form. The `bad_date` construction in the R6 `client.py` harness (a `DATA` payload carrying `Date: not-a-real-date`) produced, verbatim on the wire:
+
+```
+send: b'From: alice@example.org\r\nTo: alice@example.org\r\nSubject: bad date\r\nDate: not-a-real-date\r\n\r\nbody\r\n.\r\n'
+reply: b'554 5.0.0 Malformed Date header (msg ID = 7c0ba5cf)\r\n'
+```
+
+with the correlated server `debug` log confirming the source left the enhanced code unset (`0.0.0`) before go-smtp filled it in:
+
+```
+submission: DATA error	{"date":"not-a-real-date","modifier":"submission_prepare","msg_id":"7c0ba5cf","reason":"date not-a-real-date could not be parsed","smtp_code":554,"smtp_enchcode":"0.0.0","smtp_msg":"Malformed Date header"}
+```
 
 ### Rationale
 
@@ -785,7 +798,7 @@ Every `file:line` below was verified against the source at commit `26452dd8dd787
 | `internal/endpoint/smtp/submission.go:L39-L48` | missing `From` → `554 5.6.0 "Message does not contains a From header field"` |
 | `internal/endpoint/smtp/submission.go:L50-L95` | invalid `Sender`/`To`/…/`From` → `554 5.6.0 "Invalid address in …"` |
 | `internal/endpoint/smtp/submission.go:L99-L109` | `554 5.6.0 "Missing Sender header field"` |
-| `internal/endpoint/smtp/submission.go:L111-L127` | `554 "Malformed Date header"` (no enhanced code); Date insertion (fmt at `:L126`) |
+| `internal/endpoint/smtp/submission.go:L111-L127` | `554 5.0.0 "Malformed Date header"` (source `SMTPError` omits `EnhancedCode` at `:L114-L122` → logged `smtp_enchcode "0.0.0"`; go-smtp derives `5.0.0` from the `554` category — see R8 bonus); Date insertion (fmt at `:L126`) |
 | `internal/endpoint/smtp/smtp.go:L492` | `submission: modName == "submission"` |
 | `internal/endpoint/smtp/smtp.go:L589-L593` | mandatory-auth (`authAlwaysRequired = true`) |
 | `internal/endpoint/smtp/smtp.go:L653-L655` | `Login` → `errors.New("Invalid credentials")` |
