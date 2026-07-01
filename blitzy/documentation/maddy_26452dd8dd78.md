@@ -17,13 +17,17 @@ every factual claim is paired with a `file:line` citation into the source tree.
 
 ## 1. Methodology and toolchain
 
-**Toolchain actually used:** `go version go1.26.4 linux/amd64` (GOROOT
-`/tmp/go1264/go`, installed outside the repository working tree). All Go
-build/module/temp caches were likewise kept **outside** the repository
-(`GOCACHE=/tmp/go-cache-1264`, `GOTMPDIR=/tmp`, `GOMODCACHE=/root/go/pkg/mod`,
-`GOFLAGS=-mod=readonly`, `GOTOOLCHAIN=local`) so the working tree stays
-byte-for-byte unchanged. Every value quoted below was observed in a test run
-executed under this toolchain.
+**Toolchain actually used:** `go version go1.18.10 linux/amd64` (GOROOT
+`/usr/local/go`), the toolchain installed on `PATH` in the project's blessed
+container. All Go build/module caches were kept **outside** the repository
+working tree (`GOCACHE=/tmp/go-cache-118`, `GOMODCACHE=/root/go/pkg/mod`) and
+the module graph was pinned read-only (`GOFLAGS=-mod=readonly`) so that
+`go.mod` / `go.sum` and the rest of the tree stay byte-for-byte unchanged.
+Every value quoted below was observed in a test run executed under this
+toolchain. One value — the Go standard-library TLS-verification error text
+surfaced in Q3c — is **Go-version-dependent**; that dependence is called out
+explicitly where it occurs (§5, Q3c) and summarised in the determinism note
+(§8).
 
 **Verified invocation pattern.** maddy's test logger routes messages to Go's
 `t.Log`, which the `go test` runner only prints in verbose mode; debug-level
@@ -114,27 +118,27 @@ sub-logger `"smtp/pipeline"` [internal/endpoint/smtp/smtp_test.go:L85].
 **Verbatim — successful delivery (`TestSMTPDelivery`):**
 
 ```text
-smtp: incoming message	{"msg_id":"d3250afc","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:60004"}
-smtp: RCPT ok	{"msg_id":"d3250afc","rcpt":"rcpt1@example.com"}
-smtp: RCPT ok	{"msg_id":"d3250afc","rcpt":"rcpt2@example.com"}
-smtp: accepted	{"msg_id":"d3250afc"}
+smtp: incoming message	{"msg_id":"ccacf6bf","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:48768"}
+smtp: RCPT ok	{"msg_id":"ccacf6bf","rcpt":"rcpt1@example.com"}
+smtp: RCPT ok	{"msg_id":"ccacf6bf","rcpt":"rcpt2@example.com"}
+smtp: accepted	{"msg_id":"ccacf6bf"}
 ```
 
 **Verbatim — aborted mid-DATA (`TestSMTPDelivery_AbortData`):**
 
 ```text
-smtp: incoming message	{"msg_id":"0464e3a9","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:33234"}
-smtp: RCPT ok	{"msg_id":"0464e3a9","rcpt":"test@example.com"}
-smtp: DATA error	{"msg_id":"0464e3a9","reason":"unexpected EOF"}
-smtp: aborted	{"msg_id":"0464e3a9"}
+smtp: incoming message	{"msg_id":"c561daab","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:48790"}
+smtp: RCPT ok	{"msg_id":"c561daab","rcpt":"test@example.com"}
+smtp: DATA error	{"msg_id":"c561daab","reason":"unexpected EOF"}
+smtp: aborted	{"msg_id":"c561daab"}
 ```
 
 **Verbatim — aborted via logout (`TestSMTPDelivery_AbortLogout`):**
 
 ```text
-smtp: incoming message	{"msg_id":"ae472f73","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:41442"}
-smtp: RCPT ok	{"msg_id":"ae472f73","rcpt":"test@example.com"}
-smtp: aborted	{"msg_id":"ae472f73"}
+smtp: incoming message	{"msg_id":"3213bf63","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:48796"}
+smtp: RCPT ok	{"msg_id":"3213bf63","rcpt":"test@example.com"}
+smtp: aborted	{"msg_id":"3213bf63"}
 ```
 
 Note the logout variant ends `RCPT ok → aborted` with **no** `DATA error` line,
@@ -186,7 +190,7 @@ Endpoint-originated messages get their ID from `GenerateMsgID()`, which reads 4
 random bytes and hex-encodes them (4 bytes → 8 hex chars)
 [internal/msgpipeline/msgid.go:L12-L16].
 **⚠ Non-deterministic:** the value is random per run. The values shown above —
-`d3250afc`, `0464e3a9`, `ae472f73` — are illustrative examples from **this**
+`ccacf6bf`, `c561daab`, `3213bf63` — are illustrative examples from **this**
 run; a different run yields different 8-hex IDs. The **format** (8 lowercase hex
 characters) is the stable answer.
 
@@ -212,7 +216,7 @@ exactly.
 [debug] queue: delivery attempt #1	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
 queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org","reason":"you shall not pass"}
 queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org","reason":"you shall not pass"}
-queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-457ns","rcpts":["tester1@example.org","tester2@example.org"]}
+queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-629ns","rcpts":["tester1@example.org","tester2@example.org"]}
 [debug] queue: delivery attempt #2	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
 queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org"}
 queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org"}
@@ -334,7 +338,7 @@ When the TLS handshake fails and MX-authentication policy permits plaintext, the
 remote target logs a fallback message and reconnects without TLS. Verbatim:
 
 ```text
-remote: TLS error, falling back to plaintext	{"domain":"example.invalid","msg_id":"2176ec5872ed2b87d832b4070e88232bd94ac7d3","mx":"mx.example.invalid.","reason":"smtpconn: tls: failed to verify certificate: x509: certificate signed by unknown authority"}
+remote: TLS error, falling back to plaintext	{"domain":"example.invalid","msg_id":"2176ec5872ed2b87d832b4070e88232bd94ac7d3","mx":"mx.example.invalid.","reason":"smtpconn: x509: certificate signed by unknown authority"}
 ```
 
 - The message is **`remote: TLS error, falling back to plaintext`** with exactly
@@ -349,12 +353,26 @@ remote: TLS error, falling back to plaintext	{"domain":"example.invalid","msg_id
   `printf '%s' 'TestRemoteDelivery_TLSErrFallback' | sha1sum` →
   `2176ec5872ed2b87d832b4070e88232bd94ac7d3`.
 - **`reason`** is added automatically by `Logger.Error` from the underlying
-  error's text [internal/log/log.go:L89-L104]. Under the `go1.26.4` toolchain
-  used for this investigation it was observed as **`smtpconn: tls: failed to
-  verify certificate: x509: certificate signed by unknown authority`**. The
-  `smtpconn: ` prefix is maddy's own: `smtpconn.TLSError.Error()` returns
-  `"smtpconn: " + err.Err.Error()` [internal/smtpconn/smtpconn.go:L144-L146],
-  wrapping the Go standard-library TLS verification error that follows.
+  error's text [internal/log/log.go:L89-L104]. Under the blessed **`go1.18.10`**
+  toolchain used for this investigation it was observed as **`smtpconn: x509:
+  certificate signed by unknown authority`**. The `smtpconn: ` prefix is
+  maddy's own: `smtpconn.TLSError.Error()` returns `"smtpconn: " +
+  err.Err.Error()` [internal/smtpconn/smtpconn.go:L144-L146], wrapping the Go
+  standard-library TLS-verification error that follows.
+- **⚠ Go-version-dependent (the wrapped stdlib text only).** The Go standard
+  library changed this message in **Go 1.20**, which added a
+  `tls: failed to verify certificate:` prefix on handshake verification
+  failures. This was confirmed by running the same test under both toolchains:
+  - Blessed **`go1.18.10`** →
+    `reason":"smtpconn: x509: certificate signed by unknown authority"` (the
+    value quoted above).
+  - A **Go ≥ 1.20** toolchain (verified with `go1.26.4`) →
+    `reason":"smtpconn: tls: failed to verify certificate: x509: certificate signed by unknown authority"`.
+
+  maddy's own `smtpconn: ` prefix, the message string `TLS error, falling back
+  to plaintext`, and the four field names (`domain`, `msg_id`, `mx`, `reason`)
+  are **toolchain-independent**; only the wrapped Go-stdlib text inside `reason`
+  varies with the compiler version.
 
 **Rationale — when the fallback fires.** The reconnect-without-TLS branch is
 guarded so that it triggers only when the connection error is an
@@ -380,8 +398,8 @@ injected by `DeliveryLogger`).
 **Value and rationale.** `next_try_delay` is a Go `time.Duration` rendered as a
 string, computed as `time.Until(nextTryTime)`
 [internal/target/queue/queue.go:L417]. In the tests it is a near-zero /
-negative-nanosecond value — observed as **`"-457ns"`** in the isolated
-`TestQueueDelivery_TemporaryFail` run above (and, e.g., `"-623ns"` / `"-287ns"`
+negative-nanosecond value — observed as **`"-629ns"`** in the isolated
+`TestQueueDelivery_TemporaryFail` run above (and, e.g., `"-524ns"` / `"-277ns"`
 in `TestQueueDelivery_MultipleAttempts`). The reason it is essentially zero is
 that the test helper `cleanQueue` overrides the retry parameters to
 `initialRetryTime = 0` [internal/target/queue/queue_test.go:L50] and
@@ -417,7 +435,7 @@ production default.
 | **Q2** — complete queue lifecycle (accept → retry) | `delivery attempt #N` (debug) → `delivery attempt failed` (`msg_id,rcpt,reason`) → `will retry` (`attempts_count,msg_id,next_try_delay,rcpts`) → `delivery attempt #N+1` (debug) → `delivered` (`attempt,msg_id,rcpt`); recipient-scoped lines repeat once per recipient | §4 |
 | **Q3a** — MX authenticity error string | `Failed to estabilish the MX record (mx.example.invalid.) authenticity` (typo `estabilish` reported as-is) | §5 |
 | **Q3b** — enhanced status code + reply text | Enhanced code `5.4.0` (`smtp_enchcode:[5 4 0]`), `smtp_code` `550`, reply text `No usable MXs, last err: Failed to estabilish the MX record (mx.example.invalid.) authenticity`; surfaced `5.4.0` (not internal `5.7.0`) due to `SMTPEnchCode` forcing `code[0]=5` | §5 |
-| **Q3c** — TLS→plaintext fallback log line + all JSON fields | `remote: TLS error, falling back to plaintext` with four fields `domain`, `msg_id`, `mx`, `reason`; observed `reason` = `smtpconn: tls: failed to verify certificate: x509: certificate signed by unknown authority` | §5 |
+| **Q3c** — TLS→plaintext fallback log line + all JSON fields | `remote: TLS error, falling back to plaintext` with four fields `domain`, `msg_id`, `mx`, `reason`; observed `reason` = `smtpconn: x509: certificate signed by unknown authority` (blessed go1.18.10; under Go ≥ 1.20 the wrapped `tls: failed to verify certificate:` form appears — see §5) | §5 |
 | **Q4** — retry-delay JSON field name | `next_try_delay` on the `queue: will retry` line | §6 |
 
 All ten sub-parts (Q1a–e, Q2, Q3a–c, Q4) are explicitly addressed above.
@@ -445,8 +463,22 @@ To distinguish stable answers from run-varying artifacts:
 
 **Non-deterministic — varies per run:**
 
-- The **endpoint 8-hex `msg_id`** (e.g. `d3250afc`, `0464e3a9`, `ae472f73`),
+- The **endpoint 8-hex `msg_id`** (e.g. `ccacf6bf`, `c561daab`, `3213bf63`),
   because it is 4 random bytes hex-encoded.
-- The **magnitude** of `next_try_delay` (e.g. `-457ns`), a sub-microsecond
+- The **magnitude** of `next_try_delay` (e.g. `-629ns`), a sub-microsecond
   scheduling artifact under the tests' zeroed retry parameters.
+- The ephemeral **`src_ip` port** on the `incoming message` line (e.g.
+  `127.0.0.1:48768`), i.e. the OS-assigned client port of the in-process test
+  connection.
+
+**Toolchain-dependent — varies with the Go compiler version (not per run):**
+
+- The **wrapped Go-standard-library text inside the Q3c `reason` field**. Under
+  the blessed **`go1.18.10`** it is `smtpconn: x509: certificate signed by
+  unknown authority`; under **Go ≥ 1.20** the standard library adds a
+  `tls: failed to verify certificate:` prefix, yielding `smtpconn: tls: failed
+  to verify certificate: x509: certificate signed by unknown authority`. All
+  quoted values in this document are from the blessed `go1.18.10` toolchain
+  (§1). maddy's own `smtpconn: ` prefix, the log message, and the field names
+  remain toolchain-independent — only the inner stdlib phrase changes.
 
