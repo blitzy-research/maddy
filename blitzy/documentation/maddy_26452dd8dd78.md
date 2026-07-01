@@ -115,7 +115,7 @@ $ grep -c "This is the body" run_debugonly.log      # body bytes on the wire
 $ grep -c "^smtp: 354" run_debugonly.log            # the 354 prompt on the wire
 0
 $ grep -c "smtp: incoming message\|accepted" run_debugonly.log   # structured markers present
-3
+2
 ```
 
 Adding `io_debug` (with `debug`) makes the wire transcript appear:
