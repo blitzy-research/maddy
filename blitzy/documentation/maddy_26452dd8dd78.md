@@ -787,7 +787,8 @@ graph is otherwise wired up. The two exit codes make the settle state unambiguou
   [`internal/storage/sql/sql.go:L263`], *before* the version log at
   [`internal/storage/sql/sql.go:L268`] — which is why no `go-imap-sql version` line appears in the no-CGO
   run). The `reference &local_mailboxes` line still prints first because `internal/config/module/modconfig.go:L68` runs before the
-  error is returned at `internal/config/module/modconfig.go:L73`.
+  error check at `internal/config/module/modconfig.go:L73` (the `return err` itself is at
+  `internal/config/module/modconfig.go:L74`).
 - **Version string distinction.** The runtime prints `go-imap-sql version 0.4.0` — this is the dependency's
   compiled-in constant `const VersionStr = "0.4.0"`
   (`github.com/foxcpp/go-imap-sql@v0.3.2-0.20191208094750-8b4ec6b19a78/version.go:L7`). It is **distinct**
