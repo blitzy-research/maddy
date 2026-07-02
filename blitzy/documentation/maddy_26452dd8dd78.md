@@ -30,19 +30,19 @@ confirming default new-key algorithm **rsa2048** (`internal/modify/dkim/dkim.go:
 ## O1 — How maddy accepts/rejects a sender, and at what granularity
 Acceptance is decided by **pipeline source routing at the domain level**, not by comparing `MAIL FROM` to the authenticated user. `startDelivery` records the cleaned sender as `msgMeta.OriginalFrom` and starts the pipeline with no From/AuthUser compare (`internal/endpoint/smtp/smtp.go:83-160`, assignment `:116`); the authenticated user is only *logged*:
 ```
-submission: incoming message	{"msg_id":"373e1abf","sender":"bob@example.org","src_host":"probe.local","src_ip":"127.0.0.1:37526","username":"alice@example.org"}
+submission: incoming message	{"msg_id":"7e3f7780","sender":"bob@example.org","src_host":"probe.local","src_ip":"127.0.0.1:46828","username":"alice@example.org"}
 ```
 (Scenario B: `sender`=bob but `username`=alice; delivery proceeds.) The pipeline matches **full address → domain → default_source** (`internal/msgpipeline/msgpipeline.go:155-193`; `perSource[cleanFrom]` `:171` → `perSource[domain]` `:190` → `defaultSource` `:193`):
 ```
-[debug] smtp/pipeline: sender alice@example.org matched by domain rule 'example.org'	{"msg_id":"e5b1bd50"}
+[debug] smtp/pipeline: sender alice@example.org matched by domain rule 'example.org'	{"msg_id":"46abfa3a"}
 ```
 ```
-[debug] smtp/pipeline: sender eve@notlocal.com matched by default rule	{"msg_id":"62766548"}
+[debug] smtp/pipeline: sender eve@notlocal.com matched by default rule	{"msg_id":"3cd6abd7"}
 ```
 The only envelope-level enforcement is **domain membership** via `default_source { reject 501 5.1.8 "Non-local sender domain" }` (`maddy.conf:117-119`). **Granularity: per-domain, not per-account.**
 
 ## O2 — Actual SMTP response codes/messages (verbatim) + full protocol dialogs
-Both transactions below are the **complete** raw-socket dialogs (every client `C:` command and server `S:` response, from the `220` greeting through `QUIT`/`221`). The `AUTH PLAIN` base64 SASL token is redacted (it carries the password); everything else is verbatim.
+Both transactions below are the **complete** raw-socket dialogs (every client `C:` command and server `S:` response, from the `220` greeting through `QUIT`/`221`). The `AUTH PLAIN` base64 SASL token is redacted (it carries the password) and the message `DATA` payload is shown as a one-line summary (its stored form is dumped verbatim in **O3**); every SMTP command and every server response line is verbatim.
 
 **Accepted (Scenario A, :2525) — greeting → EHLO → AUTH → MAIL → RCPT → DATA → QUIT:**
 ```
@@ -63,8 +63,8 @@ C: RCPT TO:<bob@example.org>
 S: 250 2.0.0 I'll make sure <bob@example.org> gets this
 C: DATA
 S: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
-C: <message headers: From: alice@example.org; To: bob@example.org; Subject: Scenario-A-legit-signed>
-C: <body + terminating line '.'>
+C: <DATA: From: alice@example.org; To: bob@example.org; Subject: Scenario-A-legit-signed; + body>
+C: .
 S: 250 2.0.0 OK: queued
 C: QUIT
 S: 221 2.0.0 Goodnight and good luck
@@ -85,32 +85,32 @@ S: 235 2.0.0 Authentication succeeded
 C: MAIL FROM:<eve@notlocal.com>
 S: 250 2.0.0 Roger, accepting mail from <eve@notlocal.com>
 C: RCPT TO:<alice@example.org>
-S: 501 5.1.8 Non-local sender domain (msg ID = 62766548)
+S: 501 5.1.8 Non-local sender domain (msg ID = 3cd6abd7)
 C: QUIT
 S: 221 2.0.0 Goodnight and good luck
 ```
 - The accept strings `Roger, accepting mail from <…>` / `I'll make sure <…> gets this` / `OK: queued`, the greeting `Goodnight and good luck`, and the `354 … Go ahead` line originate in the **go-smtp dependency** (`go.mod:19`, `v0.12.1-0.20191206174923-1f576e0ec85c`), not maddy source.
-- `Non-local sender domain` / `501 5.1.8` come from config `default_source` (`maddy.conf:118`); the ` (msg ID = 62766548)` suffix is appended by `internal/endpoint/smtp/smtp.go:437`.
+- `Non-local sender domain` / `501 5.1.8` come from config `default_source` (`maddy.conf:118`); the ` (msg ID = 3cd6abd7)` suffix is appended by `internal/endpoint/smtp/smtp.go:437`.
 - The multiline `250-…` EHLO capabilities (`PIPELINING`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `AUTH PLAIN`, `SMTPUTF8`, `SIZE 33554432`) are advertised by the endpoint before authentication.
 
 ## O3 — Raw stored headers (verbatim) + a demonstrated absence
 `DKIM-Signature` (Scenario A → bob), via `maddyctl imap-msgs dump bob@example.org INBOX 1` (reproduced exactly as stored, including header folding and the complete `b=` signature bytes):
 ```
 Dkim-Signature: a=rsa-sha256; bh
- =B6JQtAWuxDk05K0MXqY6YftNjeB5xYr+DfAj4EFpqiU=; c=relaxed/relaxed;
+ =BRbNLh8fl39kILyZlU0lQ5uq6kkwvLNaDjtXnOQNTco=; c=relaxed/relaxed;
  d=example.org;
- h=Subject:Subject:Sender:To:To:Cc:From:From:Date:Date:MIME-Version:Content-Type:Content-Transfer-Encoding:Reply-To:In-Reply-To:Message-Id:Message-Id:References:Autocrypt:Openpgp; i=alice@example.org; s=default; t=1782944796; v=1; x=1783376796; b=XgSZaoa4smn/bj4wiO6mX/ytRgUlx2U/SBDrlGsvXlqYowxnr6Kmq+hTuM+Xwdarr9HNCe93RAiwAUYcWOiE7P9qlUR+G8Z5p8/WU8uOz6Er/QFDXLLrWDDQPj8tic0SzaiwqbAIKXKuUlo5n8t9JzfyLz9RxlfO8/yRVJ5cL7hZLGmAwTG8VB++PLvLVjf5oH5CfciVu1SRSBcRJ1qcf28Uq8juc8ICxW0WF8X4n4ReH+xUkRq0b6kBNzK2ybxEy0QCFW1jfURTzV6QFm2ENxNYp4QxE/Ei4sqOn++u0TwBLqOHjTBu3wHjPPi7+pWeKiLwv3qi358mfr6i20M0OA==;
+ h=Subject:Subject:Sender:To:To:Cc:From:From:Date:Date:MIME-Version:Content-Type:Content-Transfer-Encoding:Reply-To:In-Reply-To:Message-Id:Message-Id:References:Autocrypt:Openpgp; i=alice@example.org; s=default; t=1782954108; v=1; x=1783386108; b=OmTdAZeRBXHGNYYpwRiTAMZrJNw6QJxmQrU9dPsmfKn6ny+WZkI8kjYtj8p+J8vVrMpDFatd8/035HTWubcoXXwoTlLgc22qTp3OghWGsZD4UDolLs0VOe0zolxrUHYuwwqGHvLbYQsmgiROFQNo6lbLkxiqqyRkF0pl1Zjsq+8CBOm2Yd+DA4dp7hoU7q4FtFkWKCVVXeprJJhPOu+3nMjaVgZ3CwEiL3gPgrCMU391bDAEIeewZ4VC/L/x5UIqduc6CNq7jEu5MUbUdZLS3if7VcItbL2t6wPTLxPEPqOoDHtJZQnwCDHj2+paGBeG7B6n6J6NV+DqDLwRIM1vKw==;
 ```
 - Emitted by `h.Add("DKIM-Signature", signer.SignatureValue())` (`internal/modify/dkim/dkim.go:406`). `d=example.org` (SDID), `i=alice@example.org` (AUID), `a=rsa-sha256` (default hash `sha256`, `dkim.go:148`), `c=relaxed/relaxed`.
-- **Expiry:** `x − t = 1783376796 − 1782944796 = 432000 s = 5 days`, matching `sig_expiry` default `5*Day` (`dkim.go:146`).
+- **Expiry:** `x − t = 1783386108 − 1782954108 = 432000 s = 5 days`, matching `sig_expiry` default `5*Day` (`dkim.go:146`).
 - **Covers `From`:** the `h=` list contains `From:From` → `From` is **oversigned**, so the signature covers it.
 
 `Received` (Scenario A):
 ```
 Received:  by example.org (envelope-sender <alice@example.org>) with ESMTP
- id e5b1bd50; Wed, 01 Jul 2026 22:26:36 +0000
+ id 46abfa3a; Thu, 02 Jul 2026 01:01:48 +0000
 ```
-Built by `GenerateReceived` (`internal/target/received.go:19-87`). Note the **double space** after `Received:` and the **missing leading `from <host> ([ip])` clause**: submission sets `DontTraceSender` (`internal/endpoint/smtp/submission.go:28`) and the `from …` clause is gated on `!DontTraceSender` (`received.go:30`); the `by …(envelope-sender <…>) with ESMTP id …; <date>` shape matches `received.go:62,69`. The trace `id` (`e5b1bd50`) equals the message's `msg_id`.
+Built by `GenerateReceived` (`internal/target/received.go:19-87`). Note the **double space** after `Received:` and the **missing leading `from <host> ([ip])` clause**: submission sets `DontTraceSender` (`internal/endpoint/smtp/submission.go:28`) and the `from …` clause is gated on `!DontTraceSender` (`received.go:30`); the `by …(envelope-sender <…>) with ESMTP id …; <date>` shape matches `received.go:62,69`. The trace `id` (`46abfa3a`) equals the message's `msg_id`.
 
 `Authentication-Results` — **absent**. The four delivered messages were dumped with `maddyctl imap-msgs dump` into `A_bob_uid1.eml` (A→bob INBOX 1), `B_alice_uid1.eml` (B→alice INBOX 1), `D_bob_uid2.eml` (D→bob INBOX 2) and `E_bob_uid3.eml` (E→bob INBOX 3), so the counts below run against the actual stored headers. Counting the header across **all four delivered messages** returns **0**:
 ```
@@ -136,16 +136,16 @@ submission: adding missing Date header
 
 (a) **`From` domain ≠ key domain** (Scenario D, `From: attacker@evil.com`). Decision log:
 ```
-sign_dkim: not signing, From domain is not key domain	{"from_domain":"evil.com","key_domain":"example.org","msg_id":"c21b06db"}
+sign_dkim: not signing, From domain is not key domain	{"from_domain":"evil.com","key_domain":"example.org","msg_id":"0e2f47af"}
 ```
 (gate `dkim.go:287-291`). The transaction was still accepted (`250 … OK: queued`, see D in the table) and the **stored message carries no `DKIM-Signature`** — the dumped headers and a header count confirm it:
 ```
 Delivered-To: bob@example.org
 Return-Path: <alice@example.org>
 Received:  by example.org (envelope-sender <alice@example.org>) with ESMTP
- id c21b06db; Wed, 01 Jul 2026 22:26:51 +0000
-Date: Wed, 1 Jul 2026 22:26:51 +0000
-Message-Id: <a543097c-db91-4f50-a8bc-f38a9005e06b@example.org>
+ id 0e2f47af; Thu, 02 Jul 2026 01:02:48 +0000
+Date: Thu, 2 Jul 2026 01:02:48 +0000
+Message-Id: <39d0645f-892a-4ac5-a11d-23b7fb789ba7@example.org>
 From: attacker@evil.com
 To: bob@example.org
 Subject: Scenario-D-spoofed
@@ -154,20 +154,20 @@ Subject: Scenario-D-spoofed
 $ grep -c -i "^Dkim-Signature:" D_bob_uid2.eml
 0
 ```
-(The trace `id c21b06db` matches the decision-log `msg_id`; `From:` is `attacker@evil.com` while `Return-Path` is the envelope `alice@example.org`.)
+(The trace `id 0e2f47af` matches the decision-log `msg_id`; `From:` is `attacker@evil.com` while `Return-Path` is the envelope `alice@example.org`.)
 
 (b) **`From` ≠ authenticated identity** under default `{envelope, auth}` (Scenario B, auth alice / `From: bob`). Decision log:
 ```
-sign_dkim: not signing, From address is not authenticated identity	{"auth_id":"alice@example.org","from_addr":"bob@example.org","msg_id":"373e1abf"}
+sign_dkim: not signing, From address is not authenticated identity	{"auth_id":"alice@example.org","from_addr":"bob@example.org","msg_id":"7e3f7780"}
 ```
 (gate `dkim.go:299-310`). Delivered to alice, and the **stored message carries no `DKIM-Signature`**:
 ```
 Delivered-To: alice@example.org
 Return-Path: <bob@example.org>
 Received:  by example.org (envelope-sender <bob@example.org>) with ESMTP id
- 373e1abf; Wed, 01 Jul 2026 22:26:51 +0000
-Date: Wed, 1 Jul 2026 22:26:51 +0000
-Message-Id: <61272bb6-78a1-42a0-bc9a-3bad3675faa1@example.org>
+ 7e3f7780; Thu, 02 Jul 2026 01:02:17 +0000
+Date: Thu, 2 Jul 2026 01:02:17 +0000
+Message-Id: <c07af33d-b281-4d59-8b2b-0767838ac6d0@example.org>
 From: bob@example.org
 To: alice@example.org
 Subject: Scenario-B-crossuser
@@ -180,7 +180,7 @@ $ grep -c -i "^Dkim-Signature:" B_alice_uid1.eml
 **What a verifying recipient sees:** maddy **never emits a `d=example.org` signature over a `From: attacker@evil.com` message**, so it never produces a DMARC-*misaligned* signature. The recipient of Scenario D sees an **unsigned message** (no DKIM `pass` to rely on), not a valid-but-misaligned one. This enforces the DKIM AUID/SDID relationship (RFC 6376: `i=` domain must equal/subdomain `d=`).
 
 ## O5 — Protocol-level capture
-The **complete** client/server transcripts for one accepted (A) and one rejected (C) transaction — from the `220` greeting and `EHLO`/`AUTH` through `QUIT` (and, for C, the `501` abort) — are shown in full in **O2**, captured with a temporary raw-socket SMTP client (`/tmp/smtp_probe.py`, removed after). They are cross-referenced with maddy's structured JSON logs (`incoming message`, `matched by … rule`, `sign_dkim: …`, the `501 5.1.8` reject, `signed`). The debug-level `sign_dkim: signed` line is visible because the harness passed `-debug`; the `not signing, …` lines are normal-level. Both channels agree (e.g., the reject's ` (msg ID = 62766548)` on the wire equals the `incoming message` `msg_id` in the log).
+The **complete** client/server transcripts for one accepted (A) and one rejected (C) transaction — from the `220` greeting and `EHLO`/`AUTH` through `QUIT` (and, for C, the `501` abort) — are shown in full in **O2**, captured with a temporary raw-socket SMTP client (`/tmp/smtp_probe.py`, removed after). They are cross-referenced with maddy's structured JSON logs (`incoming message`, `matched by … rule`, `sign_dkim: …`, the `501 5.1.8` reject, `signed`). The debug-level `sign_dkim: signed` line is visible because the harness passed `-debug`; the `not signing, …` lines are normal-level. Both channels agree (e.g., the reject's ` (msg ID = 3cd6abd7)` on the wire equals the `incoming message` `msg_id` in the log).
 
 ## O6 — Does the default config align MAIL FROM/From to the login identity?
 **No.** Default `require_sender_match` = `{envelope, auth}` (`internal/modify/dkim/dkim.go:151-152`) gates **signing**, not **acceptance**; there is no per-account `MAIL FROM` enforcement (O1). Author-domain alignment is a receiver-side DMARC concern (RFC 7489); maddy runs DMARC inbound-only (`maddy.conf:70`).
@@ -194,9 +194,9 @@ The **complete** client/server transcripts for one accepted (A) and one rejected
 and the stored `DKIM-Signature` (via `maddyctl imap-msgs dump bob@example.org INBOX 3`) carries `d=example.org` with `i=bob@example.org`:
 ```
 Dkim-Signature: a=rsa-sha256;
- bh=fCGzeuUYgJ5PlWnFna3s1weKle+lIkcGD+qSY60CVos=; c=relaxed/relaxed;
+ bh=yfMCG+QNY7ifaFedCoOf2Qwa4pulUlhArEIaXEqciF8=; c=relaxed/relaxed;
  d=example.org;
- h=Subject:Subject:Sender:To:To:Cc:From:From:Date:Date:MIME-Version:Content-Type:Content-Transfer-Encoding:Reply-To:In-Reply-To:Message-Id:Message-Id:References:Autocrypt:Openpgp; i=bob@example.org; s=default; t=1782944817; v=1; x=1783376817; b=AJDSevCyEc5ds/yvbN9KttIbBuJ5xrn8afFpBVBC5lUVy4FqcHgR1c1R/ci3EykCOM5h9MDNmG4N/GC+p89qXO7HsV0N/qhRLkiYeMWHX2UX/AjxY6uXViEcTgiuS1rgxAOM2kVumBqWiilKhmWVQEy3RgqEtRKyQzy2+GVL6arb19i0lcXHPNFWMB2HxFXrf6QOxdRFatW/nXYfMlEcAX0kpw2ruJOtpq8RDrnq4Vl5gMvV1MJt13Dj7n0VpC/YGHy4/H4L2PWFPuaDjel4ww0GtOhTWIZfS0E/sLOVcBtdn9OD4E7Ik+cb8n5wLs8E42DTLAnzmkTwncSz4Yz5pQ==;
+ h=Subject:Subject:Sender:To:To:Cc:From:From:Date:Date:MIME-Version:Content-Type:Content-Transfer-Encoding:Reply-To:In-Reply-To:Message-Id:Message-Id:References:Autocrypt:Openpgp; i=bob@example.org; s=default; t=1782954183; v=1; x=1783386183; b=x0pi5armiM6a0XiX9jB8h/Uw66qF5rLDfOlLel5/Ne98xI/2e0CgupN32LQDDqsZ8zTvqforibuW24b1iHLe7opoEwf2JKrmwvsBEHbQbkmzhdbBFknD6IYRZhck1/H0LtlAScaFQiOmWxyWTdqiGIWhShQEl5DMCTIL6DrIIdh4spVJiXjxGpEzUsPxLdU+Y5gC4IfLSdDDixZ0Nd/G2Q6fCpSpEm9h+iTPvPUtaS5zndBad435bpUAyKDDM+VdC9b3J9JLr4/RMufo1yUDXqjs2f1BXqcM+SAWWpw8HPSwsg6MQyZ/l/rmcE0JDt+QiYsFb+PaaZue+RgsEME4YA==;
 ```
 The **same inputs** were **not** signed under the default endpoint (Scenario B) but **are** signed here — `auth_user` is **less strict** than the default, which no reasonable config reading predicts.
 (b) **`default_source` reject looks like a `MAIL FROM` rejection but fires at `RCPT`.** Config `default_source { reject 501 5.1.8 "Non-local sender domain" }` (`maddy.conf:117-119`), but `defer_sender_reject` defaults `true` (`internal/endpoint/smtp/smtp.go:567`), so `MAIL FROM` gets `250` and the `501 5.1.8` is emitted on first `RCPT` — see Scenario C's full dialog in O2 (`MAIL FROM:<eve@notlocal.com>` → `250`, then `RCPT TO:<alice@example.org>` → `501 5.1.8`).
