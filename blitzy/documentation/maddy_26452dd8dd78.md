@@ -36,7 +36,26 @@ go build -o /tmp/maddy_scratch/maddy ./cmd/maddy
 go build -o /tmp/maddy_scratch/maddyctl ./cmd/maddyctl
 ```
 
-Both builds exited `0`. The Go toolchain used was go1.20.14 (installed at `/usr/local/go`); gcc 13.3.0 was present for the `github.com/mattn/go-sqlite3` cgo build. The only compiler warning was a harmless `sqlite3-binding.c` `-Wreturn-local-addr` originating from `go-sqlite3 v1.11.0` — it does not affect the binary.
+Both builds exited `0`. The toolchain versions were captured with `go version` and `gcc --version` (and `go env GOROOT`) [observed, verbatim]:
+
+```
+go version go1.18.10 linux/amd64
+gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
+/usr/local/go
+```
+
+So the Go toolchain used was **go1.18.10** (installed at `/usr/local/go`), and **gcc 15.2.0** was present for the `github.com/mattn/go-sqlite3` cgo build (`CGO_ENABLED=1`). The only compiler diagnostic was a harmless `sqlite3-binding.c` `-Wreturn-local-addr` warning originating from `go-sqlite3 v1.11.0`; it appeared identically for both binaries and does not affect the build (exit code stayed `0`) [observed, verbatim]:
+
+```
+# github.com/mattn/go-sqlite3
+sqlite3-binding.c: In function ‘sqlite3SelectNew’:
+sqlite3-binding.c:125322:10: warning: function may return address of local variable [-Wreturn-local-addr]
+125322 |   return pNew;
+       |          ^~~~
+sqlite3-binding.c:125282:10: note: declared here
+125282 |   Select standin;
+       |          ^~~~~~~
+```
 
 **Version banner [observed, verbatim].** Running `./maddy -v` prints:
 
@@ -50,14 +69,15 @@ This is the **canonical default-build value**: the version string defaults to `V
 
 ## Section 2 — Configuration used, and why the substitutions are non-behavioral
 
-The test configuration reproduces the **default `maddy.conf` pipeline structure verbatim** and substitutes **only** four non-behavioral values:
+The test configuration reproduces the **default `maddy.conf` pipeline structure verbatim** and substitutes **only** three non-behavioral values:
 
 1. a controllable test domain, `test.example`, in place of the packaged placeholder;
 2. a self-signed TLS certificate/key pair (required because both submission :465 and IMAP :993 are *implicit* TLS);
-3. loopback listen addresses; and
-4. an out-of-tree state directory (so `all.db` and the generated `dkim_keys/` never land in the repository).
+3. an out-of-tree state directory (so `all.db` and the generated `dkim_keys/` never land in the repository).
 
-None of these four substitutions touches the enforcement *logic* — source routing, `require_sender_match`, the reject codes, and the delivery target are all unchanged — so the observations below are canonical for Maddy's default policy.
+The **listen addresses were deliberately kept at the packaged defaults** — `tls://0.0.0.0:465` for submission and `tls://0.0.0.0:993` for IMAP — matching `maddy.conf:L93` and `maddy.conf:L149`. The test client simply connects to those wildcard listeners over the loopback address `127.0.0.1`. This is confirmed directly by the startup log below, which reports `submission: listening on tls://0.0.0.0:465` and `imap: listening on tls://0.0.0.0:993` — a `0.0.0.0` wildcard bind, **not** a loopback bind.
+
+None of these three substitutions touches the enforcement *logic* — source routing, `require_sender_match`, the reject codes, and the delivery target are all unchanged — so the observations below are canonical for Maddy's default policy.
 
 **Preserved default structure, with source anchors.** The following directives are taken verbatim from the packaged `maddy.conf`:
 
@@ -73,9 +93,10 @@ The default configuration path is `/etc/maddy/maddy.conf`, formed by `filepath.J
 
 ```
 [debug] sql: go-imap-sql version 0.4.0
-[debug] /tmp/maddy_scratch/maddy_test.conf:27: new module sign_dkim [test.example default]
+[debug] maddy_test.conf:27: new module sign_dkim [test.example default]
 sign_dkim: generating a new rsa2048 keypair...
 sign_dkim: generated a new rsa2048 keypair, private key is in dkim_keys/test.example_default.key, TXT record with public key is in dkim_keys/test.example_default.dns,
+put its contents into TXT record for default._domainkey.test.example to make signing and verification work
 submission: listening on tls://0.0.0.0:465
 imap: listening on tls://0.0.0.0:993
 ```
@@ -117,7 +138,7 @@ The addresses were normalized to lowercase (`usera` / `userb`), and `INBOX` was 
 **The DKIM public-key DNS record that a verifying recipient would fetch [observed, verbatim]**, captured from `state/dkim_keys/test.example_default.dns` — this is literally the value that would be published at `default._domainkey.test.example`:
 
 ```
-v=DKIM1; k=rsa; p=MIIBCgKCAQEAotQXaMP7AMGaSVk7Gjry6+ovw79bnyv3Fcdb8o/9pdIyXwRZs4X7iCMqsGVU/1hrc0XyT3o+bO1XBk24bjUC30ZsZp5cT6clmR67NixXRtpoC2CU6VBvpZcKI3+RkfpwaC0Nzyr42hVnswgkxOXymQ0XW8Xiq+gKkHxP4vKIttISqX/hS+dq3tvNvkH2vnM+F2H9kxmz7ls8R86e9jhzDHDkYKJoZJhBbCKgJZnv9LIisF7+C7SCXi0xFfYOGTd7KEBUX8Jobk1dW7SzmYFqtCiWq7sKxfw7ZqYJaP6LkBEE5qVnRAbV2UF3br48UnY68/DtCROcyL/2d/65yNlcTwIDAQAB
+v=DKIM1; k=rsa; p=MIIBCgKCAQEA3ntY7ju4V7ikWTPWlF/qW06wB04U52oC6mXYnRR0D/89wq6oeOncpPMTgPQ2h1LiSZcOGjFPf2lkpqKKW/FAdMakPtQ+FWEexGSqakxUU94z5r7W6n2rqTclxvM7rjgVclvi+tYFqXtg6ps02Agh1L/XWQ/aGZ16aV3QcScB4UNGS/XkLmWtPLKZKwLOlBrevPFEUa1uAqhHJCSCychv9J27C0gw6X80Wawfv3QyNFlhvh+1i5w6db7Lhv6wGkCY4VJ1m5UVEat9GguYijh/BrAoGQK6bGv4Ul5igoDJ5vlcnJYDJ617/OUWwodd1PqWF+o+xn3au7TaQQa+fmFx6wIDAQAB
 ```
 
 The record is assembled by `fmt.Sprintf("v=DKIM1; k=%s; p=%s", ...)` [`internal/modify/dkim/keys.go:L158`]. The precise significance of how the `p=` bytes are encoded is analyzed in Section 6 (it is the primary config-vs-behavior divergence).
@@ -152,117 +173,280 @@ Authenticate as `usera`, `MAIL FROM:<usera@test.example>`, `From: usera@test.exa
 
 ```
 send: 'ehlo client.test.example\r\n'
-reply: b'250-Hello client.test.example\r\n' ... b'250-AUTH PLAIN\r\n' ... b'250 SIZE 33554432\r\n'
+reply: b'250-Hello client.test.example\r\n'
+reply: b'250-PIPELINING\r\n'
+reply: b'250-8BITMIME\r\n'
+reply: b'250-ENHANCEDSTATUSCODES\r\n'
+reply: b'250-AUTH PLAIN\r\n'
+reply: b'250-SMTPUTF8\r\n'
+reply: b'250 SIZE 33554432\r\n'
+reply: retcode (250); Msg: b'Hello client.test.example\nPIPELINING\n8BITMIME\nENHANCEDSTATUSCODES\nAUTH PLAIN\nSMTPUTF8\nSIZE 33554432'
 send: 'AUTH PLAIN AHVzZXJhQHRlc3QuZXhhbXBsZQBwYXNzd29yZEE=\r\n'
 reply: b'235 2.0.0 Authentication succeeded\r\n'
-send: 'mail FROM:<usera@test.example>\r\n'
+reply: retcode (235); Msg: b'2.0.0 Authentication succeeded'
+send: 'mail from:<usera@test.example>\r\n'
 reply: b'250 2.0.0 Roger, accepting mail from <usera@test.example>\r\n'
-send: 'rcpt TO:<userb@test.example>\r\n'
+reply: retcode (250); Msg: b'2.0.0 Roger, accepting mail from <usera@test.example>'
+send: 'rcpt to:<userb@test.example>\r\n'
 reply: b"250 2.0.0 I'll make sure <userb@test.example> gets this\r\n"
+reply: retcode (250); Msg: b"2.0.0 I'll make sure <userb@test.example> gets this"
 send: 'data\r\n'
 reply: b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
-send: b'From: usera@test.example\r\nTo: userb@test.example\r\nSubject: T3-aligned-legit\r\n\r\nBody of T3-aligned-legit (...).\r\n.\r\n'
+reply: retcode (354); Msg: b'2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>'
+data: (354, b'2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>')
+send: b'From: usera@test.example\r\nTo: userb@test.example\r\nSubject: T3-aligned-legit\r\n\r\nBody of T3-aligned-legit.\r\n.\r\n'
 reply: b'250 2.0.0 OK: queued\r\n'
+reply: retcode (250); Msg: b'2.0.0 OK: queued'
+data: (250, b'2.0.0 OK: queued')
 send: 'quit\r\n'
 reply: b'221 2.0.0 Goodnight and good luck\r\n'
+reply: retcode (221); Msg: b'2.0.0 Goodnight and good luck'
 ```
 
 Matching Maddy `-debug` decision lines [observed, verbatim]:
 
 ```
-[debug] smtp/pipeline: sender usera@test.example matched by domain rule 'test.example'   {"msg_id":"a3414c27"}
+[debug] smtp/pipeline: sender usera@test.example matched by domain rule 'test.example'   {"msg_id":"31b3d758"}
 submission: adding missing Message-ID
 submission: adding missing Date header
 [debug] sign_dkim: signed   {"identifier":"usera@test.example"}
-submission: accepted   {"msg_id":"a3414c27"}
+submission: accepted   {"msg_id":"31b3d758"}
 ```
 
-- **Claim: the envelope was routed to the local `source` block by its domain** — evidence: `sender usera@test.example matched by domain rule 'test.example'`. This is the domain match in `srcBlockForAddr` [`internal/msgpipeline/msgpipeline.go:L190`] logged at [`msgpipeline.go:L196`].
+- **Claim: the envelope was routed to the local `source` block by its domain** — evidence: `sender usera@test.example matched by domain rule 'test.example'`. This is the domain match in `srcBlockForAddr` [`internal/msgpipeline/msgpipeline.go:L190`] logged at [`internal/msgpipeline/msgpipeline.go:L196`].
 - **Claim: the message was DKIM-signed** — evidence: `sign_dkim: signed   {"identifier":"usera@test.example"}`, emitted by `s.m.log.DebugMsg("signed", "identifier", id)` after `h.Add("DKIM-Signature", signer.SignatureValue())` [`internal/modify/dkim/dkim.go:L406-L408`].
-- **Claim: the message was accepted and queued** — evidence: the SMTP reply `250 2.0.0 OK: queued` and the log line `submission: accepted   {"msg_id":"a3414c27"}`.
+- **Claim: the message was accepted and queued** — evidence: the SMTP reply `250 2.0.0 OK: queued` and the log line `submission: accepted   {"msg_id":"31b3d758"}`.
 
 ### T2 — non-local sender domain → REJECTED `501 5.1.8` (deferred to RCPT)
 
 Authenticate as `usera`, `MAIL FROM:<spoof@nonlocal.tld>`. Full client transcript [observed, verbatim]:
 
 ```
-send: 'mail FROM:<spoof@nonlocal.tld>\r\n'
+send: 'ehlo client.test.example\r\n'
+reply: b'250-Hello client.test.example\r\n'
+reply: b'250-PIPELINING\r\n'
+reply: b'250-8BITMIME\r\n'
+reply: b'250-ENHANCEDSTATUSCODES\r\n'
+reply: b'250-AUTH PLAIN\r\n'
+reply: b'250-SMTPUTF8\r\n'
+reply: b'250 SIZE 33554432\r\n'
+reply: retcode (250); Msg: b'Hello client.test.example\nPIPELINING\n8BITMIME\nENHANCEDSTATUSCODES\nAUTH PLAIN\nSMTPUTF8\nSIZE 33554432'
+send: 'AUTH PLAIN AHVzZXJhQHRlc3QuZXhhbXBsZQBwYXNzd29yZEE=\r\n'
+reply: b'235 2.0.0 Authentication succeeded\r\n'
+reply: retcode (235); Msg: b'2.0.0 Authentication succeeded'
+send: 'mail from:<spoof@nonlocal.tld>\r\n'
 reply: b'250 2.0.0 Roger, accepting mail from <spoof@nonlocal.tld>\r\n'
-send: 'rcpt TO:<userb@test.example>\r\n'
-reply: b'501 5.1.8 Non-local sender domain (msg ID = 9f53b0a5)\r\n'
-send: 'data\r\n'
+reply: retcode (250); Msg: b'2.0.0 Roger, accepting mail from <spoof@nonlocal.tld>'
+send: 'rcpt to:<userb@test.example>\r\n'
+reply: b'501 5.1.8 Non-local sender domain (msg ID = 913b2863)\r\n'
+reply: retcode (501); Msg: b'5.1.8 Non-local sender domain (msg ID = 913b2863)'
+send: 'DATA\r\n'
 reply: b'502 5.5.1 Missing RCPT TO command.\r\n'
+reply: retcode (502); Msg: b'5.5.1 Missing RCPT TO command.'
+send: 'quit\r\n'
+reply: b'221 2.0.0 Goodnight and good luck\r\n'
+reply: retcode (221); Msg: b'2.0.0 Goodnight and good luck'
 ```
 
 Matching Maddy `-debug` decision lines [observed, verbatim]:
 
 ```
-[debug] smtp/pipeline: sender spoof@nonlocal.tld matched by default rule   {"msg_id":"9f53b0a5"}
+[debug] smtp/pipeline: sender spoof@nonlocal.tld matched by default rule   {"msg_id":"913b2863"}
 submission: RCPT error   {"effective_rcpt":"userb@test.example","rcpt":"userb@test.example","reason":"reject directive used","smtp_code":501,"smtp_enchcode":"5.1.8","smtp_msg":"Non-local sender domain"}
-submission: aborted   {"msg_id":"9f53b0a5"}
+submission: aborted   {"msg_id":"913b2863"}
 ```
 
-- **Claim: a non-local envelope domain falls through to `default_source`** — evidence: `sender spoof@nonlocal.tld matched by default rule`. This is the default-rule fallback in `srcBlockForAddr` [`internal/msgpipeline/msgpipeline.go:L190` no match → default] logged at [`msgpipeline.go:L194`].
+- **Claim: a non-local envelope domain falls through to `default_source`** — evidence: `sender spoof@nonlocal.tld matched by default rule`. This is the default-rule fallback in `srcBlockForAddr` [`internal/msgpipeline/msgpipeline.go:L190` no match → default] logged at [`internal/msgpipeline/msgpipeline.go:L194`].
 - **Claim: the rejection renders the configured `501 5.1.8 "Non-local sender domain"`** — evidence: `smtp_code":501,"smtp_enchcode":"5.1.8","smtp_msg":"Non-local sender domain"`. The literal is the `reject` directive at [`maddy.conf:L117-L119`], rendered by `parseRejectDirective` [`internal/msgpipeline/config.go:L292`].
-- **Claim (critical): `MAIL FROM` is answered `250` and the rejection surfaces only at `RCPT`, because sender rejection is deferred** — evidence: the transcript shows `mail FROM:<spoof@nonlocal.tld>` → `250 2.0.0 Roger, accepting mail from <spoof@nonlocal.tld>` yet `rcpt TO` → `501 5.1.8 Non-local sender domain`. This is the `defer_sender_reject` default, which is `true`: `cfg.Bool("defer_sender_reject", false, true, &endp.deferServerReject)` [`internal/endpoint/smtp/smtp.go:L567`], taking the deferral branch `if !s.endp.deferServerReject` [`internal/endpoint/smtp/smtp.go:L163`]. **A reader must not misread the `250` at `MAIL` as acceptance** — the transaction was rejected at `RCPT`. The subsequent `DATA` then returns `502 5.5.1 Missing RCPT TO command.` because no recipient was ever accepted.
+- **Claim (critical): `MAIL FROM` is answered `250` and the rejection surfaces only at `RCPT`, because sender rejection is deferred** — evidence: the transcript shows `mail from:<spoof@nonlocal.tld>` → `250 2.0.0 Roger, accepting mail from <spoof@nonlocal.tld>` yet `rcpt to:<userb@test.example>` → `501 5.1.8 Non-local sender domain`. This is the `defer_sender_reject` default, which is `true`: `cfg.Bool("defer_sender_reject", false, true, &endp.deferServerReject)` [`internal/endpoint/smtp/smtp.go:L567`], taking the deferral branch `if !s.endp.deferServerReject` [`internal/endpoint/smtp/smtp.go:L163`]. **A reader must not misread the `250` at `MAIL` as acceptance** — the transaction was rejected at `RCPT`. The subsequent `DATA` then returns `502 5.5.1 Missing RCPT TO command.` because no recipient was ever accepted.
 
 ### T1a — same-domain cross-user (envelope + `From` = userB, auth = userA) → ACCEPTED + DKIM SKIPPED
 
-Authenticate as `usera`; `MAIL FROM:<userb@test.example>`; `From: userb@test.example`. Transcript key lines [observed]: `MAIL FROM:<userb@test.example>` → `250 2.0.0 Roger, accepting mail from <userb@test.example>`; `RCPT` → `250`; `DATA` → `250 2.0.0 OK: queued`. Matching Maddy `-debug` lines [observed, verbatim]:
+Authenticate as `usera`; `MAIL FROM:<userb@test.example>`; `From: userb@test.example`. Full client transcript [observed, verbatim]:
 
 ```
-[debug] smtp/pipeline: sender userb@test.example matched by domain rule 'test.example'   {"msg_id":"16a76681"}
-sign_dkim: not signing, From address is not authenticated identity   {"auth_id":"usera@test.example","from_addr":"userb@test.example","msg_id":"16a76681"}
-submission: accepted   {"msg_id":"16a76681"}
+send: 'ehlo client.test.example\r\n'
+reply: b'250-Hello client.test.example\r\n'
+reply: b'250-PIPELINING\r\n'
+reply: b'250-8BITMIME\r\n'
+reply: b'250-ENHANCEDSTATUSCODES\r\n'
+reply: b'250-AUTH PLAIN\r\n'
+reply: b'250-SMTPUTF8\r\n'
+reply: b'250 SIZE 33554432\r\n'
+reply: retcode (250); Msg: b'Hello client.test.example\nPIPELINING\n8BITMIME\nENHANCEDSTATUSCODES\nAUTH PLAIN\nSMTPUTF8\nSIZE 33554432'
+send: 'AUTH PLAIN AHVzZXJhQHRlc3QuZXhhbXBsZQBwYXNzd29yZEE=\r\n'
+reply: b'235 2.0.0 Authentication succeeded\r\n'
+reply: retcode (235); Msg: b'2.0.0 Authentication succeeded'
+send: 'mail from:<userb@test.example>\r\n'
+reply: b'250 2.0.0 Roger, accepting mail from <userb@test.example>\r\n'
+reply: retcode (250); Msg: b'2.0.0 Roger, accepting mail from <userb@test.example>'
+send: 'rcpt to:<userb@test.example>\r\n'
+reply: b"250 2.0.0 I'll make sure <userb@test.example> gets this\r\n"
+reply: retcode (250); Msg: b"2.0.0 I'll make sure <userb@test.example> gets this"
+send: 'data\r\n'
+reply: b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+reply: retcode (354); Msg: b'2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>'
+data: (354, b'2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>')
+send: b'From: userb@test.example\r\nTo: userb@test.example\r\nSubject: T1a-crossuser-fromB\r\n\r\nBody of T1a-crossuser-fromB.\r\n.\r\n'
+reply: b'250 2.0.0 OK: queued\r\n'
+reply: retcode (250); Msg: b'2.0.0 OK: queued'
+data: (250, b'2.0.0 OK: queued')
+send: 'quit\r\n'
+reply: b'221 2.0.0 Goodnight and good luck\r\n'
+reply: retcode (221); Msg: b'2.0.0 Goodnight and good luck'
 ```
 
-- **Claim: `userA`, authenticated, successfully sent a message bearing `userB`'s address — the message was accepted** — evidence: `submission: accepted   {"msg_id":"16a76681"}` (and `250 2.0.0 OK: queued`). This is the primary falsification evidence used in Section 8.
+Matching Maddy `-debug` lines [observed, verbatim]:
+
+```
+[debug] smtp/pipeline: sender userb@test.example matched by domain rule 'test.example'   {"msg_id":"06ac4941"}
+sign_dkim: not signing, From address is not authenticated identity   {"auth_id":"usera@test.example","from_addr":"userb@test.example","msg_id":"06ac4941"}
+submission: accepted   {"msg_id":"06ac4941"}
+```
+
+- **Claim: `userA`, authenticated, successfully sent a message bearing `userB`'s address — the message was accepted** — evidence: `submission: accepted   {"msg_id":"06ac4941"}` (and `250 2.0.0 OK: queued`). This is the primary falsification evidence used in Section 8.
 - **Claim: the only consequence of the auth/`From` mismatch was that signing was skipped (not that the message was rejected)** — evidence: `sign_dkim: not signing, From address is not authenticated identity`. This is the `auth` check in `shouldSign()` [`internal/modify/dkim/dkim.go:L299-L308`].
 
 ### T1b — same-domain cross-user (MAIL FROM = userB, `From` = userA, auth = userA) → ACCEPTED + DKIM SKIPPED
 
+Authenticate as `usera`; `MAIL FROM:<userb@test.example>`; `From: usera@test.example`. Full client transcript [observed, verbatim]:
+
+```
+send: 'ehlo client.test.example\r\n'
+reply: b'250-Hello client.test.example\r\n'
+reply: b'250-PIPELINING\r\n'
+reply: b'250-8BITMIME\r\n'
+reply: b'250-ENHANCEDSTATUSCODES\r\n'
+reply: b'250-AUTH PLAIN\r\n'
+reply: b'250-SMTPUTF8\r\n'
+reply: b'250 SIZE 33554432\r\n'
+reply: retcode (250); Msg: b'Hello client.test.example\nPIPELINING\n8BITMIME\nENHANCEDSTATUSCODES\nAUTH PLAIN\nSMTPUTF8\nSIZE 33554432'
+send: 'AUTH PLAIN AHVzZXJhQHRlc3QuZXhhbXBsZQBwYXNzd29yZEE=\r\n'
+reply: b'235 2.0.0 Authentication succeeded\r\n'
+reply: retcode (235); Msg: b'2.0.0 Authentication succeeded'
+send: 'mail from:<userb@test.example>\r\n'
+reply: b'250 2.0.0 Roger, accepting mail from <userb@test.example>\r\n'
+reply: retcode (250); Msg: b'2.0.0 Roger, accepting mail from <userb@test.example>'
+send: 'rcpt to:<userb@test.example>\r\n'
+reply: b"250 2.0.0 I'll make sure <userb@test.example> gets this\r\n"
+reply: retcode (250); Msg: b"2.0.0 I'll make sure <userb@test.example> gets this"
+send: 'data\r\n'
+reply: b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+reply: retcode (354); Msg: b'2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>'
+data: (354, b'2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>')
+send: b'From: usera@test.example\r\nTo: userb@test.example\r\nSubject: T1b-crossuser-fromA\r\n\r\nBody of T1b-crossuser-fromA.\r\n.\r\n'
+reply: b'250 2.0.0 OK: queued\r\n'
+reply: retcode (250); Msg: b'2.0.0 OK: queued'
+data: (250, b'2.0.0 OK: queued')
+send: 'quit\r\n'
+reply: b'221 2.0.0 Goodnight and good luck\r\n'
+reply: retcode (221); Msg: b'2.0.0 Goodnight and good luck'
+```
+
 Matching Maddy `-debug` lines [observed, verbatim]:
 
 ```
-[debug] smtp/pipeline: sender userb@test.example matched by domain rule 'test.example'   {"msg_id":"970eb97b"}
-sign_dkim: not signing, From address is not envelope address   {"envelope":"userb@test.example","from_addr":"usera@test.example","msg_id":"970eb97b"}
-submission: accepted   {"msg_id":"970eb97b"}
+[debug] smtp/pipeline: sender userb@test.example matched by domain rule 'test.example'   {"msg_id":"e1aa26eb"}
+sign_dkim: not signing, From address is not envelope address   {"envelope":"userb@test.example","from_addr":"usera@test.example","msg_id":"e1aa26eb"}
+submission: accepted   {"msg_id":"e1aa26eb"}
 ```
 
-- **Claim: the message was accepted despite `From` (userA) not matching the envelope (userB)** — evidence: `submission: accepted   {"msg_id":"970eb97b"}`.
-- **Claim: signing was skipped by the `envelope` check, which fires *before* the `auth` check** — evidence: `sign_dkim: not signing, From address is not envelope address`. This is the `envelope` check [`internal/modify/dkim/dkim.go:L293-L296`], ordered ahead of the `auth` check [`dkim.go:L299`].
+- **Claim: the message was accepted despite `From` (userA) not matching the envelope (userB)** — evidence: `submission: accepted   {"msg_id":"e1aa26eb"}`.
+- **Claim: signing was skipped by the `envelope` check, which fires *before* the `auth` check** — evidence: `sign_dkim: not signing, From address is not envelope address`. This is the `envelope` check [`internal/modify/dkim/dkim.go:L293-L296`], ordered ahead of the `auth` check [`internal/modify/dkim/dkim.go:L299`].
 
 ### Tm — mismatched `From`, foreign domain (auth = userA, MAIL FROM = userA, `From: stranger@other.invalid`) → ACCEPTED + DKIM SKIPPED
 
-This is the user's explicit *"From matches neither the authenticated user nor the signing domain"* case. Matching Maddy `-debug` lines [observed, verbatim]:
+This is the user's explicit *"From matches neither the authenticated user nor the signing domain"* case. Full client transcript [observed, verbatim]:
 
 ```
-[debug] smtp/pipeline: sender usera@test.example matched by domain rule 'test.example'   {"msg_id":"f8877787"}
-sign_dkim: not signing, From domain is not key domain   {"from_domain":"other.invalid","key_domain":"test.example","msg_id":"f8877787"}
-submission: accepted   {"msg_id":"f8877787"}
+send: 'ehlo client.test.example\r\n'
+reply: b'250-Hello client.test.example\r\n'
+reply: b'250-PIPELINING\r\n'
+reply: b'250-8BITMIME\r\n'
+reply: b'250-ENHANCEDSTATUSCODES\r\n'
+reply: b'250-AUTH PLAIN\r\n'
+reply: b'250-SMTPUTF8\r\n'
+reply: b'250 SIZE 33554432\r\n'
+reply: retcode (250); Msg: b'Hello client.test.example\nPIPELINING\n8BITMIME\nENHANCEDSTATUSCODES\nAUTH PLAIN\nSMTPUTF8\nSIZE 33554432'
+send: 'AUTH PLAIN AHVzZXJhQHRlc3QuZXhhbXBsZQBwYXNzd29yZEE=\r\n'
+reply: b'235 2.0.0 Authentication succeeded\r\n'
+reply: retcode (235); Msg: b'2.0.0 Authentication succeeded'
+send: 'mail from:<usera@test.example>\r\n'
+reply: b'250 2.0.0 Roger, accepting mail from <usera@test.example>\r\n'
+reply: retcode (250); Msg: b'2.0.0 Roger, accepting mail from <usera@test.example>'
+send: 'rcpt to:<userb@test.example>\r\n'
+reply: b"250 2.0.0 I'll make sure <userb@test.example> gets this\r\n"
+reply: retcode (250); Msg: b"2.0.0 I'll make sure <userb@test.example> gets this"
+send: 'data\r\n'
+reply: b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+reply: retcode (354); Msg: b'2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>'
+data: (354, b'2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>')
+send: b'From: stranger@other.invalid\r\nTo: userb@test.example\r\nSubject: Tm-foreign-from\r\n\r\nBody of Tm-foreign-from.\r\n.\r\n'
+reply: b'250 2.0.0 OK: queued\r\n'
+reply: retcode (250); Msg: b'2.0.0 OK: queued'
+data: (250, b'2.0.0 OK: queued')
+send: 'quit\r\n'
+reply: b'221 2.0.0 Goodnight and good luck\r\n'
+reply: retcode (221); Msg: b'2.0.0 Goodnight and good luck'
 ```
 
-- **Claim: routing accepted the message because the *envelope* (`usera@test.example`) is local — the `From` header plays no part in Layer 1** — evidence: `sender usera@test.example matched by domain rule 'test.example'` and `submission: accepted   {"msg_id":"f8877787"}`.
+Matching Maddy `-debug` lines [observed, verbatim]:
+
+```
+[debug] smtp/pipeline: sender usera@test.example matched by domain rule 'test.example'   {"msg_id":"25ec8565"}
+sign_dkim: not signing, From domain is not key domain   {"from_domain":"other.invalid","key_domain":"test.example","msg_id":"25ec8565"}
+submission: accepted   {"msg_id":"25ec8565"}
+```
+
+- **Claim: routing accepted the message because the *envelope* (`usera@test.example`) is local — the `From` header plays no part in Layer 1** — evidence: `sender usera@test.example matched by domain rule 'test.example'` and `submission: accepted   {"msg_id":"25ec8565"}`.
 - **Claim: signing was skipped because the `From` domain (`other.invalid`) is not the key domain (`test.example`)** — evidence: `sign_dkim: not signing, From domain is not key domain   {"from_domain":"other.invalid","key_domain":"test.example",...}`. This is the From-domain check [`internal/modify/dkim/dkim.go:L287-L290`]. The message was therefore **delivered unsigned** (analyzed in Section 6).
 
 ### Tn — missing `From` header entirely → REJECTED `554 5.6.0` at DATA
 
-`DATA` reply [observed, verbatim]:
+Authenticate as `usera`; `MAIL FROM:<usera@test.example>`; recipient `userb@test.example`; the message carries **no `From` header**. Full client transcript [observed, verbatim]:
 
 ```
-554 5.6.0 Message does not contains a From header field (msg ID = 6647b5cf)
+send: 'ehlo client.test.example\r\n'
+reply: b'250-Hello client.test.example\r\n'
+reply: b'250-PIPELINING\r\n'
+reply: b'250-8BITMIME\r\n'
+reply: b'250-ENHANCEDSTATUSCODES\r\n'
+reply: b'250-AUTH PLAIN\r\n'
+reply: b'250-SMTPUTF8\r\n'
+reply: b'250 SIZE 33554432\r\n'
+reply: retcode (250); Msg: b'Hello client.test.example\nPIPELINING\n8BITMIME\nENHANCEDSTATUSCODES\nAUTH PLAIN\nSMTPUTF8\nSIZE 33554432'
+send: 'AUTH PLAIN AHVzZXJhQHRlc3QuZXhhbXBsZQBwYXNzd29yZEE=\r\n'
+reply: b'235 2.0.0 Authentication succeeded\r\n'
+reply: retcode (235); Msg: b'2.0.0 Authentication succeeded'
+send: 'mail from:<usera@test.example>\r\n'
+reply: b'250 2.0.0 Roger, accepting mail from <usera@test.example>\r\n'
+reply: retcode (250); Msg: b'2.0.0 Roger, accepting mail from <usera@test.example>'
+send: 'rcpt to:<userb@test.example>\r\n'
+reply: b"250 2.0.0 I'll make sure <userb@test.example> gets this\r\n"
+reply: retcode (250); Msg: b"2.0.0 I'll make sure <userb@test.example> gets this"
+send: 'data\r\n'
+reply: b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+reply: retcode (354); Msg: b'2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>'
+data: (354, b'2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>')
+send: b'To: userb@test.example\r\nSubject: Tn-missing-from\r\n\r\nBody of Tn-missing-from.\r\n.\r\n'
+reply: b'554 5.6.0 Message does not contains a From header field (msg ID = 6d6f933e)\r\n'
+reply: retcode (554); Msg: b'5.6.0 Message does not contains a From header field (msg ID = 6d6f933e)'
+data: (554, b'5.6.0 Message does not contains a From header field (msg ID = 6d6f933e)')
+send: 'quit\r\n'
+reply: b'221 2.0.0 Goodnight and good luck\r\n'
+reply: retcode (221); Msg: b'2.0.0 Goodnight and good luck'
 ```
 
-Matching Maddy `-debug` lines [observed, verbatim]:
+The `DATA` command is answered `554 5.6.0 Message does not contains a From header field (msg ID = 6d6f933e)`. Matching Maddy `-debug` lines [observed, verbatim]:
 
 ```
-submission: DATA error   {"modifier":"submission_prepare","msg_id":"6647b5cf","reason":"Message does not contains a From header field","smtp_code":554,"smtp_enchcode":"5.6.0","smtp_msg":"Message does not contains a From header field"}
-submission: aborted   {"msg_id":"6647b5cf"}
+submission: DATA error   {"modifier":"submission_prepare","msg_id":"6d6f933e","reason":"Message does not contains a From header field","smtp_code":554,"smtp_enchcode":"5.6.0","smtp_msg":"Message does not contains a From header field"}
+submission: aborted   {"msg_id":"6d6f933e"}
 ```
 
 - **Claim: a submission with no `From` header is rejected `554 5.6.0` at DATA with the message "Message does not contains a From header field"** — evidence: the `DATA` reply above. Note the source-code grammatical typo **"contains"** is reproduced verbatim; the literal is at [`internal/endpoint/smtp/submission.go:L41-L43`].
 
-**The rest of the missing/invalid-`From` family [inferred from source; not each variant was separately exercised]:** the same `554 5.6.0` class also covers `"Invalid address in <Sender/To/Cc/Bcc/Reply-To>"` [`internal/endpoint/smtp/submission.go:L54-L56, L70-L72`], `"Invalid address in From"` [`submission.go:L86-L88`], and `"Missing Sender header field"` when there are multiple `From` addresses without a `Sender` header [`submission.go:L101-L103`]. The submission handler also sets `msgMeta.DontTraceSender = true` [`submission.go:L28`], which shapes the `Received` header in Section 5.
+**The rest of the missing/invalid-`From` family [inferred from source; not each variant was separately exercised]:** the same `554 5.6.0` class also covers `"Invalid address in <Sender/To/Cc/Bcc/Reply-To>"` [`internal/endpoint/smtp/submission.go:L54-L56, L70-L72`], `"Invalid address in From"` [`internal/endpoint/smtp/submission.go:L86-L88`], and `"Missing Sender header field"` when there are multiple `From` addresses without a `Sender` header [`internal/endpoint/smtp/submission.go:L101-L103`]. The submission handler also sets `msgMeta.DontTraceSender = true` [`internal/endpoint/smtp/submission.go:L28`], which shapes the `Received` header in Section 5.
 
 
 ---
@@ -277,25 +461,71 @@ submission: aborted   {"msg_id":"6647b5cf"}
 Delivered-To: userb@test.example
 Return-Path: <usera@test.example>
 Dkim-Signature: a=rsa-sha256;
- bh=iT9Qop7GXJAOgqBBZyj0IZvaW+ehSyasvZhaVisaQY4=; c=relaxed/relaxed;
+ bh=N+3MkpbIxAU54kCTSqG9wDk7nZMDrtpNnj6/CSnoCdY=; c=relaxed/relaxed;
  d=test.example;
- h=Subject:Subject:Sender:To:To:Cc:From:From:Date:Date:MIME-Version:Content-Type:Content-Transfer-Encoding:Reply-To:In-Reply-To:Message-Id:Message-Id:References:Autocrypt:Openpgp; i=usera@test.example; s=default; t=1783029517; v=1; x=1783461517; b=n5Eh0zfTbkoqpOg57JiT5vs0WSYasQ/udwh3+SI2jHKC8JhKfQuNqXTcv8YY4/mBAfLnyuWpXchIHnWt9QY4tji1MdGhchj/D32xr8sxc3wpFoMHVwykdtO+YXjM+z5eVxeKjJuSZNQNtJLg+Ng8B9GLVsi3gyUSvNxTKKz7aaKLyhYqEJABi2ks31YCJ2SUh44n9gm85i3IWvGbyhyS8hz0sNtOzJgBwxWcVEtNC++BeukGtpqnl5iDg9JWY+WI9UGuBEOYED+wKt2R2n0zAmuiEeJoUJlxmNr/m3pM18TGHM624y7s6waLQt/KzFOT3r4JWyMtlZLEiIQ31aTcZg==;
+ h=Subject:Subject:Sender:To:To:Cc:From:From:Date:Date:MIME-Version:Content-Type:Content-Transfer-Encoding:Reply-To:In-Reply-To:Message-Id:Message-Id:References:Autocrypt:Openpgp; i=usera@test.example; s=default; t=1783039243; v=1; x=1783471243; b=OMPF0Z3Ujb4naBVTCANrOM17M2WS5y0CFXkOaslNUd1vTe+GLAFOFlKmPN+fFnT3ZW7WNPJHCV+2+oZ+GqyrThersEDUMYje0ovp7g0cC5BbwnxK1VJrevUtF2iwq1LNEORitQeAEpZE4uNsB2qQ1uuGOotb4knkUEgteOOA7d7453fvmwTxq5yUM7YOmvIHTz4nPazBlIGifynyFGR03tgba4USPNNAdEilOGpRdAfuyoOy9aeGdT2qw/vOFumVbWZbNBRw4pbzf6jKJyho43BxPsCy+5JTZj7nuF1spStu1wFXgHqU+a03V7E+ncbO+vnJGlkUp6GXvpaveWqG1A==;
 Received:  by test.example (envelope-sender <usera@test.example>) with
- ESMTPS id a3414c27; Thu, 02 Jul 2026 21:58:37 +0000
-Date: Thu, 2 Jul 2026 21:58:37 +0000
-Message-Id: <ecf1ce83-4049-4d23-8075-be13e230b0d8@test.example>
+ ESMTPS id 31b3d758; Fri, 03 Jul 2026 00:40:43 +0000
+Date: Fri, 3 Jul 2026 00:40:43 +0000
+Message-Id: <410eb941-51dc-4aeb-b5f4-5fa98662e5de@test.example>
 From: usera@test.example
 To: userb@test.example
 Subject: T3-aligned-legit
 ```
 
-- **Claim: the `DKIM-Signature` covers the `From` header — in fact it *oversigns* it.** Evidence: the `h=` tag contains `From` **twice** (`...Cc:From:From:Date...`). Oversigning adds the header name a second time so that a maliciously *added* second `From` would break verification. `From` is in Maddy's oversign default list [`internal/modify/dkim/dkim.go:L31-L38`, `From` at `L37`]. The full tag set observed is: `v=1`, `a=rsa-sha256`, `c=relaxed/relaxed`, `d=test.example`, `s=default`, `i=usera@test.example`, `bh=iT9Qop7GXJAOgqBBZyj0IZvaW+ehSyasvZhaVisaQY4=`, `t=1783029517`, `x=1783461517`, `b=n5Eh0zfT...` (truncated for readability but reproduced in full in the block above).
+- **Claim: the `DKIM-Signature` covers the `From` header — in fact it *oversigns* it.** Evidence: the `h=` tag contains `From` **twice** (`...Cc:From:From:Date...`). Oversigning adds the header name a second time so that a maliciously *added* second `From` would break verification. `From` is in Maddy's oversign default list [`internal/modify/dkim/dkim.go:L31-L38`, `From` at `L37`]. The full tag set observed is: `v=1`, `a=rsa-sha256`, `c=relaxed/relaxed`, `d=test.example`, `s=default`, `i=usera@test.example`, `bh=N+3MkpbIxAU54kCTSqG9wDk7nZMDrtpNnj6/CSnoCdY=`, `t=1783039243`, `x=1783471243`, `b=OMPF0Z3U...` (truncated for readability but reproduced in full in the block above).
 - **Claim: the signature is *DMARC-alignable in principle*, because `d=` equals the `From` domain.** Evidence: `d=test.example` and `From: usera@test.example` share the domain `test.example`. Whether it *validates* is a separate question answered in Section 6 (it does not).
-- **Claim: the signature carries a 5-day expiry.** Evidence: `t=1783029517` and `x=1783461517`; `1783461517 − 1783029517 = 432000` seconds = 5 days.
-- **Claim: the `Received` header Maddy added for submission has *no* leading `from <host> [ip]` client-trace clause; it begins directly with `by`.** Evidence: `Received:  by test.example (envelope-sender <usera@test.example>) with ESMTPS id a3414c27; ...`. The client-trace clause is gated on `!DontTraceSender` [`internal/target/received.go:L30`], and submission sets `DontTraceSender = true` [`internal/endpoint/smtp/submission.go:L28`], so the builder skips straight to the ` by ` clause [`internal/target/received.go:L62`], then ` (envelope-sender <` [`received.go:L69`], ` with ` + protocol (`ESMTPS`) [`received.go:L75-L79`], and ` id ` + the message ID [`received.go:L81-L82`]. The two spaces in `Received:  by` are the header-separator space plus the value's own leading space before `by`. Header generation is `GenerateReceived` [`internal/target/received.go:L19`].
+- **Claim: the signature carries a 5-day expiry.** Evidence: `t=1783039243` and `x=1783471243`; `1783471243 − 1783039243 = 432000` seconds = 5 days.
+- **Claim: the `Received` header Maddy added for submission has *no* leading `from <host> [ip]` client-trace clause; it begins directly with `by`.** Evidence: `Received:  by test.example (envelope-sender <usera@test.example>) with ESMTPS id 31b3d758; ...`. The client-trace clause is gated on `!DontTraceSender` [`internal/target/received.go:L30`], and submission sets `DontTraceSender = true` [`internal/endpoint/smtp/submission.go:L28`], so the builder skips straight to the ` by ` clause [`internal/target/received.go:L62`], then ` (envelope-sender <` [`internal/target/received.go:L69`], ` with ` + protocol (`ESMTPS`) [`internal/target/received.go:L75-L79`], and ` id ` + the message ID [`internal/target/received.go:L81-L82`]. The two spaces in `Received:  by` are the header-separator space plus the value's own leading space before `by`. Header generation is `GenerateReceived` [`internal/target/received.go:L19`].
 - **Claim: there is *no* `Authentication-Results` header on any stored message.** Evidence: the header is absent from every fetched header block. The header is only added when checks emit results — `if len(cr.mergedRes.AuthResult) != 0 { header.Add("Authentication-Results", ...) }` [`internal/msgpipeline/check_runner.go:L301-L302`]. The default submission block defines no checks, so no `Authentication-Results` is produced. (This is confirmed **absent** at runtime, not merely expected.)
 
-**T1a / T1b / Tm (unsigned) [observed].** None of the three misaligned messages carries a `Dkim-Signature` header; each carries `Delivered-To`, `Return-Path`, and a submission-shape `Received` (same `Received:  by ...` form, no from-clause). For example, the Tm stored message shows `From: stranger@other.invalid` with `Return-Path: <usera@test.example>` and no signature — confirming the skip-not-reject behavior at the storage layer.
+**T1a / T1b / Tm (unsigned) full stored header blocks [observed, verbatim].** Each was read back through the same real IMAP `FETCH (BODY.PEEK[HEADER])` path and is reproduced exactly as stored. None of the three carries a `Dkim-Signature` or an `Authentication-Results` header.
+
+*T1a* — envelope + `From` = `userB`, auth = `userA`:
+
+```
+Delivered-To: userb@test.example
+Return-Path: <userb@test.example>
+Received:  by test.example (envelope-sender <userb@test.example>) with
+ ESMTPS id 06ac4941; Fri, 03 Jul 2026 00:40:45 +0000
+Date: Fri, 3 Jul 2026 00:40:45 +0000
+Message-Id: <366d49df-3323-428a-a468-300b335afcbc@test.example>
+From: userb@test.example
+To: userb@test.example
+Subject: T1a-crossuser-fromB
+```
+
+*T1b* — `MAIL FROM` = `userB`, `From` = `userA`, auth = `userA`:
+
+```
+Delivered-To: userb@test.example
+Return-Path: <userb@test.example>
+Received:  by test.example (envelope-sender <userb@test.example>) with
+ ESMTPS id e1aa26eb; Fri, 03 Jul 2026 00:40:45 +0000
+Date: Fri, 3 Jul 2026 00:40:45 +0000
+Message-Id: <63822e6e-312c-41e2-8e11-979a717ebdad@test.example>
+From: usera@test.example
+To: userb@test.example
+Subject: T1b-crossuser-fromA
+```
+
+*Tm* — `MAIL FROM` = `userA`, `From: stranger@other.invalid`:
+
+```
+Delivered-To: userb@test.example
+Return-Path: <usera@test.example>
+Received:  by test.example (envelope-sender <usera@test.example>) with
+ ESMTPS id 25ec8565; Fri, 03 Jul 2026 00:40:46 +0000
+Date: Fri, 3 Jul 2026 00:40:46 +0000
+Message-Id: <758d75fe-5596-42eb-869b-565889e7b41c@test.example>
+From: stranger@other.invalid
+To: userb@test.example
+Subject: Tm-foreign-from
+```
+
+- **Claim: all three misaligned messages were delivered *unsigned* — the skip-not-reject behavior is visible at the storage layer.** Evidence: none of the three blocks above contains a `Dkim-Signature` line (contrast the T3 block, which does), and none contains an `Authentication-Results` line; yet each was stored and delivered (`Delivered-To: userb@test.example` present in all three).
+- **Claim: the `Received` header and `Return-Path` record the *envelope* sender — the address routing matched on — not the `From` header.** Evidence: T1a and T1b both show `(envelope-sender <userb@test.example>)` and `Return-Path: <userb@test.example>` even though T1b's `From` is `usera@test.example`; Tm shows `(envelope-sender <usera@test.example>)` and `Return-Path: <usera@test.example>` while its `From` is `stranger@other.invalid`.
+- **Claim: the `From` header is stored exactly as submitted, even when it names another local user or a foreign domain.** Evidence: `From: userb@test.example` (T1a), `From: usera@test.example` (T1b), and `From: stranger@other.invalid` (Tm) — Maddy neither rewrote nor rejected any of them.
 
 ---
 
@@ -320,16 +550,16 @@ This **skip-not-reject** behavior is at [`internal/modify/dkim/dkim.go:L348-L350
 
 | Skip reason | Exact log message | Source |
 |-------------|-------------------|--------|
-| `off` token present | (signing disabled entirely; no per-message log) | `dkim.go:L250` |
-| empty `From` | `not signing, empty From` | `dkim.go:L266` |
-| malformed `From` field | `not signing, malformed From field` | `dkim.go:L271` |
-| multiple addresses in `From` | `not signing, multiple addresses in From` | `dkim.go:L275` |
-| malformed address in `From` | `not signing, malformed address in From` | `dkim.go:L282` |
-| `From` domain ≠ key domain | `not signing, From domain is not key domain` | `dkim.go:L288` **[observed: Tm]** |
-| `envelope` check (`From` ≠ MAIL FROM) | `not signing, From address is not envelope address` | `dkim.go:L294` **[observed: T1b]** |
-| `auth` check (`From` ≠ authenticated identity) | `not signing, From address is not authenticated identity` | `dkim.go:L306` **[observed: T1a]** |
+| `off` token present | (signing disabled entirely; no per-message log) | `internal/modify/dkim/dkim.go:L250` |
+| empty `From` | `not signing, empty From` | `internal/modify/dkim/dkim.go:L266` |
+| malformed `From` field | `not signing, malformed From field` | `internal/modify/dkim/dkim.go:L271` |
+| multiple addresses in `From` | `not signing, multiple addresses in From` | `internal/modify/dkim/dkim.go:L275` |
+| malformed address in `From` | `not signing, malformed address in From` | `internal/modify/dkim/dkim.go:L282` |
+| `From` domain ≠ key domain | `not signing, From domain is not key domain` | `internal/modify/dkim/dkim.go:L288` **[observed: Tm]** |
+| `envelope` check (`From` ≠ MAIL FROM) | `not signing, From address is not envelope address` | `internal/modify/dkim/dkim.go:L294` **[observed: T1b]** |
+| `auth` check (`From` ≠ authenticated identity) | `not signing, From address is not authenticated identity` | `internal/modify/dkim/dkim.go:L306` **[observed: T1a]** |
 
-The `From`-domain check unconditionally requires `From` domain to equal the key domain [`dkim.go:L287-L290`]; the `envelope` check is guarded by the `envelope` token [`dkim.go:L293`]; and the `auth` check is guarded by the `auth` token [`dkim.go:L299`].
+The `From`-domain check unconditionally requires `From` domain to equal the key domain [`internal/modify/dkim/dkim.go:L287-L290`]; the `envelope` check is guarded by the `envelope` token [`internal/modify/dkim/dkim.go:L293`]; and the `auth` check is guarded by the `auth` token [`internal/modify/dkim/dkim.go:L299`].
 
 ### (b) The mismatched-`From` case (the user's follow-on question)
 
@@ -343,39 +573,104 @@ Answering the three sub-parts precisely:
 
 ### (c) What a verifying recipient actually sees for the one signed message (T3) — DKIM verification deep-dive
 
-- **The signature covers `From` (oversigned, Section 5) and the body hash is correct [observed].** An independent recomputation of the body hash under *both* the relaxed and the simple canonicalizations matched the signature's `bh=iT9Qop7GXJAOgqBBZyj0IZvaW+ehSyasvZhaVisaQY4=`. So the message *body* is intact end-to-end.
-
-- **PRIMARY divergence — the published public key is PKCS#1, not the RFC-6376 SubjectPublicKeyInfo (SPKI) [observed + source-confirmed].** The root cause is that Maddy marshals the RSA public key with `keyBlob = x509.MarshalPKCS1PublicKey(pubkey)` [`internal/modify/dkim/keys.go:L143`], which emits a bare PKCS#1 `RSAPublicKey`, whereas DKIM verifiers expect a DER-encoded SPKI. Runtime proof: `openssl asn1parse` of the captured `p=` decodes to `SEQUENCE { INTEGER (modulus), INTEGER (010001) }` — a bare PKCS#1 `RSAPublicKey` (an SPKI key would instead wrap an `AlgorithmIdentifier` plus a `BIT STRING`). Consistently, the captured `p=` base64 begins `MIIBCgKCAQEA...`, whereas an RFC-correct SPKI key begins `MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A...`. When the real published record is handed to a standard verifier — **go-msgauth, the very library Maddy uses both to sign and to verify (its `verify_dkim` check), version `v0.3.2-0.20191028231513-55b75676976c`** per `go.mod` — it fails to parse the key [observed, verbatim]:
+- **The signature covers `From` (oversigned, Section 5) and the body hash is correct [observed].** An independent recomputation of the body hash under *both* the relaxed and the simple canonicalizations matched the signature's `bh=N+3MkpbIxAU54kCTSqG9wDk7nZMDrtpNnj6/CSnoCdY=` (the exact `bh=` in T3's stored `DKIM-Signature`, Section 5). One subtlety had to be handled: the copy fetched over IMAP stores the body with a lone `LF` line ending, whereas DKIM's `bh=` is computed over the `CRLF` wire body, so the stored body must be normalized back to `CRLF` before canonicalization for the hashes to match. Verbatim recomputation output:
 
   ```
-  dkim: key syntax error: x509: failed to parse public key (use ParsePKCS1PublicKey instead for this key format)
+  stored body repr : b'Body of T3-aligned-legit.\n'
+  wire   body repr : b'Body of T3-aligned-legit.\r\n'
+  relaxed canon repr: b'Body of T3-aligned-legit.\r\n'
+  signature bh= : N+3MkpbIxAU54kCTSqG9wDk7nZMDrtpNnj6/CSnoCdY=
+  relaxed  bh   : N+3MkpbIxAU54kCTSqG9wDk7nZMDrtpNnj6/CSnoCdY= MATCH
+  simple   bh   : N+3MkpbIxAU54kCTSqG9wDk7nZMDrtpNnj6/CSnoCdY= MATCH
+  ```
+
+  So the message *body* is intact end-to-end.
+
+- **PRIMARY divergence — the published public key is PKCS#1, not the RFC-6376 SubjectPublicKeyInfo (SPKI) [observed + source-confirmed].** The root cause is that Maddy marshals the RSA public key with `keyBlob = x509.MarshalPKCS1PublicKey(pubkey)` [`internal/modify/dkim/keys.go:L143`], which emits a bare PKCS#1 `RSAPublicKey`, whereas DKIM verifiers expect a DER-encoded SPKI. Runtime proof — `openssl asn1parse` of the captured `p=` decodes to a two-INTEGER `SEQUENCE` (modulus, then the exponent `010001`), i.e. a bare PKCS#1 `RSAPublicKey`; an SPKI key would instead wrap an `AlgorithmIdentifier` plus a `BIT STRING` [observed, verbatim]:
+
+  ```
+      0:d=0  hl=4 l= 266 cons: SEQUENCE          
+      4:d=1  hl=4 l= 257 prim: INTEGER           :DE7B58EE3BB857B8A45933D6945FEA5B4EB0074E14E76A02EA65D89D14740FFF3DC2AEA878E9DCA4F31380F4368752E249970E1A314F7F6964A6A28A5BF14074C6A43ED43E15611EC464AA6A4C5453DE33E6BED6EA7DABA93725C6F33BAE3815725BE2FAD605A97B60EA9B34D80821D4BFD7590FDA199D7A695DD0712701E143464BF5E42E65AD3CB2992B02CE941ADEBCF14451AD6E02A847242482C9C86FF49DBB0B4830E97F3459AC1FBF7432345961BE1FB58B9C3A75BECB86FEB01A4098E152759B951511AB7D1A0B988A387F06B0281902BA6C6BF8525E628280C9E6F95C9C960327AD7BFCE516C2875DD4FA9617EA3EC67DDABBB4DA4106BE7E6171EB
+    265:d=1  hl=2 l=   3 prim: INTEGER           :010001
+  ```
+
+  Consistently, the captured `p=` base64 begins with the PKCS#1 marker, whereas an RFC-correct SPKI encoding of the *same* key begins with the SPKI marker [observed, verbatim]:
+
+  ```
+  PKCS#1 p= prefix : MIIBCgKCAQEA3ntY7ju4V7ikWTPWlF/q
+  SPKI   p= prefix : MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A
+  ```
+
+  When the real published record is handed to a standard verifier — **go-msgauth, the very library Maddy uses both to sign and to verify (its `verify_dkim` check), version `v0.3.2-0.20191028231513-55b75676976c`** per `go.mod` — it fails to parse the key outright [observed, verbatim]:
+
+  ```
+  [PUBLISHED-PKCS1] Domain=test.example Identifier=usera@test.example Err=dkim: key syntax error: x509: failed to parse public key (use ParsePKCS1PublicKey instead for this key format)
   ```
 
   **Therefore a recipient using Maddy's own DKIM stack cannot even parse the published key**, so the signature can never be validated. *Provenance:* the DNS lookup was **stubbed / non-canonical** — `test.example` cannot be published in real DNS, so a local resolver returned the captured record — but the **key bytes and the signing computation are exactly what Maddy produced**, so this is a canonical statement about Maddy's output, not about the stubbed transport.
 
-- **SECONDARY observation — even a format-corrected key fails to verify the delivered copy [observed; root byte not isolated].** After re-encoding the *same* key into correct SPKI (`openssl rsa -RSAPublicKey_in -pubout`), go-msgauth parses it but then reports:
+- **SECONDARY observation — even a format-corrected key fails to verify the delivered copy [observed; root byte not isolated].** First, the obvious `openssl` re-encode path does *not* work here: `openssl rsa -RSAPublicKey_in -pubout` on the captured PKCS#1 key was attempted and failed [observed, verbatim]:
 
   ```
-  dkim: signature did not verify: crypto/rsa: verification error
+  Could not find private key of public key from /tmp/maddy_scratch/evidence/pubkey_pkcs1.pem
   ```
 
-  on the copy obtained from storage (IMAP) and from an SMTP relay capture, even though the body hash matches; the independent `dkimpy` verifier (which is lenient enough to parse the PKCS#1 key directly) *also* fails the header signature. **Control proving the harness is correct:** a go-msgauth sign→verify round-trip with the *same* key succeeds (`Err=<nil>`) across all four canonicalization/oversign variants — simple/relaxed × no-oversign/oversign — including the relaxed + oversign combination that matches Maddy's configuration. Since go-msgauth verifies its own oversigned + relaxed output, the delivered-message failure indicates that the **stored/relayed header bytes differ from the exact bytes Maddy signed** — consistent with the header set being re-serialized after the `DKIM-Signature` is added. The precise mutated byte is **not isolated** and this re-serialization is **[inferred]**; it was observed only on stored/relayed copies (a real outbound `target.remote` path was not separately tested).
+  The format correction was therefore done in Go, by parsing the captured key with `x509.ParsePKCS1PublicKey` and re-marshalling the *same* key with `x509.MarshalPKIXPublicKey` (producing the `MIIBIjAN...` SPKI form shown above). go-msgauth then parses that SPKI record but reports, on the full T3 message fetched from IMAP storage [observed, verbatim]:
+
+  ```
+  [SPKI-CORRECTED] Domain=test.example Identifier=usera@test.example Err=dkim: signature did not verify: crypto/rsa: verification error
+  ```
+
+  Crucially, go-msgauth checks the **body hash first** and only then the RSA header signature: `// Check body hash` … `failError("body hash did not verify")` at [`github.com/emersion/go-msgauth/dkim/verify.go:L340-L354`], followed by `// Compute data hash` … `failError("signature did not verify: " + err.Error())` at [`github.com/emersion/go-msgauth/dkim/verify.go:L357-L384`]. Because the reported failure is `signature did not verify` (not `body hash did not verify`), **the body-hash check already passed** and only the header RSA signature failed. **Control proving the key/library/signing pipeline are correct:** a go-msgauth sign→verify round-trip with the *same* private key — using relaxed/relaxed canonicalization and an oversigned `From` (matching Maddy's `c=relaxed/relaxed` and its oversign configuration), verified against the format-corrected SPKI record — succeeds [observed, verbatim]:
+
+  ```
+  [ROUNDTRIP] Domain=test.example Identifier=@test.example Err=<nil>
+  ```
+
+  Since go-msgauth verifies its own freshly-signed, oversigned + relaxed output with this key, the delivered-message failure indicates that the **stored header bytes differ from the exact bytes Maddy signed** — consistent with the stored header set being re-serialized (e.g. header-name casing / folding) after the `DKIM-Signature` is added. The precise mutated byte is **not isolated** and this re-serialization is **[inferred]**; it was observed only on the stored (IMAP) copy — a real outbound `target.remote` wire path was not separately tested, so what a remote recipient would see on the original wire message may differ from the stored copy.
 
 - **Net answer [observed]:** aligned mail *is* signed and the signature *does* cover `From`, but a verifying recipient **cannot validate it** — primarily because the published key record is PKCS#1 rather than SPKI (a standard verifier rejects the key outright), and secondarily because the delivered copy's signature does not validate under test even with a format-corrected key (while the body hash does match).
 
 ### Protocol-capture method and the fallback that was required
 
-Per the repo-integrity directive, the capture approach and its fallback are stated explicitly:
+Per the repo-integrity directive, the capture approach and its fallback are stated explicitly, each with the exact tool output:
 
-- **Plaintext `tcpdump` is insufficient** because :465 and :993 are *implicit* TLS — a raw packet capture yields ciphertext. In this environment `tcpdump` was additionally **not even installed** [observed]: `tcpdump: command not found`. A plaintext `EHLO` to :465 likewise returned nothing usable [observed]: the connection closed with no SMTP banner (the server expects a TLS handshake first).
-- **The sanctioned alternatives that reveal the real exchange were used:** (1) Maddy's own `-debug` log (the decision lines quoted throughout Section 4); and (2) a **TLS-terminating verbose client**. For example, `openssl s_client -connect 127.0.0.1:465 -quiet` returned the real banner [observed] `220 test.example ESMTP Service Ready` followed by `221 2.0.0 Goodnight and good luck`; and `smtplib.SMTP_SSL` with `set_debuglevel(1)` produced the full dialogues in Section 4. A TLS-terminating client that observes the true dialogue is **not** a bypassing interface — it speaks the real SMTP protocol to the real endpoint.
+- **Plaintext `tcpdump` is insufficient** because :465 and :993 are *implicit* TLS — a raw packet capture yields ciphertext. In this environment `tcpdump` was additionally **not even installed** [observed, verbatim]:
+
+  ```
+  tcpdump: command not found
+  /bin/bash: line 986: tcpdump: command not found
+  ```
+
+- **A plaintext `EHLO` to :465 returns no SMTP banner** because the server expects a TLS handshake first, so the raw read comes back empty [observed, verbatim]:
+
+  ```
+  sent (plaintext): EHLO client.test.example
+  server replied (plaintext): b''
+  ```
+
+- **The sanctioned alternative — a TLS-terminating verbose client — reveals the real exchange.** `openssl s_client -connect 127.0.0.1:465 -quiet` produced the real banner, the full `EHLO` capability list, and the `QUIT` response [observed, verbatim]:
+
+  ```
+  220 test.example ESMTP Service Ready
+  250-Hello client.test.example
+  250-PIPELINING
+  250-8BITMIME
+  250-ENHANCEDSTATUSCODES
+  250-AUTH PLAIN
+  250-SMTPUTF8
+  250 SIZE 33554432
+  221 2.0.0 Goodnight and good luck
+  ```
+
+  This confirms the capability list quoted in the T3 transcript (Section 4) against a second, independent TLS-terminating client. Together with Maddy's own `-debug` decision lines (quoted throughout Section 4) and `smtplib.SMTP_SSL` with `set_debuglevel(1)` (the full dialogues in Section 4), these give complete visibility into the real protocol exchange. A TLS-terminating client that observes the true dialogue is **not** a bypassing interface — it speaks the real SMTP protocol to the real endpoint.
 
 
 ---
 
 ## Section 7 — Conclusion on default-config sender alignment
 
-**Accept/reject is decided *only* by the envelope `MAIL FROM` domain (Layer 1); the authenticated identity is never consulted for acceptance.** Evidence: `srcBlockForAddr` operates on `var cleanFrom = mailFrom` [`internal/msgpipeline/msgpipeline.go:L156`] and matches `dd.d.perSource[domain]` [`msgpipeline.go:L190`] — the authenticated user does not appear in this function at all. At runtime, T1a and T1b (cross-user, same *local* domain) were both **accepted** (`submission: accepted`), whereas T2 (a *non-local* domain) was **rejected** `501 5.1.8`. The dividing line is the *envelope domain's locality*, not the sender's identity.
+**Accept/reject is decided *only* by the envelope `MAIL FROM` domain (Layer 1); the authenticated identity is never consulted for acceptance.** Evidence: `srcBlockForAddr` operates on `var cleanFrom = mailFrom` [`internal/msgpipeline/msgpipeline.go:L156`] and matches `dd.d.perSource[domain]` [`internal/msgpipeline/msgpipeline.go:L190`] — the authenticated user does not appear in this function at all. At runtime, T1a and T1b (cross-user, same *local* domain) were both **accepted** (`submission: accepted`), whereas T2 (a *non-local* domain) was **rejected** `501 5.1.8`. The dividing line is the *envelope domain's locality*, not the sender's identity.
 
 **DKIM signing (Layer 2) is a separate decision and is skip-not-reject.** Evidence: misaligned mail (T1a, T1b, Tm) was delivered **unsigned**, not rejected, because `RewriteBody()` returns `nil` on a failed check [`internal/modify/dkim/dkim.go:L348-L350`].
 
@@ -387,15 +682,16 @@ Per the repo-integrity directive, the capture approach and its fallback are stat
 
 **Hypothesis ruled out: "authenticated submission binds `MAIL FROM` / `From` to the logged-in user by default."**
 
-If that hypothesis were true, T1a (authenticate as `usera`, but `MAIL FROM:<userb@test.example>`) would have been **rejected**. Instead it was **accepted** end to end [observed]:
+If that hypothesis were true, T1a (authenticate as `usera`, but `MAIL FROM:<userb@test.example>`) would have been **rejected**. Instead it was **accepted** end to end. The decisive lines, quoted verbatim from the T1a client transcript and the `-debug` log (the complete T1a transcript is in Section 4) [observed, verbatim]:
 
 ```
-mail FROM:<userb@test.example>
-250 2.0.0 Roger, accepting mail from <userb@test.example>
-rcpt TO:<userb@test.example>
-250 ...
-data → 250 2.0.0 OK: queued
-submission: accepted   {"msg_id":"16a76681"}
+send: 'mail from:<userb@test.example>\r\n'
+reply: b'250 2.0.0 Roger, accepting mail from <userb@test.example>\r\n'
+send: 'rcpt to:<userb@test.example>\r\n'
+reply: b"250 2.0.0 I'll make sure <userb@test.example> gets this\r\n"
+send: b'From: userb@test.example\r\nTo: userb@test.example\r\nSubject: T1a-crossuser-fromB\r\n\r\nBody of T1a-crossuser-fromB.\r\n.\r\n'
+reply: b'250 2.0.0 OK: queued\r\n'
+submission: accepted   {"msg_id":"06ac4941"}
 ```
 
 The *only* consequence of the identity mismatch was that signing was skipped [observed]: `sign_dkim: not signing, From address is not authenticated identity` — a **skip, not a reject**. This directly falsifies the binding hypothesis: the authenticated identity gates *signing* (Layer 2), it does **not** gate *acceptance* (Layer 1).
@@ -417,7 +713,7 @@ The *only* consequence of the identity mismatch was that signing was skipped [ob
 
 **Secondary divergences (each runtime-supported):**
 
-- **The `require_sender_match` default token `auth` is not among the documented valid enum values.** The enum declares valid values `["envelope", "auth_domain", "auth_user", "off"]` yet sets the default to `["envelope", "auth"]` [`internal/modify/dkim/dkim.go:L151-L152`], and `shouldSign()` really does test `m.senderMatch["auth"]` [`dkim.go:L299`]. So the *default* uses a token (`auth`) that the *configuration surface* does not list as selectable — a config-surface-vs-runtime-default discrepancy. This was exercised at runtime: T1a's skip reason `From address is not authenticated identity` is exactly the `auth`-token branch firing under the default.
+- **The `require_sender_match` default token `auth` is not among the documented valid enum values.** The enum declares valid values `["envelope", "auth_domain", "auth_user", "off"]` yet sets the default to `["envelope", "auth"]` [`internal/modify/dkim/dkim.go:L151-L152`], and `shouldSign()` really does test `m.senderMatch["auth"]` [`internal/modify/dkim/dkim.go:L299`]. So the *default* uses a token (`auth`) that the *configuration surface* does not list as selectable — a config-surface-vs-runtime-default discrepancy. This was exercised at runtime: T1a's skip reason `From address is not authenticated identity` is exactly the `auth`-token branch firing under the default.
 - **Sender rejection surfaces at `RCPT`, not at `MAIL FROM`.** A reader of `default_source { reject ... }` might expect `MAIL FROM:<spoof@nonlocal.tld>` to be rejected immediately, but it is answered `250` and the `501 5.1.8` appears only at `RCPT` because `defer_sender_reject` defaults `true` [`internal/endpoint/smtp/smtp.go:L567`]. Evidence [observed, T2]: `mail FROM ... 250 2.0.0 Roger, accepting mail from <spoof@nonlocal.tld>` then `rcpt TO ... 501 5.1.8 Non-local sender domain`.
 
 ---
