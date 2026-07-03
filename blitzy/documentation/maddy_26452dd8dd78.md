@@ -228,6 +228,8 @@ Each distinct line explained (one claim → one evidence):
    ```
    Emitted by `dl.Error("delivery attempt failed", rcptErr, "rcpt", rcpt)` (`internal/target/queue/queue.go:384`). Fields: `msg_id`, `rcpt`, `reason` (the `reason` is auto-injected by `Logger.Error`, `internal/log/log.go:98`–`100`).
 
+   > **Ordering note (observed).** The *relative* order of the two sibling `delivery attempt failed` lines for different recipients **within a single attempt** is **non-deterministic** — it follows Go's per-recipient goroutine / result-map iteration order, not a fixed sequence. Re-running `TestQueueDelivery_MultipleAttempts` with `-count=1` six times yielded the `tester1`-before-`tester2` order in 4 runs and the reverse in 2; the block above quotes one such run. What *is* stable across runs is the overall lifecycle order (`starting delivery` → `delivery attempt #N` → per-rcpt `delivered` / `delivery attempt failed` → `will retry` → next attempt → terminal `not delivered, …`).
+
 5. **Retry scheduling** (see Q4 for the field-name detail):
    ```
    queue: will retry	{"attempts_count":1,"msg_id":"cab2c2f3f939862a8eaea9f844143e36c0f2c1b5","next_try_delay":"-522ns","rcpts":["tester2@example.org"]}
