@@ -63,7 +63,7 @@ sqlite3-binding.c:125282:10: note: declared here
 maddy unknown (built from source tree)
 ```
 
-This is the **canonical default-build value**: the version string defaults to `Version = "unknown (built from source tree)"` [`maddy.go:L41`] because no VCS build information is embedded in a plain `go build` from the source tree. `maddyctl --version` prints the same string. The `-v` flag itself is declared as `printVersion = flag.Bool("v", false, "print version and exit")` [`maddy.go:L109`].
+This is the **canonical default-build value**: the version string defaults to `Version = "unknown (built from source tree)"` [`maddy.go:L41`] because no VCS build information is embedded in a plain `go build` from the source tree. `maddyctl --version` reports the same version *value* but with its own binary-name prefix, printing `maddyctl version unknown (built from source tree)` (whereas `maddy -v` prints `maddy unknown (built from source tree)`) — both share the `Version` constant, only the leading program name differs. The `-v` flag itself is declared as `printVersion = flag.Bool("v", false, "print version and exit")` [`maddy.go:L109`].
 
 **Exact build and invocation commands [observed, verbatim].** The complete command sequence a normal user runs to reproduce this investigation — built and run out-of-tree under `/tmp/maddy_scratch`:
 
@@ -189,8 +189,10 @@ Six tests were run. **T3 is the required ≥1 accepted transaction; T2 is the re
 | `354` | `2.0.0` | Data go-ahead | [observed] T3 |
 | `221` | `2.0.0` | Connection close on `QUIT` | [observed] T3 |
 | `501` | `5.1.8` | `Non-local sender domain` (envelope domain not local) | [observed] T2; `maddy.conf:L117-L119` |
-| `501` | `5.1.7` | `Unable to normalize the sender address` | [inferred] `internal/msgpipeline/msgpipeline.go:L162-L164` |
-| `501` | `5.1.3` | `Invalid sender address` (reason "Can't extract local-part and host-part") | [inferred] `internal/msgpipeline/msgpipeline.go:L181-L185` |
+| `553` | `5.1.7` | `Unable to normalize the sender address` (malformed envelope sender, e.g. `MAIL FROM:<foo>`, `<foo@>`, `<@bar>`; surfaced at `RCPT` because `defer_sender_reject` defaults true) | [observed] canonical submission-endpoint code — `address.CleanDomain(from)` in `internal/endpoint/smtp/smtp.go:L103-L108` |
+| `500` | `5.5.4` | `Unknown MAIL FROM argument` (syntactically unparseable argument, e.g. `MAIL FROM:< >`) | [observed] go-smtp protocol layer, before Maddy's pipeline |
+| `501` | `5.1.7` | `Unable to normalize the sender address` | [source-defined; shadowed] `internal/msgpipeline/msgpipeline.go:L162-L164` — not reached via the authenticated submission endpoint because `smtp.go` `CleanDomain` normalizes/rejects the sender first with `553 5.1.7` |
+| `501` | `5.1.3` | `Invalid sender address` (reason "Can't extract local-part and host-part") | [source-defined; unreachable via submission] `internal/msgpipeline/msgpipeline.go:L181-L185` — `CleanDomain` in `smtp.go` rejects malformed senders first with `553 5.1.7`, so this deeper path is never observed on the submission path |
 | `502` | `5.5.1` | `Missing RCPT TO command.` (DATA after a rejected RCPT) | [observed] T2 |
 | `554` | `5.6.0` | Missing/invalid `From`/`Sender`/recipient header family | [observed] Tn; `internal/endpoint/smtp/submission.go:L41-L103` |
 
@@ -642,13 +644,22 @@ Answering the three sub-parts precisely:
 
   **Therefore a recipient using Maddy's own DKIM stack cannot even parse the published key**, so the signature can never be validated. *Provenance:* the DNS lookup was **stubbed / non-canonical** — `test.example` cannot be published in real DNS, so a local resolver returned the captured record — but the **key bytes and the signing computation are exactly what Maddy produced**, so this is a canonical statement about Maddy's output, not about the stubbed transport.
 
-- **SECONDARY observation — even a format-corrected key fails to verify the delivered copy [observed; root byte not isolated].** First, the obvious `openssl` re-encode path does *not* work here: `openssl rsa -RSAPublicKey_in -pubout` on the captured PKCS#1 key was attempted and failed [observed, verbatim]:
+- **SECONDARY observation — even a format-corrected key fails to verify the delivered copy [observed; root byte not isolated].** To read the published key at all, a verifier must first re-encode it from PKCS#1 to SPKI, and that re-encode succeeds cleanly with the obvious `openssl` one-liner: `openssl rsa -RSAPublicKey_in -pubout < pubkey_pkcs1.pem` exits `0`, prints `writing RSA key` on stderr, and emits the SPKI form [observed, verbatim — byte-for-byte identical in the canonical Docker image's OpenSSL 1.1.1n and the sandbox's OpenSSL 3.5.3]:
 
   ```
-  Could not find private key of public key from /tmp/maddy_scratch/evidence/pubkey_pkcs1.pem
+  writing RSA key
+  -----BEGIN PUBLIC KEY-----
+  MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0hdcnshL3SGj3jnu1k8J
+  JkxhcFTCybN47VDGMxE98eKYALGAI9CvLm6SvHmjLT0uGqBiFtElJdPpHngDAB9T
+  calpjq+3k0y+cfrMcep9r94md122a08XvHH9QVG+a08U/TT7E2N4ZJFS8lk4AcBl
+  zJzwIbBPLY8d4ZwQTM040ugvPqYvwzderyxSM/ocvhHNbHnW4YBYLhZkrQimNA2T
+  JQRkqQJD12sEZyQ3W+uhS5+QOpK4a6s27uSmdfLoMLDlj4swKE1Y56NULDLnAbMQ
+  7qQK2RLce+hwg0kN97GFS1G+blhyf7gwKSzjLIoKSRzMZqlmj7T4PIKeaRUveGAx
+  hQIDAQAB
+  -----END PUBLIC KEY-----
   ```
 
-  The format correction was therefore done in Go, by parsing the captured key with `x509.ParsePKCS1PublicKey` and re-marshalling the *same* key with `x509.MarshalPKIXPublicKey` (producing the `MIIBIjAN...` SPKI form shown above). go-msgauth then parses that SPKI record but reports, on the full T3 message fetched from IMAP storage [observed, verbatim]:
+  Re-encoding the *same* key in Go — parsing it with `x509.ParsePKCS1PublicKey` and re-marshalling with `x509.MarshalPKIXPublicKey` — produces a byte-identical SPKI DER (294-byte DER, SHA-256 `c23a6d2d9339514f9e1f79d04c28882afce3702933a508536392db51657bc5a7` for both the `openssl` and Go outputs), i.e. the `MIIBIjAN...` SPKI form shown above. go-msgauth then parses that SPKI record but reports, on the full T3 message fetched from IMAP storage [observed, verbatim]:
 
   ```
   [SPKI-CORRECTED] Domain=test.example Identifier=usera@test.example Err=dkim: signature did not verify: crypto/rsa: verification error
@@ -812,7 +823,7 @@ The `ls` confirms the harness is gone, and `git status --porcelain`, `git diff -
 
 - **Three named sends** — cross-user `MAIL FROM` (T1a/T1b), non-local `MAIL FROM` domain (T2), legitimate signed (T3) — all present, plus the mismatched-`From` case (Tm) and the missing-`From` case (Tn).
 - **≥1 rejected transcript** (T2, `501 5.1.8`) and **≥1 accepted transcript** (T3, `250 2.0.0 OK: queued`), both verbatim.
-- **Every SMTP code enumerated** with literal and cause (Section 4 table): `235`, `250`, `354`, `221`, `501 5.1.8`, `501 5.1.7` [inferred], `501 5.1.3` [inferred], `502 5.5.1`, `554 5.6.0` family.
+- **Every SMTP code enumerated** with literal and cause (Section 4 table): `235`, `250`, `354`, `221`, `501 5.1.8`, `553 5.1.7` [observed] (canonical sender-normalize code from `smtp.go` `CleanDomain`, which shadows the source-defined `501 5.1.7`/`501 5.1.3` in `msgpipeline.go`), `500 5.5.4` [observed], `502 5.5.1`, `554 5.6.0` family.
 - **Every `require_sender_match` / `shouldSign()` skip variant** enumerated with its exact log message and `file:line` (Section 6 table).
 - **Verbatim `DKIM-Signature`** (with `From` in `h=`), **`Received`** (no from-clause), and the **confirmed-absent `Authentication-Results`** (Section 5).
 - **Conclusion** (Layer-1 domain-only accept; Layer-2 skip-not-reject), **falsification** (T1a acceptance), **divergence** (PKCS#1 key + skip-not-reject + `auth` enum + deferred `RCPT`), and **standards grounding** (RFC 6409 / 6376 / 7489).
