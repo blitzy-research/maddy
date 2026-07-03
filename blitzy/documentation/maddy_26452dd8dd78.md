@@ -57,13 +57,40 @@ sqlite3-binding.c:125282:10: note: declared here
        |          ^~~~~~~
 ```
 
-**Version banner [observed, verbatim].** Running `./maddy -v` prints:
+**Version banner [observed, verbatim].** Running `/tmp/maddy_scratch/maddy -v` prints:
 
 ```
 maddy unknown (built from source tree)
 ```
 
 This is the **canonical default-build value**: the version string defaults to `Version = "unknown (built from source tree)"` [`maddy.go:L41`] because no VCS build information is embedded in a plain `go build` from the source tree. `maddyctl --version` prints the same string. The `-v` flag itself is declared as `printVersion = flag.Bool("v", false, "print version and exit")` [`maddy.go:L109`].
+
+**Exact build and invocation commands [observed, verbatim].** The complete command sequence a normal user runs to reproduce this investigation — built and run out-of-tree under `/tmp/maddy_scratch`:
+
+```bash
+# 1. Build the two binaries out-of-tree (both exited 0)
+go build -o /tmp/maddy_scratch/maddy ./cmd/maddy
+go build -o /tmp/maddy_scratch/maddyctl ./cmd/maddyctl
+
+# 2. Print the canonical version banner
+/tmp/maddy_scratch/maddy -v
+# -> maddy unknown (built from source tree)
+
+# 3. Provision the two accounts through the real CLI (password read from stdin, or via -p)
+/tmp/maddy_scratch/maddyctl --config /tmp/maddy_scratch/maddy_test.conf users create usera@test.example -p '<passwordA>'
+/tmp/maddy_scratch/maddyctl --config /tmp/maddy_scratch/maddy_test.conf users create userb@test.example -p '<passwordB>'
+
+# 4. Start the real server with the structure-preserving config and debug logging
+/tmp/maddy_scratch/maddy -config /tmp/maddy_scratch/maddy_test.conf -debug
+```
+
+The step-4 command is the exact invocation whose `-debug` output is quoted as the startup evidence in Section 2; it binds `submission: listening on tls://0.0.0.0:465` and `imap: listening on tls://0.0.0.0:993`. The config was saved out-of-tree as `/tmp/maddy_scratch/maddy_test.conf`; the filename is not behavioral, so the generic form `/tmp/maddy_scratch/maddy -config /tmp/maddy_scratch/maddy.conf -debug` is equivalent (both filenames were confirmed to start the server and bind `:465`/`:993`).
+
+**`maddy` accepts no positional subcommand [observed, verbatim].** There is no `run` verb — appending a trailing token such as `run` (i.e. `/tmp/maddy_scratch/maddy -config /tmp/maddy_scratch/maddy_test.conf -debug run`) is rejected by `if len(flag.Args()) != 0 { fmt.Println("usage:", os.Args[0], "[options]"); return 2 }` [`maddy.go:L120-L122`], which prints a usage line and exits with status `2`:
+
+```
+usage: /tmp/maddy_scratch/maddy [options]
+```
 
 ---
 
@@ -87,7 +114,7 @@ None of these three substitutions touches the enforcement *logic* — source rou
 - SQLite-backed credential store + mailbox storage — `sql local_mailboxes local_authdb { driver sqlite3 ... dsn all.db }` [`maddy.conf:L32-L35`].
 - The IMAP inspection endpoint on implicit TLS :993 — `imap tls://0.0.0.0:993 { auth &local_authdb; storage &local_mailboxes }` [`maddy.conf:L149-L152`].
 
-The default configuration path is `/etc/maddy/maddy.conf`, formed by `filepath.Join(ConfigDirectory, "maddy.conf")` with `ConfigDirectory = "/etc/maddy"` [`maddy.go:L107`, `maddy.go:L48`]. The test config was supplied via the `-config` flag and the server was run with `-debug`.
+The default configuration path is `/etc/maddy/maddy.conf`, formed by `filepath.Join(ConfigDirectory, "maddy.conf")` with `ConfigDirectory = "/etc/maddy"` [`maddy.go:L107`, `maddy.go:L48`]. The test config was supplied via the `-config` flag and the server was run with `-debug` — i.e. the exact invocation `/tmp/maddy_scratch/maddy -config /tmp/maddy_scratch/maddy_test.conf -debug` listed in Section 1; the startup log immediately below is that command's `-debug` output.
 
 **Startup evidence [observed, verbatim, from the debug log].** On first startup Maddy loaded the SQL storage, instantiated the `sign_dkim` module, and — because no key existed yet — auto-generated a fresh RSA-2048 keypair and wrote both the private key and the public-key DNS record file, then bound the two listeners:
 
@@ -734,11 +761,25 @@ The *only* consequence of the identity mismatch was that signing was skipped [ob
 
 The following situates the observed behavior within the relevant RFCs. This is *standards context*, not runtime evidence.
 
-- **RFC 6409 §6.1 (Message Submission).** Enforcing that `MAIL FROM` matches the authenticated identity is an **optional** MSA action — an MSA *MAY* reject with `550 5.7.1` when the sender lacks submission rights, but it is not required to. Domain-level-only locality (exactly what Maddy's default does) is therefore standards-conformant. Maddy's `501` invalid-address path likewise aligns with RFC 6409's guidance to reject syntactically improper addresses with `501`.
-- **RFC 6376 (DKIM).** The DKIM signing identity is deliberately decoupled from header addresses, and verifiers fetch the public key from a TXT record at `{selector}._domainkey.<domain>` — here `default._domainkey.test.example`. The `p=` value is expected to be a DER-encoded **SubjectPublicKeyInfo**; this is precisely why the PKCS#1 encoding observed in Sections 6 and 9 is a defect. RFC 6376's oversigning rationale (hashing a header name more times than it appears, so an added duplicate breaks verification) explains why Maddy oversigns `From`.
-- **RFC 7489 (DMARC).** DKIM *alignment* — the signature's `d=` domain aligning with the `From` header domain — is a DMARC concern, not a base-DKIM one. This is why `shouldSign()` refuses to sign a `From`-misaligned message: signing it could never yield DMARC alignment, so Maddy declines rather than emit a signature that is useless for alignment.
+- **[RFC 6409](https://datatracker.ietf.org/doc/html/rfc6409) §6.1 (Message Submission).** Enforcing that `MAIL FROM` matches the authenticated identity is an **optional** MSA action — an MSA *MAY* reject with `550 5.7.1` when the sender lacks submission rights, but it is not required to. Domain-level-only locality (exactly what Maddy's default does) is therefore standards-conformant. Maddy's `501` invalid-address path likewise aligns with RFC 6409's guidance to reject syntactically improper addresses with `501`.
+- **[RFC 6376](https://datatracker.ietf.org/doc/html/rfc6376) (DKIM).** The DKIM signing identity is deliberately decoupled from header addresses, and verifiers fetch the public key from a TXT record at `{selector}._domainkey.<domain>` — here `default._domainkey.test.example`. The `p=` value is expected to be a DER-encoded **SubjectPublicKeyInfo**; this is precisely why the PKCS#1 encoding observed in Sections 6 and 9 is a defect. RFC 6376's oversigning rationale (hashing a header name more times than it appears, so an added duplicate breaks verification) explains why Maddy oversigns `From`.
+- **[RFC 7489](https://datatracker.ietf.org/doc/html/rfc7489) (DMARC).** DKIM *alignment* — the signature's `d=` domain aligning with the `From` header domain — is a DMARC concern, not a base-DKIM one. This is why `shouldSign()` refuses to sign a `From`-misaligned message: signing it could never yield DMARC alignment, so Maddy declines rather than emit a signature that is useless for alignment.
 
 The synthesis: a reasonable reading of the default `maddy.conf` (`auth &local_authdb` next to `sign_dkim`) might suggest that authenticated submission binds the sender to the logged-in user and always signs their mail. The standards show that per-user enforcement is *optional* (RFC 6409 §6.1) and that DKIM declines to sign misaligned mail to protect DMARC alignment — which is exactly the behavior confirmed at runtime: Maddy's default accepts same-domain cross-user senders and silently skips signing on misalignment rather than rejecting.
+
+**Standards references (stable links; each verified to resolve with `curl -sI`).** These are the primary sources cited above:
+
+- RFC 6409 — *Message Submission for Mail*: <https://datatracker.ietf.org/doc/html/rfc6409>
+- RFC 6376 — *DomainKeys Identified Mail (DKIM) Signatures*: <https://datatracker.ietf.org/doc/html/rfc6376>
+- RFC 7489 — *Domain-based Message Authentication, Reporting, and Conformance (DMARC)*: <https://datatracker.ietf.org/doc/html/rfc7489>
+
+Link resolution [observed, verbatim]:
+
+```
+curl -sI https://datatracker.ietf.org/doc/html/rfc6409  ->  HTTP/2 200
+curl -sI https://datatracker.ietf.org/doc/html/rfc6376  ->  HTTP/2 200
+curl -sI https://datatracker.ietf.org/doc/html/rfc7489  ->  HTTP/2 200
+```
 
 ---
 
@@ -749,6 +790,21 @@ The synthesis: a reasonable reading of the default `maddy.conf` (`auth &local_au
 **Removed after evidence capture:** all of the above artifacts were deleted and the Maddy / sink / DNS-stub processes were stopped. Nothing dirtied the repository: `.gitignore` already ignores `*.pem` / `*.crt` / `*.key`; the SQLite database and `dkim_keys/` lived outside the tree; and the build binaries were written out-of-tree (a root `./maddy` is *not* ignored, which is why `-o /tmp/maddy_scratch/...` was used).
 
 **Confirmation:** `git status --porcelain` on the source repository is **empty** (the tree is byte-for-byte unchanged; the baseline was verified clean before any work began). The only permanent addition anywhere is this document, `blitzy/documentation/maddy_26452dd8dd78.md`.
+
+**Cleanup commands and observed output [observed, verbatim].** The teardown sequence and the resulting source-repository state (each of the three `git` commands produced **no output**, shown here by the immediately-following shell prompt):
+
+```
+$ kill "$MADDY_PID"          # stop the running server (frees the :465 and :993 listeners)
+$ rm -rf /tmp/maddy_scratch  # remove the entire out-of-tree harness (binaries, config, certs, all.db, dkim_keys/, scripts)
+$ ls -d /tmp/maddy_scratch
+ls: cannot access '/tmp/maddy_scratch': No such file or directory
+$ git status --porcelain
+$ git diff --stat
+$ git status --porcelain --untracked-files=all
+$
+```
+
+The `ls` confirms the harness is gone, and `git status --porcelain`, `git diff --stat`, and `git status --porcelain --untracked-files=all` all returned empty — the source working tree is byte-for-byte identical to `HEAD`, with no leftover binary, database, DKIM key, or certificate anywhere in the tree. This document (already tracked) is the sole permanent addition.
 
 ---
 
