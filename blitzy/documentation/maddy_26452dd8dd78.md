@@ -546,11 +546,17 @@ if !ok {
 
 This **skip-not-reject** behavior is at [`internal/modify/dkim/dkim.go:L348-L350`] and was observed at runtime in T1a, T1b, and Tm — all three were `submission: accepted` and **delivered unsigned**. It is essential not to confuse this with a routing reject.
 
-**Every `require_sender_match` / `shouldSign()` skip reason, with its exact log message and `file:line`:**
+**The `off` token is the always-sign short-circuit — it is *not* a skip reason.** When `require_sender_match off` is set, `shouldSign()` takes its very first branch [`internal/modify/dkim/dkim.go:L250`] and returns `("@" + aDomain, true)` for non-EAI mail [`internal/modify/dkim/dkim.go:L259`] or `("@" + m.domain, true)` for EAI mail [`internal/modify/dkim/dkim.go:L261`] — i.e. it returns `ok = true` *before* any of the `From`-domain, `envelope`, or `auth` checks run, so `RewriteBody()` proceeds to add the `DKIM-Signature` rather than hitting the `if !ok { return nil }` skip [`internal/modify/dkim/dkim.go:L348-L350`]. The man page states this verbatim — `off`: "Disable check, always sign." [`docs/man/maddy-filters.5.scd:L531-L532`]. This was confirmed at runtime: a T1a-misaligned message (authenticated as `usera`, `MAIL FROM`/`From` = `userb`) that the default `[envelope, auth]` policy *skips* was instead **signed** under `require_sender_match off`:
+
+```
+[debug] sign_dkim: signed	{"identifier":"@test.example"}
+```
+**[observed]** — and was delivered with a real `DKIM-Signature` (`d=test.example; i=@test.example; s=default; c=relaxed/relaxed; h=…From:From…`) that covers `From`, versus the same message under the default policy which logged `not signing, From address is not authenticated identity` and was delivered unsigned. The *only* sub-case in which `off` does **not** sign is a rare IDNA failure converting the key domain to A-labels, which logs `not signing, cannot convert key domain domain into A-labels` and returns `("", false)` [`internal/modify/dkim/dkim.go:L254-L256`]. (`off` also may not be combined with other sender-match tokens [`internal/modify/dkim/dkim.go:L170-L171`].)
+
+**Every `require_sender_match` / `shouldSign()` skip reason (all of which apply only when `off` is *not* set), with its exact log message and `file:line`:**
 
 | Skip reason | Exact log message | Source |
 |-------------|-------------------|--------|
-| `off` token present | (signing disabled entirely; no per-message log) | `internal/modify/dkim/dkim.go:L250` |
 | empty `From` | `not signing, empty From` | `internal/modify/dkim/dkim.go:L266` |
 | malformed `From` field | `not signing, malformed From field` | `internal/modify/dkim/dkim.go:L271` |
 | multiple addresses in `From` | `not signing, multiple addresses in From` | `internal/modify/dkim/dkim.go:L275` |
@@ -713,7 +719,13 @@ The *only* consequence of the identity mismatch was that signing was skipped [ob
 
 **Secondary divergences (each runtime-supported):**
 
-- **The `require_sender_match` default token `auth` is not among the documented valid enum values.** The enum declares valid values `["envelope", "auth_domain", "auth_user", "off"]` yet sets the default to `["envelope", "auth"]` [`internal/modify/dkim/dkim.go:L151-L152`], and `shouldSign()` really does test `m.senderMatch["auth"]` [`internal/modify/dkim/dkim.go:L299`]. So the *default* uses a token (`auth`) that the *configuration surface* does not list as selectable — a config-surface-vs-runtime-default discrepancy. This was exercised at runtime: T1a's skip reason `From address is not authenticated identity` is exactly the `auth`-token branch firing under the default.
+- **The `require_sender_match` default token `auth` is rejected by the code-level validation enum — a genuine three-surface inconsistency.** The `cfg.EnumList("require_sender_match", ...)` call declares its *code-level validation enum* (the `allowed` set) as `["envelope", "auth_domain", "auth_user", "off"]` while setting the default to `["envelope", "auth"]` [`internal/modify/dkim/dkim.go:L151-L152`]. The default is accepted only because `EnumList`'s default callback returns the default list **without** validating it against the allowed set [`internal/config/map.go:L82-L84`]; an *explicitly* supplied `require_sender_match auth` is instead rejected at config-parse time. Evidence [observed, verbatim] — starting the server with a `sign_dkim` block containing `require_sender_match auth`:
+
+  ```
+  /tmp/maddy_scratch/f2_auth.conf:23: invalid argument, valid values are: [envelope auth_domain auth_user off]
+  ```
+
+  produced by `m.MatchErr("invalid argument, valid values are: %v", allowed)` [`internal/config/map.go:L100`]. This is a genuine **three-surface** mismatch: (1) the *code validation enum* accepts `{envelope, auth_domain, auth_user, off}` and rejects `auth`; (2) the compiled-in *default* is `{envelope, auth}`; and (3) the *man page* documents the valid values as `{off, envelope, auth}` [`docs/man/maddy-filters.5.scd:L530-L538`] — so the man page (the actual documentation) *does* document `auth`, and does *not* mention `auth_domain`/`auth_user`. It is therefore the **code validation enum**, not the documentation, that omits `auth`. Compounding this, `shouldSign()` only ever reads `senderMatch["off"]`, `senderMatch["envelope"]`, and `senderMatch["auth"]` [`internal/modify/dkim/dkim.go:L250, L293, L299`] — it never reads `auth_domain` or `auth_user`, so those two enum-accepted tokens are **dead config** with no runtime effect (confirmed [observed]: `require_sender_match auth_domain` parses and the server starts — `submission: listening on tls://127.0.0.1:11465` — while none of the sender-match branches consume it). That the *default* (`auth`) is a value the *validation enum* would reject when typed explicitly was also exercised via T1a, whose skip reason `From address is not authenticated identity` is exactly the `auth`-token branch [`internal/modify/dkim/dkim.go:L299`] firing under the default.
 - **Sender rejection surfaces at `RCPT`, not at `MAIL FROM`.** A reader of `default_source { reject ... }` might expect `MAIL FROM:<spoof@nonlocal.tld>` to be rejected immediately, but it is answered `250` and the `501 5.1.8` appears only at `RCPT` because `defer_sender_reject` defaults `true` [`internal/endpoint/smtp/smtp.go:L567`]. Evidence [observed, T2]: `mail FROM ... 250 2.0.0 Roger, accepting mail from <spoof@nonlocal.tld>` then `rcpt TO ... 501 5.1.8 Non-local sender domain`.
 
 ---
