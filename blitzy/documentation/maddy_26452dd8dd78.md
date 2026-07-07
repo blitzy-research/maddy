@@ -49,11 +49,11 @@ All outcomes were **deterministic** across the two runs of each scenario (§7.5)
 **Commit confirmation (the binaries are built from the working-tree checkout, whose only difference from `26452dd` is this document — so the compiled Go code is byte-identical to the commit under test):**
 
 ```console
-$ git -C /src rev-parse HEAD              # working-tree checkout the binaries are built from
-f7474491afad73f9bd7b37bf4c1d2d2fd8680762
-$ git -C /src rev-parse HEAD~1            # its parent — the commit under test
+$ git -C /src rev-parse 26452dd^{commit}                        # the commit under test (pinned by hash)
 26452dd8dd787dc455278b0fdd296f4a5432c768
-$ git -C /src diff --name-status 26452dd..HEAD
+$ git -C /src merge-base --is-ancestor 26452dd HEAD && echo "26452dd is an ancestor of HEAD"
+26452dd is an ancestor of HEAD
+$ git -C /src diff --name-status 26452dd..HEAD                  # the only net difference from the code under test
 A	blitzy/documentation/maddy_26452dd8dd78.md
 ```
 
@@ -363,7 +363,7 @@ Because D fails at gate 5 and A fails at gate 7, they emit **different** debug l
 
 ### 6.2 Defaults and the oversigned header set
 
-`require_sender_match` default is `[envelope auth]` (`dkim.go:L151-L152`; the valid tokens are `[envelope, auth_domain, auth_user, off]`). The default **oversigned** header list (`oversignDefault`, `dkim.go:L31-L52`) is: `Subject, Sender, To, Cc, From, Date, MIME-Version, Content-Type, Content-Transfer-Encoding, Reply-To, In-Reply-To, Message-Id, References, Autocrypt, Openpgp`. `fieldsToSign` (`dkim.go:L202`) lists each header `(occurrences + 1)` times, which is why the observed `h=` tag doubles the headers that are present (e.g. `Subject:Subject`, `From:From`) and names once those that are absent (e.g. `Sender`, `Cc`, `MIME-Version`). The subtlety at gate 7: because the authenticated name contains `@`, the comparison uses the full address `alice@example.org` (not just the local part; `strings.EqualFold` at `L305`), as seen in Scenario A's debug (`auth_id:alice@example.org`, `from_addr:bob@example.org`). The manual documents this: `docs/man/maddy-filters.5.scd:L535-L538` describes the `auth` token as matching the full address when the username contains `@`, otherwise the local part.
+`require_sender_match` default is `[envelope auth]` (`dkim.go:L151-L152`; the valid tokens are `[envelope, auth_domain, auth_user, off]`). The default **oversigned** header list (`oversignDefault`, `dkim.go:L31-L54`) is: `Subject, Sender, To, Cc, From, Date, MIME-Version, Content-Type, Content-Transfer-Encoding, Reply-To, In-Reply-To, Message-Id, References, Autocrypt, Openpgp`. `fieldsToSign` (`dkim.go:L202`) lists each header `(occurrences + 1)` times, which is why the observed `h=` tag doubles the headers that are present (e.g. `Subject:Subject`, `From:From`) and names once those that are absent (e.g. `Sender`, `Cc`, `MIME-Version`). The subtlety at gate 7: because the authenticated name contains `@`, the comparison uses the full address `alice@example.org` (not just the local part; `strings.EqualFold` at `L305`), as seen in Scenario A's debug (`auth_id:alice@example.org`, `from_addr:bob@example.org`). The manual documents this: `docs/man/maddy-filters.5.scd:L535-L538` describes the `auth` token as matching the full address when the username contains `@`, otherwise the local part.
 
 ### 6.3 Signatures are produced — but they do not verify (root cause + reconciliation with the plan's predicted PASS)
 
@@ -1036,17 +1036,19 @@ The investigation branch differs from the commit under test (`26452dd`) by exact
 ```console
 $ git rev-parse --abbrev-ref HEAD
 blitzy-f454e013-443c-41bf-a239-e2757361b5fc
-$ git rev-parse HEAD~1                              # the commit under test
+$ git rev-parse 26452dd^{commit}                    # the commit under test (pinned by hash)
 26452dd8dd787dc455278b0fdd296f4a5432c768
+$ git merge-base --is-ancestor 26452dd HEAD && echo "26452dd is an ancestor of HEAD"
+26452dd is an ancestor of HEAD
 $ git diff --name-status 26452dd..HEAD              # what changed vs the code under test
 A	blitzy/documentation/maddy_26452dd8dd78.md
 $ git diff --stat 26452dd -- go.mod go.sum          # dependency manifests
                                                      # (empty output: go.mod / go.sum unchanged)
-$ git log --author="agent@blitzy.com" 26452dd..HEAD --oneline
-f747449 docs: add runtime investigation of Maddy sender-identity & DKIM enforcement (maddy_26452dd8dd78)
+$ git log 26452dd..HEAD --format='%ae' | sort -u    # authors of every commit since the code under test
+agent@blitzy.com
 ```
 
-`git diff --name-status 26452dd..HEAD` shows a single `A` (added) entry — the documentation — and **no** ` M`/` D`/`R` entry for any tracked file. The empty `git diff` for `go.mod`/`go.sum` confirms **no dependency change**. The runtime state (`/tmp/maddy-run/`) is a sibling of the checkout and therefore never appears in git status.
+`git diff --name-status 26452dd..HEAD` shows a single `A` (added) entry — the documentation — and **no** ` M`/` D`/`R` entry for any tracked file. The empty `git diff` for `go.mod`/`go.sum` confirms **no dependency change**. Every commit layered on top of the code under test is an `agent@blitzy.com` documentation commit (the branch carries one or more such commits that only ever touch this one file, so the net `26452dd..HEAD` difference remains exactly the single added document). The runtime state (`/tmp/maddy-run/`) is a sibling of the checkout and therefore never appears in git status.
 
 ### 10.2 Cleanup commands (teardown)
 
@@ -1068,10 +1070,11 @@ Removing `/tmp/maddy-run` deletes: the test config; the self-signed `certs/`; th
 After stopping all processes and removing `/tmp/maddy-run`, the checkout shows the new answer document as the sole change and **zero** modifications to any tracked file:
 
 ```console
-$ git status --porcelain
-?? blitzy/documentation/maddy_26452dd8dd78.md    # (before commit; the sole change)
-$ git diff --stat HEAD                            # edits to tracked files — none
-                                                  # (empty output: no source/config/go.mod/go.sum changes)
+$ git status --porcelain                          # working tree state (empty output below = clean; the document is committed)
+$ git diff --name-status 26452dd..HEAD            # the sole net change vs the code under test
+A	blitzy/documentation/maddy_26452dd8dd78.md
+$ git diff --stat 26452dd..HEAD -- ':!blitzy/documentation'   # any pre-existing tracked file changed?
+                                                  # (empty output: none — no source/config/go.mod/go.sum change)
 ```
 
 `/tmp/maddy-run` was a sibling of the checkout, so its removal leaves the working tree byte-for-byte unchanged apart from adding this document. The compiled `maddy`/`maddyctl` binaries lived under `/tmp/maddy-run/bin` (outside the tree); even had they been built in-tree, `.gitignore` already excludes `cmd/maddy/maddy` and `cmd/maddyctl/maddyctl`. No dependency files (`go.mod`/`go.sum`) were touched, and the `authorize_sender` check was **not** added, enabled, or back-ported.
@@ -1154,7 +1157,7 @@ All references verified against a pristine checkout at HEAD `26452dd8dd787dc4552
 
 | Anchor | What it is |
 |---|---|
-| `L31-L52` | `oversignDefault` — 15 oversigned headers (Subject, Sender, To, Cc, From, Date, MIME-Version, Content-Type, Content-Transfer-Encoding, Reply-To, In-Reply-To, Message-Id, References, Autocrypt, Openpgp) |
+| `L31-L54` | `oversignDefault` — 15 oversigned headers (Subject, Sender, To, Cc, From, Date, MIME-Version, Content-Type, Content-Transfer-Encoding, Reply-To, In-Reply-To, Message-Id, References, Autocrypt, Openpgp) |
 | `L55-L72` | `signDefault` |
 | `L137` | `key_path` default `dkim_keys/{domain}_{selector}.key` |
 | `L140-L142` / `L143-L145` | header / body canonicalization defaults `relaxed` / `relaxed` |
@@ -1185,7 +1188,7 @@ All references verified against a pristine checkout at HEAD `26452dd8dd787dc4552
 | `L121-L131` | PEM write, `0600`, block type `"PRIVATE KEY"` |
 | `L136` | `writeDNSRecord` |
 | `L143` | **`x509.MarshalPKCS1PublicKey(pubkey)` — the PKCS#1 (non-PKIX) public-key defect** |
-| `L150` | `.dns` path = `keyPath[:-4]+".dns"` |
+| `L150-L152` | `.dns` path: `keyPath + ".dns"` (L150), replaced by `keyPath[:len-4] + ".dns"` when `keyPath` ends in `.key` (guard at L151, strip at L152) → yields `example.org_default.dns` |
 | `L158` | record string `v=DKIM1; k=rsa; p=<base64>` |
 
 ### 11.7 `internal/target/received.go` (`Received` header)
