@@ -173,16 +173,34 @@ The on-disk key is reused; the same public key remains valid for verification ac
 
 ### 1.7 Accounts (usernames are full email addresses)
 
-Account names include the domain — `docs/tutorials/setting-up.md` states that when authenticating, the full address is used as the username. Two accounts were created:
+Account names include the domain — `docs/tutorials/setting-up.md:135-136` states "account names include the domain … full address should be specified as a username." Two accounts (`user1@example.org`, `user2@example.org`) were created with `maddyctl`, which operates **directly on the SQLite store** (no running server needed): `findBlockInCfg` calls `maddy.InitDirs()` (`cmd/maddyctl/config.go:31`), which `os.Chdir`s into the state directory (`maddy.go:220` — `os.Chdir(config.StateDirectory)`), so the relative `dsn all.db` resolves inside the state dir. The `users` → `create USERNAME` subcommand takes `--password`/`-p` and a default bcrypt `--hash` (`cmd/maddyctl/main.go:71-99`); `users list` prints one username per line (`fmt.Println(user)`, `cmd/maddyctl/users.go:25`); `imap-mboxes list` prints one mailbox per line (`fmt.Println(info.Name)`, `cmd/maddyctl/imap.go:59`).
+
+The actual, unedited command transcript (preserved as `maddyctl_setup_output.txt`; each `$` line is the command run and each `[exit N]` its status; captured with `stdout`+`stderr` merged):
 
 ```
-maddyctl --config <conf> users create user1@example.org --password 'Password123!'   # EXIT 0
-maddyctl --config <conf> users create user2@example.org --password 'Password123!'   # EXIT 0
+$ /tmp/maddy_acct/maddyctl --config /tmp/maddy_acct/maddy.conf users create user1@example.org --password Password123!
+[exit 0]
+
+$ /tmp/maddy_acct/maddyctl --config /tmp/maddy_acct/maddy.conf users create user2@example.org --password Password123!
+[exit 0]
+
+$ /tmp/maddy_acct/maddyctl --config /tmp/maddy_acct/maddy.conf users list
+user1@example.org
+user2@example.org
+[exit 0]
+
+$ /tmp/maddy_acct/maddyctl --config /tmp/maddy_acct/maddy.conf imap-mboxes list user2@example.org
+INBOX
+[exit 0]
+
+$ /tmp/maddy_acct/maddyctl --config /tmp/maddy_acct/maddy.conf imap-mboxes list user1@example.org
+INBOX
+[exit 0]
 ```
 
-Both commands returned exit code 0; `maddyctl users list` showed both accounts, and `maddyctl imap-mboxes list user2@example.org` showed the auto-created `INBOX`. The `maddyctl` account/hash handling lives in `cmd/maddyctl/main.go` (the `users` → `create USERNAME` subcommand with `--password`/`-p` and a default bcrypt `--hash`).
+Both `create` commands returned `[exit 0]` with no output; `users list` shows the two full-address accounts `user1@example.org` and `user2@example.org`; and `imap-mboxes list` shows the auto-created `INBOX` for each account (the INBOX is created implicitly with the account). The output is deterministic — two independent runs against separate fresh state directories produced byte-identical transcripts.
 
-> **Non-canonical test artifact:** the password `Password123!` is a test value, not a maddy default. The accounts existed only inside the temporary SQLite database, which was removed during cleanup (see §11).
+> **Provenance / non-canonical test artifact.** This transcript was captured in a fresh scratch workdir (`/tmp/maddy_acct`) using the **byte-identical canonical** `sql local_mailboxes local_authdb { driver sqlite3; dsn all.db }` block — only the `state`/`runtime` directories were redirected, exactly the policy-preserving substitution described in §1.5 (its `diff` against the canonical `maddy.conf.used` is those two lines only). It is a faithful re-run of the canonical account-setup commands, performed to preserve the `maddyctl` output as evidence (the account-setup commands' stdout was not among the originally preserved evidence files). The same two accounts are independently corroborated at runtime by the authenticated SMTPS `AUTH` successes and the delivered messages captured in §4–§6. The password `Password123!` is a test value, not a maddy default; the accounts exist only inside temporary SQLite databases, which are removed during cleanup (see §11).
 
 ---
 
@@ -909,7 +927,7 @@ Every reference below was verified against the on-disk source in the repository 
 ### 9.8 `internal/check/spf/spf.go` and `internal/check/dkim/dkim.go` (contrast: real inbound checks)
 
 - `internal/check/spf/spf.go:28` — `const modName = "apply_spf"` (a real sender-policy check that DOES exist, used on port 25).
-- `internal/check/dkim/dkim.go:87` — inbound `verify_dkim`'s `func (d *dkimCheckState) CheckConnection(...)`. It produces an `AuthResult`: the no-signature branch builds `AuthResult: []authres.Result{ &authres.DKIMResult{ Value: authres.ResultNone } }` at **L115-117**, and the per-signature results are appended into `res.AuthResult` (declared at **L157**) via `res.AuthResult = append(res.AuthResult, &authres.DKIMResult{...})` at **L187**. This `AuthResult` is exactly what feeds `Authentication-Results` through `check_runner.go:301-302` on the inbound path — and is absent on submission because the submission block declares no `check{}`.
+- `internal/check/dkim/dkim.go` — inbound `verify_dkim`. Its `func (d *dkimCheckState) CheckConnection(...)` at **L87** returns an empty result — `return module.CheckResult{}` at **L88** — and produces **no** `AuthResult` (the same is true of `CheckSender` at **L91-93** and `CheckRcpt` at **L95-97**). The DKIM `AuthResult` is produced instead by `func (d *dkimCheckState) CheckBody(...)` at **L99**: the no-signature branch builds `AuthResult: []authres.Result{ &authres.DKIMResult{ Value: authres.ResultNone } }` at **L115-117**, and for messages carrying signatures the per-signature results are appended into `res.AuthResult` (declared `res := module.CheckResult{AuthResult: make([]authres.Result, 0, len(verifications))}` at **L157**) via `res.AuthResult = append(res.AuthResult, &authres.DKIMResult{...})` at **L187**. This `AuthResult` is exactly what feeds `Authentication-Results` through `check_runner.go:301-302` on the inbound path — and is absent on submission because the submission block declares no `check{}`.
 - **Absent module:** a repository-wide `grep -i "authorize_sender|authorizesender"` across `internal/` returns **nothing** — there is **no** built-in sender-authorization check module in this commit. (SPF, DNSBL, inbound DKIM-verify, requiretls, command, and DNS checks exist; a per-identity sender-authorization check does not.)
 
 ### 9.9 `cmd/maddyctl/main.go` (management CLI)
@@ -952,6 +970,14 @@ Every reference below was verified against the on-disk source in the repository 
 - **§6.1** Enforce Submission Rights — **a MAY (optional)** — **not implemented by default** (the authoritative basis that maddy's default non-enforcement of per-identity alignment is RFC-compliant).
 - **§8.1–§8.2** add Date / Message-ID — implemented (observed `adding missing Message-ID` / `adding missing Date header`).
 
+### 9.14 External references (corroboration)
+
+The document's primary evidence is the captured runtime output plus the `file:line` source citations above; the following external sources are independent corroboration of the code-grounded characterizations (not a citation-fidelity dependency):
+
+- `https://maddy.email/reference/modifiers/dkim/` — states the `sign_dkim` signing key is "selected based on the SMTP envelope sender," that a message whose envelope-sender domain matches no loaded key is delivered **unsigned** rather than rejected, and that `require_sender_match` governs the **signing** decision (whether `From` must match `MAIL FROM` and/or the authorization identity), not message acceptance. Corroborates §3, §4, and §8.
+- `https://maddy.email/reference/smtp-pipeline/` — states `source` blocks are selected by matching the message sender "as specified in MAIL FROM," and that a `reject` directive rejects the recipient (fired per `RCPT TO`). Corroborates §3.Q1 and the `501 5.1.8`-at-`RCPT` observation in §5.2.
+- **RFC 6409 (Message Submission for Mail, STD 72)** — see §9.13; §6.1 "Enforce Submission Rights" is an optional **MAY**, the authoritative basis for maddy's default non-enforcement of per-identity alignment being RFC-compliant.
+
 
 ---
 
@@ -970,7 +996,7 @@ Final coverage pass over every question, scenario, and named item. Each box is c
 - [x] **Q5 plausible-but-incorrect interpretation** ruled out ("maddy rejects `MAIL FROM` ≠ authenticated user") using the accepted same-domain/different-user transaction (Scenario A). → §3.Q5
 - [x] **Q6 config-vs-behavior divergence** proven at runtime: `require_sender_match envelope auth_domain` signs the identity-mismatch message as `user2@example.org`; before/after for identical inputs; root cause = code reads only the literal key `"auth"` (`dkim.go:299`), which is not user-selectable. → §3.Q6, §8
 - [x] **Every factual claim carries a `file:line` reference or captured output.** → throughout, consolidated in §9
-- [x] **Repository integrity:** source tree byte-unchanged (`git status --porcelain` empty); source commit under investigation `26452dd8dd787dc455278b0fdd296f4a5432c768` on source branch `maddy_26452dd8dd78`; deliverable committed on destination branch `blitzy-62bbeeda-df48-4e6a-b6a4-dda6742e6660`; all temporary artifacts removed. → §11
+- [x] **Repository integrity:** source tree byte-unchanged (`git status --porcelain` empty); source commit under investigation `26452dd8dd787dc455278b0fdd296f4a5432c768` on source branch `maddy_26452dd8dd78`; deliverable committed on destination branch `blitzy-62bbeeda-df48-4e6a-b6a4-dda6742e6660`; temporary runtime artifacts (workdirs, database, certificates, binaries) removed, with the captured evidence set preserved outside the repository. → §11.2
 
 ### Question-by-question confirmation
 
@@ -1018,18 +1044,31 @@ $ git status --porcelain                                   # no source-tree chan
 
 `git status --porcelain` returns **zero lines** — no file in the maddy source tree was created, modified, or deleted. The destination `HEAD` is the documentation commit on branch `blitzy-62bbeeda-…`; its parent is the source commit `26452dd8…` on source branch `maddy_26452dd8dd78`. Note that `git rev-parse HEAD` returns the *deliverable* commit hash, **not** `26452dd8…`; the source commit under investigation is HEAD's parent, shown above via its full hash and subject so the two are unambiguous.
 
-### 11.2 Ephemeral artifacts (created outside the repo, then removed)
+### 11.2 Ephemeral artifacts: removed workdirs vs. preserved evidence set
 
-All runtime work occurred **outside** the source repository, in a temporary workdir (`/tmp/maddy_work`) and a certificate directory (`/etc/maddy`). The following artifacts were created and then removed after evidence capture:
+All runtime work occurred **outside** the source repository. The artifacts fall into two categories — those removed after evidence capture, and the captured evidence itself, which is preserved outside the repository for auditability. Neither affects source-tree integrity.
 
-- Built binaries `maddy` and `maddyctl`.
-- The canonical `maddy.conf.used` and the labeled non-canonical `maddy_probe.conf`.
-- The self-signed TLS certificate/key at `/etc/maddy/certs/example.org/{fullchain.pem,privkey.pem}`.
-- The state directory contents: `all.db` (+ `-wal`/`-shm`), `dkim_keys/example.org_default.{key,dns}`, and `messages/<blobs>`.
-- The Python SMTPS client scripts and the separate Go DKIM-verifier module.
-- The two test accounts (`user1@example.org`, `user2@example.org`) — they existed only inside the removed SQLite database.
+**Removed after evidence capture** (verified absent — `find /tmp/maddy_work` → *No such file or directory*; `/etc/maddy` → absent):
 
-The captured evidence used to author this report lived outside the repository and does not affect source-tree integrity.
+- The temporary workdirs `/tmp/maddy_work` (the canonical and labeled non-canonical probe runs) and `/tmp/maddy_acct` (the §1.7 account-command re-run), plus the certificate directory `/etc/maddy`.
+- The built binaries `maddy` and `maddyctl`.
+- The self-signed TLS certificate/key that lived at `/etc/maddy/certs/example.org/{fullchain.pem,privkey.pem}`.
+- The state-directory contents: `all.db` (+ `-wal`/`-shm`), `dkim_keys/example.org_default.{key,dns}`, and `messages/<blobs>`.
+- The standalone Go DKIM-verifier module (only its output, `dkim_verify_output.txt`, is preserved below).
+- All SQLite databases — so the two test accounts (`user1@example.org`, `user2@example.org`) no longer exist anywhere; they lived only inside the now-removed databases.
+
+**Preserved outside the repository** (in `/tmp/maddy_evidence/`, retained for audit; entirely outside the source tree, does not affect source-tree integrity): the captured evidence set this report was authored from and quotes verbatim throughout —
+
+- configuration copies `maddy.conf.used` and `maddy_probe.conf`;
+- the `-debug` server logs `server_canonical.log`, `server_canonical_restart.log`, `server_probe.log`;
+- the SMTP client transcripts `client_out.txt`, `probe_client_out.txt`;
+- the raw stored messages and dumps `signed_msg_UID1.raw`, `unsigned_msg_UID2.raw`, `dump_UID1_signed.txt`, `dump_UID2_unsigned.txt`, `probe_signed_dump.txt`;
+- the published DKIM key `example.org_default.dns` and the DKIM byte-verification output `dkim_verify_output.txt`;
+- the `maddyctl` account-setup transcript `maddyctl_setup_output.txt` (§1.7);
+- the version banner `version_banner.txt`;
+- the Python SMTPS client scripts `smtp_client.py`, `probe_client.py`.
+
+Every value in that evidence set is reproduced inline in this document, so the report remains self-contained even independently of the preserved directory. No runtime artifact was ever placed inside the source repository.
 
 
 ---
