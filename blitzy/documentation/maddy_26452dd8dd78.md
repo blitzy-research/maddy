@@ -1738,7 +1738,7 @@ Consolidating the captures above, the message that left as envelope **B** was at
 | # | Artifact / decision point | Identity trusted | Observed value (mismatch scenario) | Source anchor |
 |---|---------------------------|------------------|-------------------------------------|---------------|
 | 1 | Acceptance log `username` field | **A** (auth) | `"username":"usera@localhost"` beside `"sender":"userb@localhost"` | [internal/endpoint/smtp/smtp.go:L133] |
-| 2 | `{auth_user}` external-check placeholder | **A** (auth) | `authuser=[usera@localhost]` | [internal/check/command/command.go:L149] |
+| 2 | `{auth_user}` external-check placeholder | **A** (auth) | `authuser=[usera@localhost]` | [internal/check/command/command.go:L145-L149] |
 | 3 | DKIM signer (`require_sender_match` `auth`) | **A** (compared) | declines: `auth_id":"usera@localhost","from_addr":"userb@localhost"` | [internal/modify/dkim/dkim.go:L299-L309] |
 | 4 | Downstream SASL credential relay (`auth forward`) | **A** (auth) | `decoded=b'\x00usera@localhost\x00password123'` | [internal/target/smtp_downstream/sasl.go:L41] |
 | 5 | `Received` header | **B** (envelope) | `Received: by localhost (envelope-sender <userb@localhost>)` | [internal/target/received.go:L69] |
@@ -1949,7 +1949,7 @@ if [ "$acct" = "usera" ] && [ "$pass" = "password123" ]; then exit 0; fi
 if [ "$acct" = "userb" ] && [ "$pass" = "password456" ]; then exit 0; fi
 exit 1
 ```
-**`/tmp/maddy-scratch/echo_authuser.sh`** (captures the `{auth_user}` placeholder value that maddy passes to an external check [internal/check/command/command.go:L149]):
+**`/tmp/maddy-scratch/echo_authuser.sh`** (captures the `{auth_user}` placeholder value that maddy passes to an external check [internal/check/command/command.go:L145-L149]):
 ```text
 #!/bin/sh
 # Records the {auth_user} value maddy expands and passes as argv[1].
@@ -2308,15 +2308,22 @@ echo "[cell $tag done] msgids=$msgids"
 ```
 ### 8.5 Cleanup and final repository state
 
-After capturing all evidence, the scratch instance and all scaffolding are removed and the repository is confirmed unchanged apart from this one document:
+After capturing all evidence, the two scratch processes are stopped by their captured PIDs and every piece of non-repository scaffolding is removed:
 ```text
 # stop the two processes we started, by their captured PIDs only
 kill "$(cat /tmp/maddy-scratch/maddy.pid)" "$(cat /tmp/maddy-scratch/sink.pid)"
 # remove all non-repository scaffolding
 rm -rf /tmp/maddy-scratch /tmp/maddy-bin /tmp/docgen
-# confirm the tracked tree is byte-for-byte unchanged except the new answer document
-git -C <repo> status --porcelain
-#   ?? blitzy/documentation/maddy_26452dd8dd78.md   (the only change; go.mod/go.sum untouched)
 ```
-The only repository artifact produced by this task is `blitzy/documentation/maddy_26452dd8dd78.md`. No existing source file, build file, dependency manifest, or the tracked `maddy.conf` was modified; the `blitzy/documentation/` directory was created to hold this file. (The sibling `blitzy/screen_recordings/` and `blitzy/screenshots/` directories are platform-generated and left as-is.) Only the `maddy` repository under review was analysed; the platform's own `/app` directory and tooling were never inspected or documented. The read-only scope holds byte-for-byte: `go.mod`/`go.sum` are untouched, no `internal/**` or `cmd/**` source changed, and the sole tracked addition is this answer document.
+
+The tracked tree is then confirmed byte-for-byte unchanged except for this one new document. The exact commands and their actual output, run from the repository root once the answer document is committed, are:
+```text
+$ cd /tmp/blitzy/maddy/blitzy-5c5d936c-7380-4e39-a8ba-1b06ae7d82ae_43efb6
+$ git status --porcelain
+$ git diff --name-status 26452dd8dd787dc455278b0fdd296f4a5432c768..HEAD
+A	blitzy/documentation/maddy_26452dd8dd78.md
+$ git diff --name-only 26452dd8dd787dc455278b0fdd296f4a5432c768..HEAD -- go.mod go.sum
+$
+```
+`git status --porcelain` prints nothing — the working tree is clean. `git diff --name-status` against the pre-task base commit `26452dd8dd787dc455278b0fdd296f4a5432c768` shows exactly one added path, `A	blitzy/documentation/maddy_26452dd8dd78.md`, and `git diff --name-only … -- go.mod go.sum` prints nothing, confirming the dependency manifests were never touched. The only repository artifact produced by this task is `blitzy/documentation/maddy_26452dd8dd78.md`. No existing source file, build file, dependency manifest, or the tracked `maddy.conf` was modified; the `blitzy/documentation/` directory was created to hold this file. (The sibling `blitzy/screen_recordings/` and `blitzy/screenshots/` directories are platform-generated and left as-is.) Only the `maddy` repository under review was analysed; the platform's own `/app` directory and tooling were never inspected or documented. The read-only scope holds byte-for-byte: `go.mod`/`go.sum` are untouched, no `internal/**` or `cmd/**` source changed, and the sole tracked addition is this answer document.
 
