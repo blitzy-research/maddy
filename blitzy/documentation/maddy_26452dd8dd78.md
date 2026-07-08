@@ -297,7 +297,7 @@ Provenance of the fields: `msg_id` is auto-added by the queue's per-delivery log
 
 ### Mechanism — the backoff is hardcoded (not configurable)
 
-The inter-attempt delay is `nextTryTime = LastAttempt + initialRetryTime × retryTimeScale^(TriesCount−1)`, computed at [queue.go:L414], with `initialRetryTime = 15 * time.Minute` [queue.go:L185] and `retryTimeScale = 2` [queue.go:L186] set in `NewQueue()`. **These two values are not config directives** — they are fixed in code. The only queue directives are `max_tries` (default `8` [queue.go:L204]; `maddy.conf:L125`) and `max_parallelism` (default `16` [queue.go:L205]; `maddy.conf:L128`). The retry counter is advanced by `meta.TriesCount++` [queue.go:L407].
+The inter-attempt delay is `nextTryTime = time.Now() + initialRetryTime × retryTimeScale^(TriesCount−1)` — the base term is a fresh `time.Now()` captured at reschedule [queue.go:L413] (not the earlier `meta.LastAttempt`), and the exponential term is added at [queue.go:L414], with `initialRetryTime = 15 * time.Minute` [queue.go:L185] and `retryTimeScale = 2` [queue.go:L186] set in `NewQueue()`. **These two values are not config directives** — they are fixed in code. The only queue directives are `max_tries` (default `8` [queue.go:L204]; `maddy.conf:L125`) and `max_parallelism` (default `16` [queue.go:L205]; `maddy.conf:L128`). The retry counter is advanced by `meta.TriesCount++` [queue.go:L407].
 
 ### Mechanism — failure classification is stage-dependent (pivotal; explains `remote` vs `smtp_downstream`)
 
@@ -575,6 +575,7 @@ Every anchor cited above, grouped by file. Line numbers are for branch `maddy_26
 - L401 — `q.emitDSN(meta, header)` (terminal bounce call)
 - L403 — `q.removeFromDisk(meta.MsgMeta)` (terminal removal call)
 - L407 — `meta.TriesCount++`
+- L413 — `nextTryTime := time.Now()` (fresh reschedule base for the backoff — not `meta.LastAttempt`)
 - L414 — `nextTryTime = nextTryTime.Add(q.initialRetryTime * time.Duration(math.Pow(q.retryTimeScale, float64(meta.TriesCount-1))))` (backoff)
 - L415-L418 — `dl.Msg("will retry", "attempts_count", ..., "next_try_delay", ..., "rcpts", ...)`
 - L420 — `q.wheel.Add(nextTryTime, queueSlot{...})`
@@ -584,6 +585,9 @@ Every anchor cited above, grouped by file. Line numbers are for branch `maddy_26
 - L446, L450 — `q.Target.Start()` failure → `perr.Failed = append(perr.Failed, meta.To...)` (Start-stage = permanent, no temporariness check)
 - L462 — `if exterrors.IsTemporaryOrUnspec(err)` (AddRcpt-stage classification)
 - L484-L488 — Body/Commit-stage classification via `IsTemporaryOrUnspec()`
+- L526 — `dl.Debugf("delivery.Commit failed: %v", err)` (commit-error debug log, inside the `if err := delivery.Commit(bodyCtx)` block)
+- L529 — `dl.Debugf("delivery.Commit OK")` (logged **unconditionally**, regardless of the commit error above)
+- L594-L595 — `FirstAttempt: time.Now()` / `LastAttempt: time.Now()` (two separate `time.Now()` calls in the `QueueMetadata` struct at enqueue)
 - L600 — `func (q *Queue) removeFromDisk(...)`
 - L607 — `headerPath := filepath.Join(q.location, id+".header")`
 - L611 — `bodyPath := filepath.Join(q.location, id+".body")`
@@ -607,6 +611,7 @@ Every anchor cited above, grouped by file. Line numbers are for branch `maddy_26
 
 **`internal/target/remote/connect.go`**
 - L113 — `func (rd *remoteDelivery) connectionForDomain(...)`
+- L202-L213 — "No usable MXs, last err: …" wrapper returned when no candidate connected: `Code: exterrors.SMTPCode(err, 451, 550)`, `EnhancedCode: exterrors.SMTPEnchCode(err, {0,4,0})`, `Message: "No usable MXs, last err: …"`, `TargetName: "remote"` (→ observed `550` permanent when the last error is not `Temporary()`)
 - L247 — `records, err = rd.rt.resolver.LookupMX(ctx, domain)`
 - L250-L258 — MX-lookup error wrapped as `SMTPError{Code: SMTPCode(err,451,554), EnhancedCode: {0,4,4}, Message: "MX lookup error", TargetName: "remote"}`
 - L266-L271 — fallback to A/AAAA record when no MX records are present
@@ -625,6 +630,10 @@ Every anchor cited above, grouped by file. Line numbers are for branch `maddy_26
 **`internal/exterrors/temporary.go`**
 - L15-L21 — `func IsTemporaryOrUnspec(err error) bool` — returns `true` by default (L20) when no `Temporary()` method
 - L25-L31 — `func IsTemporary(err error) bool` — returns `false` by default (L30)
+
+**`internal/exterrors/smtp.go`**
+- L95-L97 — `func (se *SMTPError) Temporary() bool { return se.Code/100 == 4 }` (a 4xx SMTP code is temporary; a 5xx is permanent)
+- L112-L118 — `func SMTPCode(err error, temporaryCode, permanentCode int) int` — returns `temporaryCode` iff `IsTemporary(err)`, else `permanentCode`
 
 **`maddy.go`**
 - L41 — `Version = "unknown (built from source tree)"`
