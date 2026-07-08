@@ -73,7 +73,34 @@ queue q_a {
 
 **Why a temporary `451` rejection drives the retry path (pivotal; reused in Q2 and Q5).** maddy's failure classification is *stage-dependent* — whether a failure is retried depends on which delivery stage surfaced it, not merely on the error type (full mechanism and proof in Q2). The fake downstream therefore returns a temporary `451` at the **DATA** stage, which maddy classifies as temporary and consequently **retries** — reliably producing the queue files and retry logs the questions ask about.
 
-**Queue inspection is filesystem-based.** The `maddyctl` companion binary has **no queue subcommand**, so the Q3/Q4 evidence is gathered by directly listing and parsing the queue directory's `.header`/`.body`/`.meta` files.
+**Queue inspection is filesystem-based.** The `maddyctl` companion binary has **no queue subcommand**, so the Q3/Q4 evidence is gathered by directly listing and parsing the queue directory's `.header`/`.body`/`.meta` files. Proven by enumerating its subcommands and grepping for a queue command:
+
+```
+$ /tmp/maddywork/maddyctl --help
+NAME:
+   maddyctl - maddy mail server administration utility
+
+USAGE:
+   maddyctl [global options] command [command options] [arguments...]
+
+VERSION:
+   unknown (built from source tree)
+
+COMMANDS:
+   users        User accounts management
+   imap-mboxes  IMAP mailboxes (folders) management
+   imap-msgs    IMAP messages management
+   help, h      Shows a list of commands or help for one command
+
+GLOBAL OPTIONS:
+   --config value  Configuration file to use (default: "/etc/maddy/maddy.conf") [$MADDY_CONFIG]
+   --help, -h      show help
+   --version, -v   print the version
+$ /tmp/maddywork/maddyctl --help 2>&1 | grep -i queue ; echo "exit=$?"
+exit=1
+```
+
+The complete `COMMANDS` list contains only `users`, `imap-mboxes`, `imap-msgs`, and `help` — there is no `queue` command — and grepping the help output for `queue` matches nothing (`grep` exit status `1`). Hence queue inspection for Q3/Q4 is necessarily filesystem-based.
 
 **Read-only guarantee.** After all reproductions, `git status --porcelain` returned empty (0 lines) on branch `maddy_26452dd8dd78`: the source tree was left byte-for-byte unchanged. Every binary, config, fake-server script, queue directory, and log capture lived under `/tmp/maddywork` and `/tmp/maddyrun`, never inside the repository.
 
@@ -95,44 +122,53 @@ The named code path:
 - **Into the queue** — `internal/target/queue/queue.go`. Delivery is scheduled through `dispatch()` [queue.go:L275]; the delivery goroutine acquires the concurrency semaphore with `q.deliverySemaphore <- struct{}{}` [queue.go:L283]; the attempt is performed by `tryDelivery()` [queue.go:L365] / `deliver()` [queue.go:L431]. The per-attempt debug line `dl.Debugf("delivery attempt #%d", meta.TriesCount+1)` [queue.go:L367] uses `TriesCount+1`, and the per-attempt delivery ID is built as `msgMeta.ID = msgMeta.ID + "-" + strconv.Itoa(meta.TriesCount+1)` [queue.go:L439] and logged at [queue.go:L440] — hence the `-<TriesCount+1>` suffix.
 - **Out through a delivery target** — the default `internal/target/remote/remote.go` (MX resolution + connect: `AddRcpt()` [remote.go:L195] → `connectionForDomain()` [remote.go:L230 → connect.go:L113], SMTP port `"25"` [remote.go:L41]); or `internal/target/smtp_downstream/smtp_downstream.go` in the reproduction.
 
-**Evidence — full ordered `-debug` trace.** A message `sender@src.local → user@dest.local` was submitted over SMTP to the loopback endpoint; the downstream returns `451` at DATA. Command:
+**Evidence — full ordered `-debug` trace.** A message `sender@src.local → user@dest.local` was submitted over SMTP to the loopback endpoint (instance A, submission port `15525`); the downstream returns `451` at DATA. Exact commands (the maddy run whose `-debug` stderr is shown, and the submission):
 
 ```
-python3 submit.py 127.0.0.1 15525 sender@src.local user@dest.local   # sends via smtplib to the maddy SMTP endpoint
+$ /tmp/maddywork/maddy -config /tmp/maddyrun/maddyA.conf -debug     # process under test; its stderr is shown below
+$ python3 /tmp/maddyrun/submit.py 127.0.0.1 15525 sender@src.local user@dest.local
+SUBMIT wall=05:36:31.521889 epoch=1783488991.521888 -> 127.0.0.1:15525 sender@src.local -> user@dest.local
+EHLO -> 250
+sendmail returned (empty=accepted): {}
+DONE epoch=1783488991.569109
 ```
 
-Captured output (message `9f32a40e`):
+Captured maddy `-debug` output (message `aff956e1`; these are maddy's own stderr lines — at this verbosity maddy prints no per-line timestamp — shown from ingress through the pipeline hand-off and the first queue delivery attempt; the two retry log lines that follow this span are shown under Q2(c)):
 
 ```
-smtp: incoming message	{"msg_id":"9f32a40e","sender":"sender@src.local","src_host":"client.local","src_ip":"127.0.0.1:32810"}
-[debug] smtp/pipeline: sender sender@src.local matched by default rule	{"msg_id":"9f32a40e"}
-[debug] smtp/pipeline: global rcpt modifiers: user@dest.local => user@dest.local	{"msg_id":"9f32a40e"}
-[debug] smtp/pipeline: per-source rcpt modifiers: user@dest.local => user@dest.local	{"msg_id":"9f32a40e"}
-[debug] smtp/pipeline: recipient user@dest.local matched by default rule (clean = user@dest.local)	{"msg_id":"9f32a40e"}
-[debug] smtp/pipeline: per-rcpt modifiers: user@dest.local => user@dest.local	{"msg_id":"9f32a40e"}
-[debug] smtp/pipeline: tgt.Start(sender@src.local) ok, target = queue:q_a	{"msg_id":"9f32a40e"}
-smtp: RCPT ok	{"msg_id":"9f32a40e","rcpt":"user@dest.local"}
-[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"9f32a40e"}
-smtp: accepted	{"msg_id":"9f32a40e"}
-[debug] queue: starting delivery for 9f32a40e	
-[debug] queue: waiting on delivery semaphore for 9f32a40e	
-[debug] queue: delivery semaphore acquired for 9f32a40e	
-[debug] queue: delivery attempt #1	{"msg_id":"9f32a40e"}
-[debug] queue: using message ID = 9f32a40e-1	{"msg_id":"9f32a40e"}
-[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"9f32a40e-1"}
-[debug] smtp_downstream: connected	{"msg_id":"9f32a40e-1","remote_server":"127.0.0.1"}
-[debug] queue: target.Start OK	{"msg_id":"9f32a40e"}
-[debug] queue: delivery.AddRcpt user@dest.local OK	{"msg_id":"9f32a40e"}
-[debug] queue: delivery.Body OK	{"msg_id":"9f32a40e"}
-[debug] queue: delivery.Commit failed: temporary failure, try again later	{"msg_id":"9f32a40e"}
-[debug] queue: failures: permanently: [], temporary: [user@dest.local], errors: map[user@dest.local:temporary failure, try again later]	{"msg_id":"9f32a40e"}
+smtp: incoming message	{"msg_id":"aff956e1","sender":"sender@src.local","src_host":"client.local","src_ip":"127.0.0.1:35116"}
+[debug] smtp/pipeline: sender sender@src.local matched by default rule	{"msg_id":"aff956e1"}
+[debug] smtp/pipeline: global rcpt modifiers: user@dest.local => user@dest.local	{"msg_id":"aff956e1"}
+[debug] smtp/pipeline: per-source rcpt modifiers: user@dest.local => user@dest.local	{"msg_id":"aff956e1"}
+[debug] smtp/pipeline: recipient user@dest.local matched by default rule (clean = user@dest.local)	{"msg_id":"aff956e1"}
+[debug] smtp/pipeline: per-rcpt modifiers: user@dest.local => user@dest.local	{"msg_id":"aff956e1"}
+[debug] smtp/pipeline: tgt.Start(sender@src.local) ok, target = queue:q_a	{"msg_id":"aff956e1"}
+smtp: RCPT ok	{"msg_id":"aff956e1","rcpt":"user@dest.local"}
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"aff956e1"}
+smtp: accepted	{"msg_id":"aff956e1"}
+[debug] smtp: reset	
+[debug] queue: starting delivery for aff956e1	
+[debug] queue: waiting on delivery semaphore for aff956e1	
+[debug] queue: delivery semaphore acquired for aff956e1	
+[debug] queue: delivery attempt #1	{"msg_id":"aff956e1"}
+[debug] queue: using message ID = aff956e1-1	{"msg_id":"aff956e1"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"aff956e1-1"}
+[debug] smtp_downstream: connected	{"msg_id":"aff956e1-1","remote_server":"127.0.0.1"}
+[debug] queue: target.Start OK	{"msg_id":"aff956e1"}
+[debug] queue: delivery.AddRcpt user@dest.local OK	{"msg_id":"aff956e1"}
+[debug] queue: delivery.Body OK	{"msg_id":"aff956e1"}
+[debug] queue: delivery.Commit failed: temporary failure, try again later	{"msg_id":"aff956e1"}
+[debug] queue: delivery.Commit OK	{"msg_id":"aff956e1"}
+[debug] queue: failures: permanently: [], temporary: [user@dest.local], errors: map[user@dest.local:temporary failure, try again later]	{"msg_id":"aff956e1"}
 ```
+
 
 **Cause → effect.**
 
-- The `msg_id` is `9f32a40e` — an **8-character lowercase hex** string, exactly as produced by `GenerateMsgID()` [msgid.go:L12] (4 random bytes → 8 hex digits).
-- The ordered lines map 1:1 onto the code path: `incoming message` (ingress, [smtp.go:L128]) → the four `smtp/pipeline:` lines (source rule, global/per-source rcpt modifiers, recipient rule, per-rcpt modifiers — i.e., `srcBlockForAddr()` [msgpipeline.go:L155] and `rcptBlockForAddr()` [msgpipeline.go:L446] plus the modifier chains) → `tgt.Start(...) ok, target = queue:q_a` (routing resolved the target to the queue) → `RCPT ok` [smtp.go:L243] → `accepted` [smtp.go:L334] → the `queue:` lines: `waiting on delivery semaphore` / `delivery semaphore acquired` (the semaphore send `q.deliverySemaphore <- struct{}{}` [queue.go:L283]) and `delivery attempt #1` [queue.go:L367].
-- The per-attempt delivery ID **`9f32a40e-1`** (`using message ID = 9f32a40e-1`) is `<msg_id>-<TriesCount+1>`; on the first attempt `TriesCount = 0`, so the suffix is `-1`. This matches the construction at [queue.go:L439] and its log at [queue.go:L440].
+- The `msg_id` is `aff956e1` — an **8-character lowercase hex** string, exactly as produced by `GenerateMsgID()` [msgid.go:L12] (4 random bytes → 8 hex digits).
+- The ordered lines map 1:1 onto the code path: `incoming message` (ingress, [smtp.go:L128]) → the four `smtp/pipeline:` lines (source rule, global/per-source rcpt modifiers, recipient rule, per-rcpt modifiers — i.e., `srcBlockForAddr()` [msgpipeline.go:L155] and `rcptBlockForAddr()` [msgpipeline.go:L446] plus the modifier chains) → `tgt.Start(...) ok, target = queue:q_a` (routing resolved the target to the queue) → `RCPT ok` [smtp.go:L243] → `accepted` [smtp.go:L334] → `smtp: reset` (the endpoint resets the SMTP transaction after handing the message off) → the `queue:` lines: `waiting on delivery semaphore` / `delivery semaphore acquired` (the semaphore send `q.deliverySemaphore <- struct{}{}` [queue.go:L283]) and `delivery attempt #1` [queue.go:L367].
+- The per-attempt delivery ID **`aff956e1-1`** (`using message ID = aff956e1-1`) is `<msg_id>-<TriesCount+1>`; on the first attempt `TriesCount = 0`, so the suffix is `-1`. This matches the construction at [queue.go:L439] and its log at [queue.go:L440].
+- The two consecutive `delivery.Commit failed: …` and `delivery.Commit OK` lines are both real and are emitted by design: the queue logs the commit error at [queue.go:L526] and then **unconditionally** logs `delivery.Commit OK` at [queue.go:L529] regardless of the error. The authoritative failure signal is the following `failures: … temporary: [user@dest.local]` line; the message is therefore kept and retried (see Q2).
 
 ---
 
@@ -158,62 +194,98 @@ Three failure modes were measured:
 
 | Failure mode | Reproduction | Observed per-attempt duration |
 |---|---|---|
-| Connection refused | `smtp_downstream` → closed port `127.0.0.1:15546` | **~4 ms** (near-instant) |
-| Black-hole (SYN dropped) | `smtp_downstream` → `192.0.2.1:25` (TEST-NET-1) | **136.00 s / 135.96 s** across two runs |
-| Accept-but-silent (no banner) | `smtp_downstream` → server that accepts TCP but never sends `220` | **Indefinite hang** (no failure after 91 s) |
+| Connection refused | `smtp_downstream` → closed port `127.0.0.1:15599` | **~12 ms** (near-instant) |
+| Black-hole (SYN dropped) | `smtp_downstream` → `192.0.2.1:25` (TEST-NET-1) | **133.2546 s / 133.2540 s** across two runs (spread 0.0006 s) |
+| Accept-but-silent (no banner) | `smtp_downstream` → server that accepts TCP but never sends `220` | **Indefinite hang** (no failure after 522 s — see below) |
 
-**Connection refused** (message `d69f4329`; note the near-instant delta `...246.351518381` → `...246.355522913`, ≈ 4 ms):
+**Connection refused** (message `13a8ce17`; `smtp_downstream` → closed port `127.0.0.1:15599`; submission port `15555`). Commands (submission through the real SMTP endpoint, then the queue-directory listing that proves the message was *not* persisted):
 
 ```
-1783480246.351518381 [debug] queue: delivery attempt #1	{"msg_id":"d69f4329"}
-1783480246.354563155 [debug] queue: failures: permanently: [refused@dest.local], temporary: [], errors: map[refused@dest.local:dial tcp 127.0.0.1:15546: connect: connection refused]	{"msg_id":"d69f4329"}
-1783480246.355522913 queue: delivery attempt failed	{"io_op":"dial","msg_id":"d69f4329","rcpt":"refused@dest.local","reason":"dial tcp 127.0.0.1:15546: connect: connection refused","remote_addr":"127.0.0.1:15546","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error","target":"smtp_downstream"}
-1783480246.356508851 queue: not delivered, permanent error	{"msg_id":"d69f4329","rcpt":"refused@dest.local"}
+$ python3 /tmp/maddyrun/submit.py 127.0.0.1 15555 sender@src.local refused@dest.local
+$ ls -la /tmp/maddyrun/stateRef/q_r/ ; echo "file-count=$(ls -1 /tmp/maddyrun/stateRef/q_r/ | wc -l)"
+total 8
+drwxr-xr-x 2 root root 4096 Jul  8 05:40 .
+drwxr-xr-x 3 root root 4096 Jul  8 05:40 ..
+file-count=0
+```
+
+Captured maddy output (epoch-prefixed by the wrapper; note the near-instant delta `…245.369888100` → `…245.381770239`, ≈ **12 ms**):
+
+```
+1783489245.369888100 [debug] queue: delivery attempt #1	{"msg_id":"13a8ce17"}
+1783489245.378809284 [debug] queue: failures: permanently: [refused@dest.local], temporary: [], errors: map[refused@dest.local:dial tcp 127.0.0.1:15599: connect: connection refused]	{"msg_id":"13a8ce17"}
+1783489245.381770239 queue: delivery attempt failed	{"io_op":"dial","msg_id":"13a8ce17","rcpt":"refused@dest.local","reason":"dial tcp 127.0.0.1:15599: connect: connection refused","remote_addr":"127.0.0.1:15599","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error","target":"smtp_downstream"}
+1783489245.384828084 queue: not delivered, permanent error	{"msg_id":"13a8ce17","rcpt":"refused@dest.local"}
 ```
 
 A refused connection returns immediately (the kernel replies with a TCP RST), so the attempt is near-instant — no timeout is involved. (This run also demonstrates the stage-dependent classification discussed below: through `smtp_downstream` a connection failure is permanent, hence `not delivered, permanent error`.)
 
-**Black-hole (SYN silently dropped)** — two runs (messages `86bf7e7b` and `94dabce0`), reason `connection timed out`:
+**Black-hole (SYN silently dropped)** — two runs submitted simultaneously (message `a9717efa` on submission port `15605`, message `18a8dbdf` on `15615`; both `smtp_downstream` → `192.0.2.1:25`), reason `connection timed out`. Command (both instances launched detached with the epoch-timestamp wrapper; then one message submitted to each):
 
 ```
-# run 1 (BH1)
-1783480229.410185709 [debug] queue: delivery attempt #1	{"msg_id":"86bf7e7b"}
-1783480365.414867731 queue: delivery attempt failed	{"io_op":"dial","msg_id":"86bf7e7b","rcpt":"bh1@dest.local","reason":"dial tcp 192.0.2.1:25: connect: connection timed out","remote_addr":"192.0.2.1:25","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error","target":"smtp_downstream"}
-# run 2 (BH2)
-1783480229.458046716 [debug] queue: delivery attempt #1	{"msg_id":"94dabce0"}
-1783480365.414814558 queue: delivery attempt failed	{"io_op":"dial","msg_id":"94dabce0","rcpt":"bh2@dest.local",...,"reason":"dial tcp 192.0.2.1:25: connect: connection timed out",...}
+$ python3 /tmp/maddyrun/submit.py 127.0.0.1 15605 sender@src.local bh1@dest.local   # BH1
+$ python3 /tmp/maddyrun/submit.py 127.0.0.1 15615 sender@src.local bh2@dest.local   # BH2
 ```
 
-Durations: run 1 = 1783480365.414867731 − 1783480229.410185709 = **136.004682 s**; run 2 = 1783480365.414814558 − 1783480229.458046716 = **135.956768 s**; the spread is 0.0479 s → **stable across 2 runs**. Mechanism (concrete, not environmental hand-waving): the host's SYN-retransmit budget was observed as
+Captured output (complete, both runs):
+
+```
+# run 1 (BH1) — message a9717efa
+1783489804.430267452 [debug] queue: delivery attempt #1	{"msg_id":"a9717efa"}
+1783489937.684827785 queue: delivery attempt failed	{"io_op":"dial","msg_id":"a9717efa","rcpt":"bh1@dest.local","reason":"dial tcp 192.0.2.1:25: connect: connection timed out","remote_addr":"192.0.2.1:25","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error","target":"smtp_downstream"}
+# run 2 (BH2) — message 18a8dbdf
+1783489804.430850132 [debug] queue: delivery attempt #1	{"msg_id":"18a8dbdf"}
+1783489937.684858306 queue: delivery attempt failed	{"io_op":"dial","msg_id":"18a8dbdf","rcpt":"bh2@dest.local","reason":"dial tcp 192.0.2.1:25: connect: connection timed out","remote_addr":"192.0.2.1:25","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error","target":"smtp_downstream"}
+```
+
+Durations: run 1 = 1783489937.684827785 − 1783489804.430267452 = **133.254560 s**; run 2 = 1783489937.684858306 − 1783489804.430850132 = **133.254008 s**; the spread is **0.000552 s** → **stable across 2 runs**. Mechanism (concrete, not environmental hand-waving): the host's SYN-retransmit budget was observed as
 
 ```
 $ cat /proc/sys/net/ipv4/tcp_syn_retries
 6
 ```
 
-so for a SYN that is never answered the kernel sends the initial SYN plus 6 retransmits with exponentially increasing gaps (≈ 1 + 2 + 4 + 8 + 16 + 32 + 64 ≈ 127 s) plus a final RTO before returning `ETIMEDOUT` — ≈ 136 s here. Because maddy imposes no dial timeout, this kernel-governed value *is* the per-attempt duration. (The AAP referenced ≈ 133 s on a different host; the value reported here is the one observed on this host, ≈ 136 s, tied to `tcp_syn_retries = 6`.)
+so for a SYN that is never answered the kernel sends the initial SYN plus 6 retransmits with exponentially increasing gaps (≈ 1 + 2 + 4 + 8 + 16 + 32 + 64 ≈ 127 s) plus a final RTO before returning `ETIMEDOUT` — ≈ 133 s here. Because maddy imposes no dial timeout, this kernel-governed value *is* the per-attempt duration. (This matches the ≈ 133 s figure referenced in the AAP, and is tied directly to `tcp_syn_retries = 6` on this host.)
 
-**Accept-but-silent (no banner)** — the destination completes the TCP handshake but never sends the `220` greeting (message `038a825e`). After submit, exactly one line appears and then nothing:
-
-```
-1783480279.534689114 [debug] queue: delivery attempt #1	{"msg_id":"038a825e"}
-```
-
-After **91.3 s** there was **no** `delivery attempt failed` and **no** `will retry` line — an indefinite hang. The fake server logged exactly one accepted connection and received no commands:
+**Accept-but-silent (no banner)** — the destination completes the TCP handshake but never sends the `220` greeting (message `3b3fae59`; submission port `15701`, silent downstream port `15700`). Command:
 
 ```
-[fake_smtp mode=silent port=15566] ... ACCEPTED connection #1 from ('127.0.0.1', 40050)
+$ python3 /tmp/maddyrun/submit.py 127.0.0.1 15701 sender@src.local silent2@dest.local
+```
+
+After submit, exactly these two `-debug` lines appear (message accepted into the queue, attempt #1 begins) and then **nothing further**:
+
+```
+[debug] queue: delivery attempt #1	{"msg_id":"3b3fae59"}
+[debug] queue: using message ID = 3b3fae59-1	{"msg_id":"3b3fae59"}
+```
+
+The fake server logged exactly one accepted connection (and received no SMTP commands); its complete log:
+
+```
+$ cat /tmp/maddyrun/logs/fakeSilentF.log
+[fake_smtp mode=silent port=15700] mono=1315731.942816 wall=06:07:32.085714 LISTENING
+[fake_smtp mode=silent port=15700] mono=1315735.005424 wall=06:07:35.148320 ACCEPTED connection #1 from ('127.0.0.1', 49888)
+```
+
+Confirming the hang was open-ended, after **522 s** (submit at wall `06:07:35`, re-checked at `06:16:17`) there was still **no** `delivery attempt failed` and **no** `will retry` line — the process (`maddy -config /tmp/maddyrun/maddySilentF.conf -debug`) was still blocked:
+
+```
+$ python3 -c "print('%.0f s' % ($(date +%s.%N) - 1783490855.081750123))"
+522 s
+$ grep -c -E 'delivery attempt failed|will retry|not delivered' /tmp/maddyrun/logs/maddySilentF.log
+0
 ```
 
 TCP connect succeeded, but maddy then blocks inside `smtp.NewClient` reading the `220` greeting that never arrives [smtpconn.go:L165]; with no read deadline set anywhere, the attempt hangs forever. Tellingly, the `[debug] smtp_downstream: connected` line that appears for a working downstream (seen in the Q1 trace, emitted at [smtp_downstream.go:L170]) is **absent** here — confirming the block is *before* client creation completes, i.e., in the greeting read.
 
 ### (c) The retry log entries (all fields)
 
-A failed **temporary** attempt emits two default-level lines. From the `451` reproduction (message `9f32a40e`; submit as in Q1, downstream returns `451 4.3.0` at DATA):
+A failed **temporary** attempt emits two default-level lines (they appear even without `-debug`). From the `451` reproduction — the **same instance-A run as Q1**, message `aff956e1`, produced by the submission shown in Q1 (`python3 /tmp/maddyrun/submit.py 127.0.0.1 15525 sender@src.local user@dest.local`), the downstream returning `451 4.3.0` at DATA:
 
 ```
-queue: delivery attempt failed	{"msg_id":"9f32a40e","rcpt":"user@dest.local","reason":"temporary failure, try again later","remote_server":"127.0.0.1","smtp_code":451,"smtp_enchcode":"4.3.0","smtp_msg":"temporary failure, try again later","target":"smtp_downstream"}
-queue: will retry	{"attempts_count":1,"msg_id":"9f32a40e","next_try_delay":"14m59.99999921s","rcpts":["user@dest.local"]}
+queue: delivery attempt failed	{"msg_id":"aff956e1","rcpt":"user@dest.local","reason":"temporary failure, try again later","remote_server":"127.0.0.1","smtp_code":451,"smtp_enchcode":"4.3.0","smtp_msg":"temporary failure, try again later","target":"smtp_downstream"}
+queue: will retry	{"attempts_count":1,"msg_id":"aff956e1","next_try_delay":"14m59.999999279s","rcpts":["user@dest.local"]}
 ```
 
 Fields, enumerated explicitly:
@@ -236,44 +308,70 @@ This is the crux of Q2/Q5 and is documented explicitly. Errors are **temporary-b
 
 Consequence, with observed proof:
 
-- **`smtp_downstream` dials eagerly inside `Start()`** — `Start()` [smtp_downstream.go:L130] invokes `d.connect(ctx)` at [smtp_downstream.go:L139] (`connect()` is defined at [smtp_downstream.go:L150]). So a connection failure is a `Start()` failure → **permanent → not retried**. **Observed:** the connection-refused run (message `d69f4329`, in (b) above) logged `queue: not delivered, permanent error` and left the queue directory **empty**, *even though* the wrapped error carried a temporary `smtp_code:450` — proving the outcome is decided by the **stage**, not by the SMTP code. (Black-hole through `smtp_downstream` is likewise permanent.)
-- **`remote` connects lazily inside `AddRcpt()`** — via `connectionForDomain()` [remote.go:L195,L230 → connect.go:L113]. **Observed** (remote target; submit `test@localhost`; message `baee2bd1`):
+- **`smtp_downstream` dials eagerly inside `Start()`** — `Start()` [smtp_downstream.go:L130] invokes `d.connect(ctx)` at [smtp_downstream.go:L139] (`connect()` is defined at [smtp_downstream.go:L150]). So a connection failure is a `Start()` failure → **permanent → not retried**. **Observed:** the connection-refused run (message `13a8ce17`, in (b) above) logged `queue: not delivered, permanent error` and left the queue directory **empty** (`file-count=0`, shown in (b)), *even though* the wrapped error carried an SMTP `smtp_code:450` — proving the outcome is decided by the **stage** (a `Start()` failure), not by the SMTP code. (Black-hole through `smtp_downstream` is likewise a `Start()` failure and therefore permanent.)
+- **`remote` connects lazily inside `AddRcpt()`** — via `connectionForDomain()` [remote.go:L195,L230 → connect.go:L113]. This is proven by two runs against the `remote` target (submission port `15565`; both left the queue **empty** — `find /tmp/maddyrun/stateRem -name '*.meta' | wc -l` = `0`). Commands:
 
   ```
-  [debug] queue: target.Start OK	{"msg_id":"baee2bd1"}
-  [debug] queue: delivery.AddRcpt test@localhost failed: no such host	{"msg_id":"baee2bd1"}
-  [debug] queue: failures: permanently: [test@localhost], temporary: [], errors: map[test@localhost:no such host]	{"msg_id":"baee2bd1"}
-  queue: delivery attempt failed	{"msg_id":"baee2bd1","rcpt":"test@localhost","reason":"no such host","smtp_code":554,"smtp_enchcode":"5.4.4","smtp_msg":"MX lookup error","target":"remote"}
+  $ python3 /tmp/maddyrun/submit.py 127.0.0.1 15565 sender@src.local test@localhost
+  $ python3 /tmp/maddyrun/submit.py 127.0.0.1 15565 sender@src.local user@nxdomain-zzz-test.invalid
   ```
 
-  This proves `remote.Start()` returns OK **without** connecting, and that the resolve/connect work happens in `AddRcpt` (the opposite of `smtp_downstream`). Here the error was an NXDOMAIN MX-lookup failure wrapped as an `SMTPError` with `Code: 554` / enhanced `5.4.4` / `"MX lookup error"` via the lookup-error path in `connect.go` [connect.go:L247,L250-L258]; that wrapper has `Temporary() == false`, so `IsTemporaryOrUnspec()` returned `false` → **permanent**.
-  - **(inferred)** A *bare* dial failure (connection refused or timeout) surfacing at `AddRcpt` carries no `Temporary() == false` SMTP wrapper, so `IsTemporaryOrUnspec()` [queue.go:L462, exterrors/temporary.go:L15] would return `true` → **temporary → retried** via the `remote` target. This specific outcome was not driven at runtime because, offline, the `remote` path's system-resolver MX lookup returns NXDOMAIN for made-up/localhost domains **before** it ever reaches the connect stage, and delivering to a real external MX on port 25 is out of scope; the stage-dependent mechanism itself is fully observed (the two traces above), and only this one bare-connection-refused-via-`remote` result is established by code reading.
+  **Observed** (message `387c62d4`, recipient `test@localhost`):
+
+  ```
+[debug] queue: target.Start OK	{"msg_id":"387c62d4"}
+[debug] queue: delivery.AddRcpt test@localhost failed: dial tcp 127.0.0.1:25: connect: connection refused	{"msg_id":"387c62d4"}
+[debug] queue: failures: permanently: [test@localhost], temporary: [], errors: map[test@localhost:dial tcp 127.0.0.1:25: connect: connection refused]	{"msg_id":"387c62d4"}
+queue: delivery attempt failed	{"domain":"localhost","io_op":"dial","msg_id":"387c62d4","rcpt":"test@localhost","reason":"dial tcp 127.0.0.1:25: connect: connection refused","remote_addr":"127.0.0.1:25","smtp_code":550,"smtp_enchcode":"5.4.0","smtp_msg":"No usable MXs, last err: dial tcp 127.0.0.1:25: connect: connection refused","target":"remote"}
+queue: not delivered, permanent error	{"msg_id":"387c62d4","rcpt":"test@localhost"}
+  ```
+
+  and (message `9b0323c2`, recipient `user@nxdomain-zzz-test.invalid`):
+
+  ```
+[debug] queue: delivery.AddRcpt user@nxdomain-zzz-test.invalid failed: dial tcp: lookup nxdomain-zzz-test.invalid on 34.118.224.10:53: no such host	{"msg_id":"9b0323c2"}
+queue: delivery attempt failed	{"domain":"nxdomain-zzz-test.invalid","io_op":"dial","msg_id":"9b0323c2","rcpt":"user@nxdomain-zzz-test.invalid","reason":"dial tcp: lookup nxdomain-zzz-test.invalid on 34.118.224.10:53: no such host","remote_server":null,"smtp_code":550,"smtp_enchcode":"5.4.0","smtp_msg":"No usable MXs, last err: dial tcp: lookup nxdomain-zzz-test.invalid on 34.118.224.10:53: no such host","target":"remote"}
+  ```
+
+  Both traces prove `remote.Start()` returns OK **without** connecting (`queue: target.Start OK` precedes the failure), and that the resolve/connect work happens lazily in `AddRcpt` — the opposite of `smtp_downstream`. In **both** runs the connect loop exhausted all candidate MXs and `connectionForDomain()` wrapped the last error as an `SMTPError` with `Code: exterrors.SMTPCode(err, 451, 550)` and message `"No usable MXs, last err: …"` [connect.go:L202-L213] — observed as `smtp_code:550`, `smtp_enchcode:5.4.0`. Because `SMTPCode()` uses `IsTemporary()` (permanent-by-default) [exterrors/smtp.go:L112-L118] and neither `connection refused` nor `no such host` reports `Temporary() == true`, the code resolved to **`550`**; and `SMTPError.Temporary()` is `Code/100 == 4` [exterrors/smtp.go:L95-L97], so a `550` is **permanent** → `IsTemporaryOrUnspec()` returned `false` → **not retried** (queue emptied). So through `remote`, a *connection-refused* or *no-such-host* failure is also permanent — reached via `AddRcpt`/the `"No usable MXs"` wrapper rather than `Start()` — the observable difference between the targets being **where** the connection is attempted (`Start` vs `AddRcpt`), proven by the `target.Start OK` line preceding the `remote` failure.
+  - **(inferred)** The distinct **`554` / `5.4.4` / `"MX lookup error"`** wrapper [connect.go:L250-L258] fires **only** when `rd.rt.resolver.LookupMX()` itself returns an error. In both runs above it did **not** fire: `localhost` has an `A` record, so `LookupMX` returned empty-without-error and the A/AAAA fallback [connect.go:L266-L271] supplied the host; and for `nxdomain-zzz-test.invalid` the failure surfaced later, during the dial's own address lookup (reason prefixed `dial tcp: lookup …: no such host`), again not from `LookupMX`. This one `LookupMX`-error path is therefore established by code reading rather than direct observation.
 
 Because of this stage dependence, the reproductions drive the retry/queue-file path with a temporary **`451` DATA-stage rejection** (a `Body`/`Commit`-stage failure → temporary → retried).
 
 ### Attempt #2 physically observed after the full ~15-minute backoff (timing stable across 2 runs)
 
-This wait is mandatory and cannot be simulated. Two independent instances were run with `max_tries 2` (instance A: message `9f32a40e`; instance B: message `c2059df9`); attempt #2 was witnessed in both. The fake server's per-connection timestamps give the true inter-attempt gap:
+This wait is mandatory and cannot be simulated. Two independent instances were run with `max_tries 2` (instance A: message `aff956e1`; instance B: message `9b21a24e`); attempt #2 was witnessed in both. The fake server's per-connection timestamps give the true inter-attempt gap. Commands (the two fake-server logs; each line is the fake downstream's own `mono`/`wall` stamp per accepted connection):
 
 ```
-# Instance A fake server
-... mono=119298.339360 wall=03:07:26 ACCEPTED connection #1 ...
-... mono=120198.342179 wall=03:22:26 ACCEPTED connection #2 ...      # gap = 900.002819 s
-# Instance B fake server
-... mono=119401.520462 wall=03:09:09 ACCEPTED connection #1 ...
-... mono=120301.523539 wall=03:24:09 ACCEPTED connection #2 ...      # gap = 900.003077 s
+$ grep ACCEPTED /tmp/maddyrun/logs/fakeA.log
+$ grep ACCEPTED /tmp/maddyrun/logs/fakeB.log
 ```
 
-And the `next_try_delay` doubling across the two attempts (instance A):
+```
+# Instance A fake server (downstream port 15526)
+[fake_smtp mode=451 port=15526] mono=1313871.426352 wall=05:36:31.569248 ACCEPTED connection #1 from ('127.0.0.1', 55136)
+[fake_smtp mode=451 port=15526] mono=1314771.430281 wall=05:51:31.573176 ACCEPTED connection #2 from ('127.0.0.1', 50720)
+# gap #1->#2 = 1314771.430281 - 1313871.426352 = 900.003929 s
+# Instance B fake server (downstream port 15536)
+[fake_smtp mode=451 port=15536] mono=1313936.337405 wall=05:37:36.480301 ACCEPTED connection #1 from ('127.0.0.1', 38818)
+[fake_smtp mode=451 port=15536] mono=1314836.341808 wall=05:52:36.484704 ACCEPTED connection #2 from ('127.0.0.1', 50920)
+# gap #1->#2 = 1314836.341808 - 1313936.337405 = 900.004403 s
+```
+
+And the `next_try_delay` doubling across the two attempts (instance A). Command:
 
 ```
-[debug] queue: delivery attempt #1	{"msg_id":"9f32a40e"}
-queue: will retry	{"attempts_count":1,"msg_id":"9f32a40e","next_try_delay":"14m59.99999921s","rcpts":["user@dest.local"]}
-[debug] queue: delivery attempt #2	{"msg_id":"9f32a40e"}
-queue: will retry	{"attempts_count":2,"msg_id":"9f32a40e","next_try_delay":"29m59.999998895s","rcpts":["user@dest.local"]}
+$ grep -E 'delivery attempt #|will retry' /tmp/maddyrun/logs/maddyA.log
 ```
 
-Instance B shows the same doubling for stability: `next_try_delay` `14m59.999999082s` → `29m59.999999282s`. Conclusion: the first backoff is **exactly 15 minutes** (gaps `900.002819 s` and `900.003077 s`; spread `0.00026 s`), and `next_try_delay` **doubles** (15 min → 30 min), matching `initialRetryTime = 15 min` and `retryTimeScale = 2` [queue.go:L185-L186,L414]. The **N + 1** schedule follows directly: with `max_tries = 2`, attempts #1, #2, and #3 run, and the terminal check `meta.TriesCount == q.maxTries` [queue.go:L390] fires on attempt #3, triggering `emitDSN()` [queue.go:L849] and removal from disk.
+```
+[debug] queue: delivery attempt #1	{"msg_id":"aff956e1"}
+queue: will retry	{"attempts_count":1,"msg_id":"aff956e1","next_try_delay":"14m59.999999279s","rcpts":["user@dest.local"]}
+[debug] queue: delivery attempt #2	{"msg_id":"aff956e1"}
+queue: will retry	{"attempts_count":2,"msg_id":"aff956e1","next_try_delay":"29m59.999998996s","rcpts":["user@dest.local"]}
+```
+
+Instance B shows the same doubling for stability: `next_try_delay` `14m59.999999423s` → `29m59.999999194s`. Conclusion: the first backoff is **exactly 15 minutes** (gaps `900.003929 s` and `900.004403 s`; spread `0.000474 s`), and `next_try_delay` **doubles** (15 min → 30 min), matching `initialRetryTime = 15 min` and `retryTimeScale = 2` [queue.go:L185-L186,L414]. Attempts #1 and #2 were physically observed for both instances, and after attempt #2 each message remained on disk at `TriesCount:2` scheduled for attempt #3 (see Q4). The **N + 1** schedule then follows from the source: the terminal check `meta.TriesCount == q.maxTries` [queue.go:L390] is evaluated *before* the counter is incremented, so with `max_tries = 2` it fires on attempt #3 (`TriesCount == 2`), triggering `emitDSN()` [queue.go:L849] and removal from disk — i.e., attempts #1, #2, #3 then a bounce.
 
 ---
 
@@ -281,16 +379,20 @@ Instance B shows the same doubling for stability: `next_try_delay` `14m59.999999
 
 **Direct answer.** The queue stores pending messages in a directory computed as `filepath.Join(StateDirectory, queueName)` [queue.go:L229]. With the default `StateDirectory = "/var/lib/maddy"` [maddy.go:L59] and the shipped queue named `remote_queue` [maddy.conf:L122], the canonical location is **`/var/lib/maddy/remote_queue`**. An explicit `location` directive (or the queue block's first positional argument) overrides this.
 
-**Evidence — default resolution proven at runtime.** With **no** `location` directive, `state /tmp/maddyrun/stateQ3`, and a queue named `remote_queue`, maddy auto-created the queue directory at `<state>/remote_queue`:
+**Evidence — default resolution proven at runtime.** With **no** `location` directive, `state /tmp/maddyrun/stateQ3`, and a queue named `remote_queue`, maddy auto-created the queue directory at `<state>/remote_queue` (a `451` message, `4701aa33`, was queued to populate it). Commands:
 
 ```
+$ python3 /tmp/maddyrun/submit.py 127.0.0.1 15585 sender@src.local user@dest.local
 $ find /tmp/maddyrun/stateQ3 -maxdepth 1 -type d
 /tmp/maddyrun/stateQ3
 /tmp/maddyrun/stateQ3/remote_queue
 $ ls -la /tmp/maddyrun/stateQ3/remote_queue/
--rw-r--r-- 1 root root  22 ... 00bcc3b1.body
--rw-r--r-- 1 root root 242 ... 00bcc3b1.header
--rw-r--r-- 1 root root 418 ... 00bcc3b1.meta
+total 20
+drwxr-xr-x 2 root root 4096 Jul  8 05:47 .
+drwx------ 3 root root 4096 Jul  8 05:47 ..
+-rw-r--r-- 1 root root   22 Jul  8 05:47 4701aa33.body
+-rw-r--r-- 1 root root  337 Jul  8 05:47 4701aa33.header
+-rw-r--r-- 1 root root  520 Jul  8 05:47 4701aa33.meta
 ```
 
 The directory name is exactly the queue's name (`remote_queue`) joined onto the state directory, which is precisely `filepath.Join(config.StateDirectory, q.name)` [queue.go:L229]. Substituting the production default `StateDirectory = /var/lib/maddy` [maddy.go:L59] for the test `state` directory yields the canonical `/var/lib/maddy/remote_queue`. The state directory is created and validated at maddy startup, and because `maddyctl` has no queue subcommand, listing this directory is the canonical way to inspect pending messages. (The retry reproductions elsewhere in this document set an explicit `location` under `/tmp/maddyrun` — a non-canonical test path — but the default `filepath.Join` behavior is what is proven here.)
@@ -303,57 +405,68 @@ The directory name is exactly the queue's name (`remote_queue`) joined onto the 
 
 ### (a) The files that exist
 
-Listing captured immediately after the first temporary failure — the exact Q4 target state (message `9f32a40e`):
+Listing captured immediately after the first temporary failure — the exact Q4 target state (message `aff956e1`, instance A). Command and complete listing:
 
 ```
 $ ls -la /tmp/maddyrun/stateA/q_a/
--rw-r--r-- 1 root root  22 ... 9f32a40e.body
--rw-r--r-- 1 root root 240 ... 9f32a40e.header
--rw-r--r-- 1 root root 515 ... 9f32a40e.meta
+total 20
+drwxr-xr-x 2 root root 4096 Jul  8 05:36 .
+drwxr-xr-x 3 root root 4096 Jul  8 05:36 ..
+-rw-r--r-- 1 root root   22 Jul  8 05:36 aff956e1.body
+-rw-r--r-- 1 root root  335 Jul  8 05:36 aff956e1.header
+-rw-r--r-- 1 root root  516 Jul  8 05:36 aff956e1.meta
 ```
 
 Three files per message, matching the source: the `.header` path is built at [queue.go:L607], `.body` at [queue.go:L611], and `.meta` at [queue.go:L615]. The `.header` and `.body` contents:
 
 ```
-$ cat 9f32a40e.header
+$ cat /tmp/maddyrun/stateA/q_a/aff956e1.header
 Received: from client.local (localhost [127.0.0.1]) by test.local
- (envelope-sender <sender@src.local>) with ESMTP id 9f32a40e; Wed, 08 Jul
- 2026 03:07:26 +0000
+ (envelope-sender <sender@src.local>) with ESMTP id aff956e1; Wed, 08 Jul
+ 2026 05:36:31 +0000
 From: sender@src.local
 To: user@dest.local
 Subject: investigation test
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+MIME-Version: 1.0
 
-$ cat 9f32a40e.body
-body sent at 03:07:26
+$ cat /tmp/maddyrun/stateA/q_a/aff956e1.body
+body sent at 05:36:31
 ```
 
-Note (observed + `file:line`): the `.header` contains maddy's own `Received:` header embedding the message ID `9f32a40e`, and it has **no `for` clause** — matching the documented quirk that "`for` field is never included in the `Received` header field" [docs/internals/quirks.md:L9].
+Note (observed + `file:line`): the `.header` contains maddy's own `Received:` header embedding the message ID `aff956e1`, and it has **no `for` clause** — matching the documented quirk that "`for` field is never included in the `Received` header field" [docs/internals/quirks.md:L9].
 
 ### (b) Naming patterns
 
-`<id>` is an **8-character lowercase hex** string — examples observed across the reproductions include `9f32a40e`, `c2059df9`, `038a825e`, and `00bcc3b1` — produced by `GenerateMsgID()` [msgid.go:L12] (4 random bytes hex-encoded). The metadata file is written atomically via a `.meta.new` temporary file plus rename; if a metadata file cannot be parsed, it is quarantined by renaming it to `<id>.meta_broken` [queue.go:L268].
+`<id>` is an **8-character lowercase hex** string — examples observed across the reproductions include `aff956e1`, `9b21a24e`, `3b3fae59`, and `4701aa33` — produced by `GenerateMsgID()` [msgid.go:L12] (4 random bytes hex-encoded). The metadata file is written atomically via a `.meta.new` temporary file plus rename; if a metadata file cannot be parsed, it is quarantined by renaming it to `<id>.meta_broken` [queue.go:L268].
 
 ### (c) Retry-count metadata — the full state transition (before / during / after)
 
-The `.meta` is stored as compact single-line JSON. All three observed states follow.
+The `.meta` is stored as compact single-line JSON. All three states were observed and are shown **complete** (each captured with `cat` on the live `.meta` file). Because a normally-failing message's `TriesCount:0` window lasts only milliseconds, the in-flight (`TriesCount:0`) snapshot is taken from a message held mid-attempt against the **silent** downstream (message `3b3fae59`), while the `TriesCount:1 → 2` progression is from the `451`-flow instance-A message (`aff956e1`); the queue writes an identical metadata shape in every case.
 
-**DURING the first attempt** (in-flight; captured with the silent/hung downstream so the attempt does not complete), message `038a825e` — `TriesCount:0`, `RcptErrs:{}`, `FirstAttempt == LastAttempt`:
-
-```
-{"MsgMeta":{"ID":"038a825e","OriginalFrom":"sender@src.local",...},"From":"sender@src.local","To":["silent@dest.local"],"FailedRcpts":null,"TemporaryFailedRcpts":null,"RcptErrs":{},"TriesCount":0,"FirstAttempt":"2026-07-08T03:11:19.483540469Z","LastAttempt":"2026-07-08T03:11:19.48354052Z"}
-```
-
-**AFTER the first temporary failure** (the Q4 target state), message `9f32a40e` — `TriesCount:1`, `RcptErrs` populated, `LastAttempt` advanced, `FirstAttempt` fixed:
+**DURING the first attempt** (in-flight; captured against the silent/hung downstream so the attempt does not complete), message `3b3fae59` — `TriesCount:0`, `RcptErrs:{}`, `FirstAttempt ≈ LastAttempt` (they differ by ~52 ns — set by two separate `time.Now()` calls at enqueue [queue.go:L594-L595]):
 
 ```
-{"MsgMeta":{"ID":"9f32a40e","OriginalFrom":"sender@src.local","DontTraceSender":false,"Quarantine":false,"OriginalRcpts":{},"SMTPOpts":{"Size":99,"RequireTLS":false,"UTF8":false},"Conn":null},"From":"sender@src.local","To":["user@dest.local"],"FailedRcpts":null,"TemporaryFailedRcpts":null,"RcptErrs":{"user@dest.local":{"Code":451,"EnhancedCode":[4,0,0],"Message":"temporary failure, try again later"}},"TriesCount":1,"FirstAttempt":"2026-07-08T03:07:26.685827802Z","LastAttempt":"2026-07-08T03:07:26.731833665Z"}
+$ cat /tmp/maddyrun/stateSilentF/q_sf/3b3fae59.meta
+{"MsgMeta":{"ID":"3b3fae59","OriginalFrom":"sender@src.local","DontTraceSender":false,"Quarantine":false,"OriginalRcpts":{},"SMTPOpts":{"Size":197,"RequireTLS":false,"UTF8":false},"Conn":null},"From":"sender@src.local","To":["silent2@dest.local"],"FailedRcpts":null,"TemporaryFailedRcpts":null,"RcptErrs":{},"TriesCount":0,"FirstAttempt":"2026-07-08T06:07:35.122613573Z","LastAttempt":"2026-07-08T06:07:35.122613625Z"}
 ```
 
-**AFTER the second attempt**, message `9f32a40e` — `TriesCount:2`, `FirstAttempt` still fixed, `LastAttempt` advanced to the second attempt's time:
+**AFTER the first temporary failure** (the Q4 target state), message `aff956e1` — `TriesCount:1`, `RcptErrs` populated, `LastAttempt` advanced, `FirstAttempt` fixed:
 
 ```
-TriesCount = 2 ; FirstAttempt = 2026-07-08T03:07:26.685827802Z ; LastAttempt = 2026-07-08T03:22:26.734693671Z
+$ cat /tmp/maddyrun/stateA/q_a/aff956e1.meta
+{"MsgMeta":{"ID":"aff956e1","OriginalFrom":"sender@src.local","DontTraceSender":false,"Quarantine":false,"OriginalRcpts":{},"SMTPOpts":{"Size":194,"RequireTLS":false,"UTF8":false},"Conn":null},"From":"sender@src.local","To":["user@dest.local"],"FailedRcpts":null,"TemporaryFailedRcpts":null,"RcptErrs":{"user@dest.local":{"Code":451,"EnhancedCode":[4,0,0],"Message":"temporary failure, try again later"}},"TriesCount":1,"FirstAttempt":"2026-07-08T05:36:31.524387989Z","LastAttempt":"2026-07-08T05:36:31.570973656Z"}
 ```
+
+**AFTER the second attempt**, message `aff956e1` — `TriesCount:2`, `FirstAttempt` still fixed at the enqueue time, `LastAttempt` advanced to the second attempt's time (15 minutes later):
+
+```
+$ cat /tmp/maddyrun/stateA/q_a/aff956e1.meta
+{"MsgMeta":{"ID":"aff956e1","OriginalFrom":"sender@src.local","DontTraceSender":false,"Quarantine":false,"OriginalRcpts":{},"SMTPOpts":{"Size":194,"RequireTLS":false,"UTF8":false},"Conn":null},"From":"sender@src.local","To":["user@dest.local"],"FailedRcpts":null,"TemporaryFailedRcpts":null,"RcptErrs":{"user@dest.local":{"Code":451,"EnhancedCode":[4,0,0],"Message":"temporary failure, try again later"}},"TriesCount":2,"FirstAttempt":"2026-07-08T05:36:31.524387989Z","LastAttempt":"2026-07-08T05:51:31.574759613Z"}
+```
+
+The transition is thus **`TriesCount` 0 → 1 → 2**; `FirstAttempt` is written once at enqueue (`2026-07-08T05:36:31.524387989Z`) and never changes, while `LastAttempt` advances on every attempt (`…05:36:31.570973656Z` after attempt #1 → `…05:51:31.574759613Z` after attempt #2, a 15-minute step); `RcptErrs` is populated from the first failure onward.
 
 The metadata fields, by name and meaning:
 
@@ -376,36 +489,46 @@ The scheduler is the time wheel in `internal/target/queue/timewheel.go`: a singl
 
 ### (b) What happens to message A's retry timing when message B (different destination) blocks on a slow timeout
 
-Demonstrated with `max_parallelism 1`, a silent (hung) downstream, and two messages to **different** recipients (message A = `ab1b9324` → `msgA_starve@dest.local`; message B = `8aad9688` → `msgB_starve@dest.local`). Both were persisted to disk, but the downstream accepted **exactly one** TCP connection:
+Demonstrated with `max_parallelism 1`, a silent (hung) downstream, and two messages to **different** destinations (message A = `d24f5376` → `msgA_starve@desta.local`; message B = `45bf4182` → `msgB_starve@destb.local`). Setup and submissions (submission port `15595`; the single delivery target for both is the silent downstream on `15596`, so the shared global slot is the only gate):
 
 ```
-$ ls -1 /tmp/maddyrun/stateStv/q/*.meta
-/tmp/maddyrun/stateStv/q/8aad9688.meta
-/tmp/maddyrun/stateStv/q/ab1b9324.meta
-
-# fake (silent) downstream — only ONE accept:
-[fake_smtp mode=silent port=15576] ... ACCEPTED connection #1 from ('127.0.0.1', 55480)
-
-# maddy -debug: ab1b9324 acquires the sole slot; 8aad9688 blocks with NO 'acquired' line:
-[debug] queue: starting delivery for ab1b9324
-[debug] queue: waiting on delivery semaphore for ab1b9324
-[debug] queue: delivery semaphore acquired for ab1b9324
-[debug] queue: delivery attempt #1	{"msg_id":"ab1b9324"}
-[debug] queue: using message ID = ab1b9324-1	{"msg_id":"ab1b9324"}
-[debug] queue: starting delivery for 8aad9688
-[debug] queue: waiting on delivery semaphore for 8aad9688
+$ python3 /tmp/maddyrun/submit.py 127.0.0.1 15595 sender@src.local msgA_starve@desta.local
+$ python3 /tmp/maddyrun/submit.py 127.0.0.1 15595 sender@src.local msgB_starve@destb.local
+$ ls -1 /tmp/maddyrun/stateStv/q_stv/*.meta
+/tmp/maddyrun/stateStv/q_stv/45bf4182.meta
+/tmp/maddyrun/stateStv/q_stv/d24f5376.meta
 ```
 
-Then the silent server was killed to free the slot; message A failed (its hung greeting read returned `EOF`) and message B immediately acquired the freed slot and finally ran (failing `connection refused`, since the server was now gone):
+Both messages were persisted, but the downstream accepted **exactly one** TCP connection (`grep ACCEPTED /tmp/maddyrun/logs/fakeStv.log` — the complete log):
 
 ```
-1783480468.744158088 [debug] queue: delivery semaphore acquired for ab1b9324
-1783480494.602544858 queue: delivery attempt failed	{"msg_id":"ab1b9324","rcpt":"msgA_starve@dest.local","reason":"EOF","remote_server":"127.0.0.1","target":"smtp_downstream"}
-1783480494.605430293 [debug] queue: delivery semaphore acquired for 8aad9688
-1783480494.610141238 queue: delivery attempt failed	{"io_op":"dial","msg_id":"8aad9688","rcpt":"msgB_starve@dest.local","reason":"dial tcp 127.0.0.1:15576: connect: connection refused","remote_addr":"127.0.0.1:15576","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error","target":"smtp_downstream"}
+[fake_smtp mode=silent port=15596] mono=1314543.460142 wall=05:47:43.603040 LISTENING
+[fake_smtp mode=silent port=15596] mono=1314546.542646 wall=05:47:46.685542 ACCEPTED connection #1 from ('127.0.0.1', 50610)
 ```
 
-Explanation: message A held the sole slot for `1783480494.602544858 − 1783480468.744158088 =` **25.858 s** (the entire time the silent server was up); message B's first delivery attempt did not run until A released the slot (B acquired it ≈ 2.9 ms later). So B's *scheduled* time was independent of A (both were scheduled immediately on the time wheel), but B's *actual execution* was gated on A's slot. The log ordering — A acquired and failed **before** B acquired — confirms the gating. This ties directly to the single global `q.deliverySemaphore` [queue.go:L283] sized by `max_parallelism` and to the fairness-free wheel selection [timewheel.go:L80].
+The `-debug` log shows `d24f5376` acquiring the sole slot while `45bf4182` blocks with **no** `acquired` line (`grep -E 'starting delivery|semaphore' /tmp/maddyrun/logs/maddyStv.log`):
+
+```
+[debug] queue: starting delivery for d24f5376	
+[debug] queue: waiting on delivery semaphore for d24f5376	
+[debug] queue: delivery semaphore acquired for d24f5376	
+[debug] queue: delivery attempt #1	{"msg_id":"d24f5376"}
+[debug] queue: using message ID = d24f5376-1	{"msg_id":"d24f5376"}
+[debug] queue: starting delivery for 45bf4182	
+[debug] queue: waiting on delivery semaphore for 45bf4182	
+```
+
+Then the silent server was killed by its numeric PID to free the slot; message A failed (its hung greeting read returned `EOF`) and message B **immediately** acquired the freed slot and finally ran (failing `connection refused`, since the server was now gone):
+
+```
+$ kill "$STV_FAKE_PID"      # numeric PID of the silent fake server on :15596
+1783489692.743667922 queue: delivery attempt failed	{"msg_id":"d24f5376","rcpt":"msgA_starve@desta.local","reason":"EOF","remote_server":"127.0.0.1","target":"smtp_downstream"}
+1783489692.753503682 [debug] queue: delivery semaphore acquired for 45bf4182	
+1783489692.756874313 [debug] queue: delivery attempt #1	{"msg_id":"45bf4182"}
+1783489692.769295773 queue: delivery attempt failed	{"io_op":"dial","msg_id":"45bf4182","rcpt":"msgB_starve@destb.local","reason":"dial tcp 127.0.0.1:15596: connect: connection refused","remote_addr":"127.0.0.1:15596","smtp_code":450,"smtp_enchcode":"4.4.2","smtp_msg":"Network I/O error","target":"smtp_downstream"}
+```
+
+Explanation: message A held the sole slot for `1783489692.743667922 − 1783489666.720682002 =` **26.022986 s** (the entire time the silent server was up); message B's first delivery attempt did not run until A released the slot (B acquired it **≈ 9.8 ms** later — `1783489692.753503682 − 1783489692.743667922`). So B's *scheduled* time was independent of A (both were placed on the time wheel immediately), but B's *actual execution* was gated on A's slot. The log ordering — A acquired and failed **before** B acquired — confirms the gating. This ties directly to the single global `q.deliverySemaphore` [queue.go:L283] sized by `max_parallelism` and to the fairness-free wheel selection [timewheel.go:L80]; note the semaphore is destination-agnostic, so even though A and B target different recipients they share the one slot.
 
 ### (c) Observable starvation
 
