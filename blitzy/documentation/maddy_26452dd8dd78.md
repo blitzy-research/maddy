@@ -147,7 +147,7 @@ Before a value is JSON-encoded, `orderedjson.go:L41-L50` special-cases a few typ
 
 Consequences used below:
 
-- `next_try_delay` is a `time.Duration`, so it prints as a duration string (`-597ns`,
+- `next_try_delay` is a `time.Duration`, so it prints as a duration string (`-464ns`,
   `15m0s`).
 - `smtp_enchcode` is an `EnhancedCode`, which implements `LogFormatter.FormatLog()`, so in a
   **real** structured log it renders as `5.4.0` (see Group C for why the *test* prints
@@ -167,7 +167,7 @@ The test logger (`testutils.Logger`) has two output modes, selected by `-test.di
   maddy). OBSERVED (default mode):
 
 ```text
-smtp: RCPT ok	{"msg_id":"e242088d","rcpt":"rcpt1@example.com"}
+smtp: RCPT ok	{"msg_id":"1f580d2c","rcpt":"rcpt1@example.com"}
 ```
 
   (shown with the `output.go:41:` caller prefix stripped; the raw captured line is
@@ -180,7 +180,7 @@ smtp: RCPT ok	{"msg_id":"e242088d","rcpt":"rcpt1@example.com"}
   `-test.directlog`):
 
 ```text
-2026-07-08T04:26:16.769Z smtp: RCPT ok	{"msg_id":"310d2821","rcpt":"rcpt1@example.com"}
+2026-07-08T04:54:52.614Z smtp: RCPT ok	{"msg_id":"834e2169","rcpt":"rcpt1@example.com"}
 ```
 
   The writer source (`internal/log/writer.go:L16-L25`):
@@ -245,7 +245,7 @@ prefix — the maddy log line is everything from `smtp:` onward).
 **Direct answer.** A successful recipient add emits exactly:
 
 ```text
-smtp: RCPT ok	{"msg_id":"e242088d","rcpt":"rcpt1@example.com"}
+smtp: RCPT ok	{"msg_id":"1f580d2c","rcpt":"rcpt1@example.com"}
 ```
 
 It carries **two** JSON fields, in this order: `msg_id`, then `rcpt`.
@@ -261,11 +261,11 @@ go test -count=1 -v -run 'TestSMTPDelivery$' ./internal/endpoint/smtp/
 ```text
 === RUN   TestSMTPDelivery
 --- PASS: TestSMTPDelivery (0.00s)
-    output.go:41: smtp: listening on tcp://127.0.0.1:13172	
-    output.go:41: smtp: incoming message	{"msg_id":"e242088d","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:50520"}
-    output.go:41: smtp: RCPT ok	{"msg_id":"e242088d","rcpt":"rcpt1@example.com"}
-    output.go:41: smtp: RCPT ok	{"msg_id":"e242088d","rcpt":"rcpt2@example.com"}
-    output.go:41: smtp: accepted	{"msg_id":"e242088d"}
+    output.go:41: smtp: listening on tcp://127.0.0.1:28374	
+    output.go:41: smtp: incoming message	{"msg_id":"1f580d2c","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:56140"}
+    output.go:41: smtp: RCPT ok	{"msg_id":"1f580d2c","rcpt":"rcpt1@example.com"}
+    output.go:41: smtp: RCPT ok	{"msg_id":"1f580d2c","rcpt":"rcpt2@example.com"}
+    output.go:41: smtp: accepted	{"msg_id":"1f580d2c"}
 PASS
 ok  	github.com/foxcpp/maddy/internal/endpoint/smtp	0.004s
 ```
@@ -287,14 +287,14 @@ is the logger `Name` (see A3). There is no timestamp because this is default (`t
   identical line with a different `rcpt`:
 
 ```text
-smtp: RCPT ok	{"msg_id":"e242088d","rcpt":"rcpt2@example.com"}
+smtp: RCPT ok	{"msg_id":"1f580d2c","rcpt":"rcpt2@example.com"}
 ```
 
 - **`incoming message` (OBSERVED)** — the line that opens every transaction, with four
   fields (`msg_id`, `sender`, `src_host`, `src_ip`), emitted at `smtp.go:L128`:
 
 ```text
-smtp: incoming message	{"msg_id":"e242088d","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:50520"}
+smtp: incoming message	{"msg_id":"1f580d2c","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:56140"}
 ```
 
 - **`accepted` (OBSERVED)** — the terminal success line (see A2), `smtp.go:L334`.
@@ -307,14 +307,34 @@ line is immediately preceded by a `smtp: DATA error` line carrying a `reason`. C
 the success side ends with:
 
 ```text
-smtp: accepted	{"msg_id":"e242088d"}
+smtp: accepted	{"msg_id":"1f580d2c"}
+```
+
+**Command (success case):**
+
+```
+go test -count=1 -v -run 'TestSMTPDelivery$' ./internal/endpoint/smtp/
+```
+
+**Complete unedited output (success case):**
+
+```text
+=== RUN   TestSMTPDelivery
+--- PASS: TestSMTPDelivery (0.00s)
+    output.go:41: smtp: listening on tcp://127.0.0.1:28374	
+    output.go:41: smtp: incoming message	{"msg_id":"1f580d2c","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:56140"}
+    output.go:41: smtp: RCPT ok	{"msg_id":"1f580d2c","rcpt":"rcpt1@example.com"}
+    output.go:41: smtp: RCPT ok	{"msg_id":"1f580d2c","rcpt":"rcpt2@example.com"}
+    output.go:41: smtp: accepted	{"msg_id":"1f580d2c"}
+PASS
+ok  	github.com/foxcpp/maddy/internal/endpoint/smtp	0.004s
 ```
 
 and the DATA-abort side ends with:
 
 ```text
-smtp: DATA error	{"msg_id":"04f1d745","reason":"unexpected EOF"}
-smtp: aborted	{"msg_id":"04f1d745"}
+smtp: DATA error	{"msg_id":"b8c8ae14","reason":"unexpected EOF"}
+smtp: aborted	{"msg_id":"b8c8ae14"}
 ```
 
 **Command (abort case):**
@@ -328,13 +348,13 @@ go test -count=1 -v -run 'TestSMTPDelivery_AbortData$' ./internal/endpoint/smtp/
 ```text
 === RUN   TestSMTPDelivery_AbortData
 --- PASS: TestSMTPDelivery_AbortData (0.25s)
-    output.go:41: smtp: listening on tcp://127.0.0.1:63826	
-    output.go:41: smtp: incoming message	{"msg_id":"04f1d745","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:50042"}
-    output.go:41: smtp: RCPT ok	{"msg_id":"04f1d745","rcpt":"test@example.com"}
-    output.go:41: smtp: DATA error	{"msg_id":"04f1d745","reason":"unexpected EOF"}
-    output.go:41: smtp: aborted	{"msg_id":"04f1d745"}
+    output.go:41: smtp: listening on tcp://127.0.0.1:39028	
+    output.go:41: smtp: incoming message	{"msg_id":"b8c8ae14","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:50950"}
+    output.go:41: smtp: RCPT ok	{"msg_id":"b8c8ae14","rcpt":"test@example.com"}
+    output.go:41: smtp: DATA error	{"msg_id":"b8c8ae14","reason":"unexpected EOF"}
+    output.go:41: smtp: aborted	{"msg_id":"b8c8ae14"}
 PASS
-ok  	github.com/foxcpp/maddy/internal/endpoint/smtp	0.255s
+ok  	github.com/foxcpp/maddy/internal/endpoint/smtp	0.254s
 ```
 
 **Source citations.**
@@ -358,7 +378,7 @@ error's `Error()` string. `msg_id` sorts before `reason` alphabetically.
   preceding `DATA error`:
 
 ```text
-smtp: aborted	{"msg_id":"3bebf265"}
+smtp: aborted	{"msg_id":"5e68714e"}
 ```
 
   Command + complete unedited output:
@@ -370,10 +390,10 @@ go test -count=1 -v -run 'TestSMTPDelivery_AbortLogout$' ./internal/endpoint/smt
 ```text
 === RUN   TestSMTPDelivery_AbortLogout
 --- PASS: TestSMTPDelivery_AbortLogout (0.25s)
-    output.go:41: smtp: listening on tcp://127.0.0.1:52555	
-    output.go:41: smtp: incoming message	{"msg_id":"3bebf265","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:60270"}
-    output.go:41: smtp: RCPT ok	{"msg_id":"3bebf265","rcpt":"test@example.com"}
-    output.go:41: smtp: aborted	{"msg_id":"3bebf265"}
+    output.go:41: smtp: listening on tcp://127.0.0.1:41239	
+    output.go:41: smtp: incoming message	{"msg_id":"5e68714e","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:51920"}
+    output.go:41: smtp: RCPT ok	{"msg_id":"5e68714e","rcpt":"test@example.com"}
+    output.go:41: smtp: aborted	{"msg_id":"5e68714e"}
 PASS
 ok  	github.com/foxcpp/maddy/internal/endpoint/smtp	0.254s
 ```
@@ -382,7 +402,25 @@ ok  	github.com/foxcpp/maddy/internal/endpoint/smtp	0.254s
 
 **Direct answer.** The prefix is **`smtp`** (the leading `smtp:` on every line above).
 
-**Command / output.** Visible in every Group A capture (e.g. `smtp: RCPT ok ...`).
+**Command:**
+
+```
+go test -count=1 -v -run 'TestSMTPDelivery$' ./internal/endpoint/smtp/
+```
+
+**Complete unedited output** — the module prefix `smtp:` leads every maddy log line below; this is the same `TestSMTPDelivery$` success run shown for A1:
+
+```text
+=== RUN   TestSMTPDelivery
+--- PASS: TestSMTPDelivery (0.00s)
+    output.go:41: smtp: listening on tcp://127.0.0.1:28374	
+    output.go:41: smtp: incoming message	{"msg_id":"1f580d2c","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:56140"}
+    output.go:41: smtp: RCPT ok	{"msg_id":"1f580d2c","rcpt":"rcpt1@example.com"}
+    output.go:41: smtp: RCPT ok	{"msg_id":"1f580d2c","rcpt":"rcpt2@example.com"}
+    output.go:41: smtp: accepted	{"msg_id":"1f580d2c"}
+PASS
+ok  	github.com/foxcpp/maddy/internal/endpoint/smtp	0.004s
+```
 
 **Source citation.** The endpoint constructor sets the logger `Name` to the module name at
 `internal/endpoint/smtp/smtp.go:L495`:
@@ -416,14 +454,53 @@ so the prefix is `submission` or `lmtp` for those module instances (they share t
 **Direct answer.** The canonical production `msg_id` is **8 lowercase hexadecimal
 characters** (4 random bytes, hex-encoded).
 
-**Command / output.** OBSERVED across five separate runs, the `msg_id` differs every time
-while the format is constant:
+**Command (run 1):**
 
-- `TestSMTPDelivery` run 1 → `e242088d`
-- `TestSMTPDelivery` run 2 → `1f2e1254`
-- `TestSMTPDelivery_AbortData` → `04f1d745`
-- `TestSMTPDelivery_AbortLogout` → `3bebf265`
-- `TestSMTPDelivery` (direct mode) → `310d2821`
+```
+go test -count=1 -v -run 'TestSMTPDelivery$' ./internal/endpoint/smtp/
+```
+
+**Complete unedited output (run 1)** — `msg_id` = `1f580d2c`:
+
+```text
+=== RUN   TestSMTPDelivery
+--- PASS: TestSMTPDelivery (0.00s)
+    output.go:41: smtp: listening on tcp://127.0.0.1:28374	
+    output.go:41: smtp: incoming message	{"msg_id":"1f580d2c","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:56140"}
+    output.go:41: smtp: RCPT ok	{"msg_id":"1f580d2c","rcpt":"rcpt1@example.com"}
+    output.go:41: smtp: RCPT ok	{"msg_id":"1f580d2c","rcpt":"rcpt2@example.com"}
+    output.go:41: smtp: accepted	{"msg_id":"1f580d2c"}
+PASS
+ok  	github.com/foxcpp/maddy/internal/endpoint/smtp	0.004s
+```
+
+**Command (run 2)** — the identical command, re-run with `-count=1` so it truly re-executes rather than replaying a cached result:
+
+```
+go test -count=1 -v -run 'TestSMTPDelivery$' ./internal/endpoint/smtp/
+```
+
+**Complete unedited output (run 2)** — `msg_id` = `98736520`, a different value than run 1, which confirms the ID is random per run while the 8-hex format is stable:
+
+```text
+=== RUN   TestSMTPDelivery
+--- PASS: TestSMTPDelivery (0.00s)
+    output.go:41: smtp: listening on tcp://127.0.0.1:41887	
+    output.go:41: smtp: incoming message	{"msg_id":"98736520","sender":"sender@example.org","src_host":"mx.example.org","src_ip":"127.0.0.1:51116"}
+    output.go:41: smtp: RCPT ok	{"msg_id":"98736520","rcpt":"rcpt1@example.com"}
+    output.go:41: smtp: RCPT ok	{"msg_id":"98736520","rcpt":"rcpt2@example.com"}
+    output.go:41: smtp: accepted	{"msg_id":"98736520"}
+PASS
+ok  	github.com/foxcpp/maddy/internal/endpoint/smtp	0.004s
+```
+
+Across five separate runs the `msg_id` differed every time while the format stayed constant (8 lowercase hex characters):
+
+- `TestSMTPDelivery` run 1 → `1f580d2c`
+- `TestSMTPDelivery` run 2 → `98736520`
+- `TestSMTPDelivery_AbortData` → `b8c8ae14`
+- `TestSMTPDelivery_AbortLogout` → `5e68714e`
+- `TestSMTPDelivery` (direct mode) → `834e2169`
 
 **Source citation.** `internal/msgpipeline/msgid.go:L12-L16`:
 
@@ -476,7 +553,7 @@ go test -count=1 -v -run 'TestQueueDelivery_TemporaryFail$' ./internal/target/qu
 === RUN   TestQueueDelivery_TemporaryFail
 === PAUSE TestQueueDelivery_TemporaryFail
 === CONT  TestQueueDelivery_TemporaryFail
---- PASS: TestQueueDelivery_TemporaryFail (0.03s)
+--- PASS: TestQueueDelivery_TemporaryFail (0.05s)
     output.go:41: [debug] queue: delivery target: *queue.unreliableTarget	
     target.go:166: -- tgt.Start tester@example.com
     target.go:166: -- delivery.AddRcpt tester1@example.org
@@ -495,9 +572,9 @@ go test -count=1 -v -run 'TestQueueDelivery_TemporaryFail$' ./internal/target/qu
     output.go:41: [debug] queue: delivery.Body OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
     output.go:41: [debug] queue: delivery.Abort (all recipients failed)	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
     output.go:41: [debug] queue: failures: permanently: [], temporary: [tester1@example.org tester2@example.org], errors: map[tester1@example.org:you shall not pass tester2@example.org:you shall not pass]	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
-    output.go:41: queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org","reason":"you shall not pass"}
     output.go:41: queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org","reason":"you shall not pass"}
-    output.go:41: queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-597ns","rcpts":["tester1@example.org","tester2@example.org"]}
+    output.go:41: queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org","reason":"you shall not pass"}
+    output.go:41: queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-464ns","rcpts":["tester1@example.org","tester2@example.org"]}
     output.go:41: [debug] queue: starting delivery for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
     output.go:41: [debug] queue: waiting on delivery semaphore for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
     output.go:41: [debug] queue: delivery semaphore acquired for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
@@ -514,7 +591,7 @@ go test -count=1 -v -run 'TestQueueDelivery_TemporaryFail$' ./internal/target/qu
     output.go:41: [debug] queue: removed message from disk	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
     queue_test.go:38: --- queue.Close
 PASS
-ok  	github.com/foxcpp/maddy/internal/target/queue	0.034s
+ok  	github.com/foxcpp/maddy/internal/target/queue	0.050s
 ```
 
 **Source citations (line by line).**
@@ -552,13 +629,68 @@ verbatim (one `delivery attempt failed` per still-temporary recipient, then one 
 for the message):
 
 ```text
-queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org","reason":"you shall not pass"}
+[debug] queue: delivery attempt #1	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
 queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org","reason":"you shall not pass"}
-queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-597ns","rcpts":["tester1@example.org","tester2@example.org"]}
+queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org","reason":"you shall not pass"}
+queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-464ns","rcpts":["tester1@example.org","tester2@example.org"]}
 ```
 
-(The delivery *attempt itself* is the `[debug] queue: delivery attempt #1` line shown in the
-full B1 capture above.)
+The first line above is the delivery *attempt itself* (`[debug] queue: delivery attempt #1`);
+the two `delivery attempt failed` lines are the failures, and `will retry` is the retry
+scheduling. The complete unedited output for this item:
+
+**Command:**
+
+```
+go test -count=1 -v -run 'TestQueueDelivery_TemporaryFail$' ./internal/target/queue/ -test.debuglog
+```
+
+**Complete unedited output:**
+
+```text
+=== RUN   TestQueueDelivery_TemporaryFail
+=== PAUSE TestQueueDelivery_TemporaryFail
+=== CONT  TestQueueDelivery_TemporaryFail
+--- PASS: TestQueueDelivery_TemporaryFail (0.05s)
+    output.go:41: [debug] queue: delivery target: *queue.unreliableTarget	
+    target.go:166: -- tgt.Start tester@example.com
+    target.go:166: -- delivery.AddRcpt tester1@example.org
+    target.go:166: -- delivery.AddRcpt tester2@example.org
+    target.go:166: -- delivery.Body
+    target.go:166: -- delivery.Commit
+    output.go:41: [debug] queue: starting delivery for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: waiting on delivery semaphore for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery semaphore acquired for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery attempt #1	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: using message ID = af8090c7eb39f761862b1f027b4f2b0bb1ce86d1-1	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: target.Start OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester1@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester2@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Body failed: you shall not pass	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Body OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Abort (all recipients failed)	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: failures: permanently: [], temporary: [tester1@example.org tester2@example.org], errors: map[tester1@example.org:you shall not pass tester2@example.org:you shall not pass]	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org","reason":"you shall not pass"}
+    output.go:41: queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org","reason":"you shall not pass"}
+    output.go:41: queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-464ns","rcpts":["tester1@example.org","tester2@example.org"]}
+    output.go:41: [debug] queue: starting delivery for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: waiting on delivery semaphore for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery semaphore acquired for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery attempt #2	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: using message ID = af8090c7eb39f761862b1f027b4f2b0bb1ce86d1-2	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: target.Start OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester1@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester2@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Body OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Commit OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: failures: permanently: [], temporary: [], errors: map[]	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org"}
+    output.go:41: queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org"}
+    output.go:41: [debug] queue: removed message from disk	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    queue_test.go:38: --- queue.Close
+PASS
+ok  	github.com/foxcpp/maddy/internal/target/queue	0.050s
+```
 
 **Source citations.** `delivery attempt failed` — `queue.go:L384`; `will retry` —
 `queue.go:L415-L418`.
@@ -567,7 +699,10 @@ full B1 capture above.)
 error's `Error()` string becomes the `reason` field — here `"you shall not pass"`, the error
 returned by the test's `unreliableTarget`. Fields sort alphabetically: `msg_id`, `rcpt`,
 `reason`. `will retry` carries `attempts_count`, `msg_id`, `next_try_delay`, `rcpts` (again
-alphabetical); the `next_try_delay` value is analysed in Group D.
+alphabetical); the `next_try_delay` value is analysed in Group D. The **relative order of
+the two `delivery attempt failed` lines is non-deterministic** — the recipients are iterated
+from a map, so a re-run may swap `tester1`/`tester2` (D2 run 2 below shows the reversed
+order); the set of lines and their fields is stable, only the inter-line order varies.
 
 **Sibling variants (queue outcomes)** at `internal/target/queue/queue.go:L378-L398`:
 - `delivered` — **OBSERVED** (success, `L378`), shown above.
@@ -670,8 +805,28 @@ reported:
   code **550**, enhanced code **`5.4.0`** (Network and Routing Status), message
   `No usable MXs, last err: Failed to estabilish the MX record (mx.example.invalid.) authenticity`.
 
-**Command / output.** Same run as C1. The mock target renders the returned `SMTPError`'s
-fields as a Go map (via `%v`), OBSERVED verbatim:
+**Command:**
+
+```
+go test -count=1 -v -run 'TestRemoteDelivery_AuthMX_Fail$' ./internal/target/remote/ -test.debuglog
+```
+
+**Complete unedited output** (the same run as C1, reproduced here so this item stands alone):
+
+```text
+=== RUN   TestRemoteDelivery_AuthMX_Fail
+--- PASS: TestRemoteDelivery_AuthMX_Fail (0.00s)
+    target.go:233: -- tgt.Start test@example.com
+    target.go:233: -- delivery.AddRcpt test@example.invalid
+    output.go:41: [debug] remote: trying	{"domain":"example.invalid","msg_id":"ac08d9f027f71627267fb3eae96f84d56762fa16","mx":"mx.example.invalid."}
+    target.go:233: -- ... delivery.AddRcpt test@example.invalid Failed to estabilish the MX record (mx.example.invalid.) authenticity map[domain:example.invalid reason:Failed to estabilish the MX record (mx.example.invalid.) authenticity smtp_code:550 smtp_enchcode:[5 4 0] smtp_msg:No usable MXs, last err: Failed to estabilish the MX record (mx.example.invalid.) authenticity target:remote]
+    target.go:233: -- delivery.Abort
+PASS
+ok  	github.com/foxcpp/maddy/internal/target/remote	0.004s
+```
+
+Within that output the failing recipient's error is surfaced by the mock target, which renders
+the returned `SMTPError`'s fields as a Go map (via `%v`); the relevant fields, OBSERVED verbatim:
 
 ```text
 map[domain:example.invalid reason:Failed to estabilish the MX record (mx.example.invalid.) authenticity smtp_code:550 smtp_enchcode:[5 4 0] smtp_msg:No usable MXs, last err: Failed to estabilish the MX record (mx.example.invalid.) authenticity target:remote]
@@ -829,7 +984,7 @@ rather than falling back.
 **Direct answer.** Retry scheduling is shown by the `will retry` line, quoted verbatim:
 
 ```text
-queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-597ns","rcpts":["tester1@example.org","tester2@example.org"]}
+queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-464ns","rcpts":["tester1@example.org","tester2@example.org"]}
 ```
 
 **Command:**
@@ -838,7 +993,53 @@ queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0b
 go test -count=1 -v -run 'TestQueueDelivery_TemporaryFail$' ./internal/target/queue/ -test.debuglog
 ```
 
-(Full unedited output is the Group B capture above.)
+**Complete unedited output** (the `will retry` line appears mid-sequence, right after the two
+`delivery attempt failed` lines):
+
+```text
+=== RUN   TestQueueDelivery_TemporaryFail
+=== PAUSE TestQueueDelivery_TemporaryFail
+=== CONT  TestQueueDelivery_TemporaryFail
+--- PASS: TestQueueDelivery_TemporaryFail (0.05s)
+    output.go:41: [debug] queue: delivery target: *queue.unreliableTarget	
+    target.go:166: -- tgt.Start tester@example.com
+    target.go:166: -- delivery.AddRcpt tester1@example.org
+    target.go:166: -- delivery.AddRcpt tester2@example.org
+    target.go:166: -- delivery.Body
+    target.go:166: -- delivery.Commit
+    output.go:41: [debug] queue: starting delivery for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: waiting on delivery semaphore for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery semaphore acquired for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery attempt #1	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: using message ID = af8090c7eb39f761862b1f027b4f2b0bb1ce86d1-1	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: target.Start OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester1@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester2@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Body failed: you shall not pass	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Body OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Abort (all recipients failed)	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: failures: permanently: [], temporary: [tester1@example.org tester2@example.org], errors: map[tester1@example.org:you shall not pass tester2@example.org:you shall not pass]	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org","reason":"you shall not pass"}
+    output.go:41: queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org","reason":"you shall not pass"}
+    output.go:41: queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-464ns","rcpts":["tester1@example.org","tester2@example.org"]}
+    output.go:41: [debug] queue: starting delivery for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: waiting on delivery semaphore for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery semaphore acquired for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery attempt #2	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: using message ID = af8090c7eb39f761862b1f027b4f2b0bb1ce86d1-2	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: target.Start OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester1@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester2@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Body OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Commit OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: failures: permanently: [], temporary: [], errors: map[]	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org"}
+    output.go:41: queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org"}
+    output.go:41: [debug] queue: removed message from disk	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    queue_test.go:38: --- queue.Close
+PASS
+ok  	github.com/foxcpp/maddy/internal/target/queue	0.050s
+```
 
 **Source citation.** `internal/target/queue/queue.go:L415-L418`:
 
@@ -853,19 +1054,136 @@ dl.Msg("will retry",
 logger plus the three explicit fields. Alphabetical ordering gives `attempts_count`, `msg_id`,
 `next_try_delay`, `rcpts`.
 
-**Sibling variants.** The other terminal queue outcomes (`delivered`, `not delivered,
-temporary error`, `not delivered, permanent error`) are enumerated in Group B (B2).
+**Sibling variants (queue outcomes)** at `internal/target/queue/queue.go:L378-L398`, labeled
+by whether each was seen in this run:
+- `will retry` — **OBSERVED** (`queue.go:L415-L418`): the line documented here, emitted after a
+  temporary failure while more attempts remain.
+- `delivered` — **OBSERVED** (`queue.go:L378`): emitted per recipient on the successful attempt
+  #2 (visible in the complete output above).
+- `not delivered, temporary error` — **SOURCE-DERIVED** (`queue.go:L394`): emitted per still-
+  temporarily-failing recipient once the maximum number of tries is exhausted (not reached here,
+  since delivery succeeds on attempt #2).
+- `not delivered, permanent error` — **SOURCE-DERIVED** (`queue.go:L398`): emitted per
+  permanently-failed recipient (no permanent failure occurs in this test).
 
 ### D2 — the JSON field carrying the retry delay
 
 **Direct answer.** The field is **`next_try_delay`**. It is a `time.Duration`, rendered via
 `String()` (preamble §3).
 
-**Command / output — stability across two runs.** The field **name and structure are stable**;
-the **value varies** and is a tiny **negative** duration in tests:
+**Command / output — stability across two runs.** The field **name and structure are stable**
+across both runs; only the nanosecond **value** varies (a tiny **negative** duration in tests).
 
-- Run 1 → `next_try_delay":"-597ns"`
-- Run 2 → `next_try_delay":"-585ns"`
+**Command (run 1):**
+
+```
+go test -count=1 -v -run 'TestQueueDelivery_TemporaryFail$' ./internal/target/queue/ -test.debuglog
+```
+
+**Complete unedited output (run 1)** — `next_try_delay":"-464ns"`:
+
+```text
+=== RUN   TestQueueDelivery_TemporaryFail
+=== PAUSE TestQueueDelivery_TemporaryFail
+=== CONT  TestQueueDelivery_TemporaryFail
+--- PASS: TestQueueDelivery_TemporaryFail (0.05s)
+    output.go:41: [debug] queue: delivery target: *queue.unreliableTarget	
+    target.go:166: -- tgt.Start tester@example.com
+    target.go:166: -- delivery.AddRcpt tester1@example.org
+    target.go:166: -- delivery.AddRcpt tester2@example.org
+    target.go:166: -- delivery.Body
+    target.go:166: -- delivery.Commit
+    output.go:41: [debug] queue: starting delivery for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: waiting on delivery semaphore for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery semaphore acquired for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery attempt #1	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: using message ID = af8090c7eb39f761862b1f027b4f2b0bb1ce86d1-1	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: target.Start OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester1@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester2@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Body failed: you shall not pass	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Body OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Abort (all recipients failed)	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: failures: permanently: [], temporary: [tester1@example.org tester2@example.org], errors: map[tester1@example.org:you shall not pass tester2@example.org:you shall not pass]	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org","reason":"you shall not pass"}
+    output.go:41: queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org","reason":"you shall not pass"}
+    output.go:41: queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-464ns","rcpts":["tester1@example.org","tester2@example.org"]}
+    output.go:41: [debug] queue: starting delivery for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: waiting on delivery semaphore for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery semaphore acquired for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery attempt #2	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: using message ID = af8090c7eb39f761862b1f027b4f2b0bb1ce86d1-2	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: target.Start OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester1@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester2@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Body OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Commit OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: failures: permanently: [], temporary: [], errors: map[]	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org"}
+    output.go:41: queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org"}
+    output.go:41: [debug] queue: removed message from disk	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    queue_test.go:38: --- queue.Close
+PASS
+ok  	github.com/foxcpp/maddy/internal/target/queue	0.050s
+```
+
+**Command (run 2)** — the identical command, re-run with `-count=1` so it truly re-executes:
+
+```
+go test -count=1 -v -run 'TestQueueDelivery_TemporaryFail$' ./internal/target/queue/ -test.debuglog
+```
+
+**Complete unedited output (run 2)** — `next_try_delay":"-482ns"` (a different magnitude than
+run 1, confirming the value jitters while the field name/type/position stay identical; note the two
+`delivery attempt failed` lines also appear in the reversed recipient order here):
+
+```text
+=== RUN   TestQueueDelivery_TemporaryFail
+=== PAUSE TestQueueDelivery_TemporaryFail
+=== CONT  TestQueueDelivery_TemporaryFail
+--- PASS: TestQueueDelivery_TemporaryFail (0.01s)
+    output.go:41: [debug] queue: delivery target: *queue.unreliableTarget	
+    target.go:166: -- tgt.Start tester@example.com
+    target.go:166: -- delivery.AddRcpt tester1@example.org
+    target.go:166: -- delivery.AddRcpt tester2@example.org
+    target.go:166: -- delivery.Body
+    target.go:166: -- delivery.Commit
+    output.go:41: [debug] queue: starting delivery for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: waiting on delivery semaphore for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery semaphore acquired for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery attempt #1	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: using message ID = af8090c7eb39f761862b1f027b4f2b0bb1ce86d1-1	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: target.Start OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester1@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester2@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Body failed: you shall not pass	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Body OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Abort (all recipients failed)	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: failures: permanently: [], temporary: [tester1@example.org tester2@example.org], errors: map[tester1@example.org:you shall not pass tester2@example.org:you shall not pass]	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org","reason":"you shall not pass"}
+    output.go:41: queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org","reason":"you shall not pass"}
+    output.go:41: queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-482ns","rcpts":["tester1@example.org","tester2@example.org"]}
+    output.go:41: [debug] queue: starting delivery for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: waiting on delivery semaphore for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery semaphore acquired for af8090c7eb39f761862b1f027b4f2b0bb1ce86d1	
+    output.go:41: [debug] queue: delivery attempt #2	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: using message ID = af8090c7eb39f761862b1f027b4f2b0bb1ce86d1-2	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: target.Start OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester1@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.AddRcpt tester2@example.org OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Body OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: delivery.Commit OK	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: [debug] queue: failures: permanently: [], temporary: [], errors: map[]	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    output.go:41: queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org"}
+    output.go:41: queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org"}
+    output.go:41: [debug] queue: removed message from disk	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}
+    queue_test.go:38: --- queue.Close
+PASS
+ok  	github.com/foxcpp/maddy/internal/target/queue	0.010s
+```
+
+- Run 1 → `next_try_delay":"-464ns"`
+- Run 2 → `next_try_delay":"-482ns"`
 
 **Source citation.** `internal/target/queue/queue.go:L413-L414` (the delay computation) and
 `L417` (the field):
@@ -881,14 +1199,14 @@ retryTimeScale^(tries-1))`. The queue test sets `q.initialRetryTime = 0`
 (`internal/target/queue/queue_test.go:L50`), so `nextTryTime ≈ now`; by the time
 `time.Until` is evaluated a few nanoseconds later, that elapsed time makes the remaining
 duration slightly **negative**, and its exact nanosecond magnitude jitters per run
-(`-597ns` vs `-585ns`). Only the value varies — the field name, type, and position are stable.
+(`-464ns` vs `-482ns`). Only the value varies — the field name, type, and position are stable.
 
 **Canonical production default (clearly separated).** In the **default** configuration the
 first-retry delay would be **`15m0s`**, not a negative nanosecond value, because
 `initialRetryTime` defaults to `15 * time.Minute` (`internal/target/queue/queue.go:L185`) and
 `retryTimeScale` defaults to `2` (`L186`), with the delay formula
 `initialRetryTime × retryTimeScale^(tries-1)` (`L414`). So `15m0s` is the canonical value a
-developer will see in production for the first retry; the `-597ns` / `-585ns` values here are
+developer will see in production for the first retry; the `-464ns` / `-482ns` values here are
 **test-only artifacts** of `initialRetryTime = 0`.
 
 ---
@@ -897,8 +1215,8 @@ developer will see in production for the first retry; the `-597ns` / `-585ns` va
 ### 1. Canonical vs. non-canonical `msg_id`
 
 - **Canonical (production):** 8 lowercase hex characters, random, from `GenerateMsgID()`
-  (`internal/msgpipeline/msgid.go:L12-L16`). OBSERVED in Group A: `e242088d`, `1f2e1254`,
-  `04f1d745`, `3bebf265`, `310d2821` — a different value every run.
+  (`internal/msgpipeline/msgid.go:L12-L16`). OBSERVED in Group A: `1f580d2c`, `98736520`,
+  `b8c8ae14`, `5e68714e`, `834e2169` — a different value every run.
 - **Non-canonical (test-harness artifact) — labeled as such wherever it appears:** the 40-hex
   IDs in the queue and remote tests are `hex(sha1(t.Name()))`, produced by the mock target
   `DoTestDeliveryErrMeta` (`internal/testutils/target.go:L239-L245`:
@@ -932,8 +1250,8 @@ The test prints the enhanced code as the slice `[5 4 0]` (Go `%v`); a real struc
 
 | Stable (never changes) | Varying (changes per run) |
 |------------------------|---------------------------|
-| Module prefixes `smtp` / `queue` / `remote` | The specific 8-hex `msg_id` (e.g. `e242088d` → `1f2e1254`) |
-| Field **names** and alphabetical ordering | `next_try_delay` nanosecond magnitude/sign (`-597ns` → `-585ns`) |
+| Module prefixes `smtp` / `queue` / `remote` | The specific 8-hex `msg_id` (e.g. `1f580d2c` → `98736520`) |
+| Field **names** and alphabetical ordering | `next_try_delay` nanosecond magnitude/sign (`-464ns` → `-482ns`) |
 | `msg_id` **format** (8 hex chars, production) | — |
 | `next_try_delay` **field name** and type | — |
 | SHA-1-derived harness IDs (deterministic per test name) | — |
@@ -961,7 +1279,7 @@ complete unedited output, `file:line` citation, causal reasoning, sibling varian
 | **C2** | inner 550/`5.7.0` (`connect.go:L97`) and outer 550/`5.4.0` (`connect.go:L206`, `SMTPEnchCode`) — both reported |
 | **C3** | `remote: TLS error, falling back to plaintext` + 4 fields (`domain`,`msg_id`,`mx`,`reason`) — `connect.go:L176-L177` |
 | **D1** | the `will retry` line — `queue.go:L415-L418` |
-| **D2** | field `next_try_delay` (`time.Duration`); test `-597ns`/`-585ns`, canonical default `15m0s` — `queue.go:L185/L414/L417` |
+| **D2** | field `next_try_delay` (`time.Duration`); test `-464ns`/`-482ns`, canonical default `15m0s` — `queue.go:L185/L414/L417` |
 
 **All referenced tests passed** (each capture above shows `--- PASS`). Commands were run with
 `-count=1` (no caching) under Go 1.13.15, `CGO_ENABLED=0`, at commit
