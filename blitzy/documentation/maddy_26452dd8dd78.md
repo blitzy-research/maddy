@@ -157,7 +157,7 @@ Consequences used below:
 ### 4. Timestamp behaviour (OBSERVED in both modes)
 
 The test logger (`testutils.Logger`) has two output modes, selected by `-test.directlog`
-(`internal/testutils/logger.go:L18-L44`):
+(`internal/testutils/logger.go:L18-L41`):
 
 - **Default mode** routes each record through `t.Log` via a `FuncOutput` whose function
   signature is `func(_ time.Time, debug bool, str string)` — the `time.Time` timestamp
