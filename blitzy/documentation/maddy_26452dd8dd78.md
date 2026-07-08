@@ -209,7 +209,7 @@ Every payload below is byte-identical except for how the `DATA` boundary is fram
 
 ### E1 — canonical `\r\n.\r\n` (baseline)
 
-**Result:** `250 2.0.0 OK: queued`; exactly 1 delivered message (312 bytes, `caught_001.raw`, `msg_id da8890d0`). Full capture in Section 2 (E1 baseline) and Appendix B.E1. All following experiments are diffed against it.
+**Result:** `250 2.0.0 OK: queued`; exactly 1 delivered message (312 bytes, `caught_001.raw`, `msg_id da8890d0`). Full capture in Section 2 (E1 baseline). All following experiments are diffed against it.
 
 ### E2 — bare-LF `\n.\n`
 
@@ -337,7 +337,7 @@ The clean **before/after state transition** (empty before a terminator, populate
 
 ### E6 — early connection close before the dot (nondeterministic abort path)
 
-**Result: 0 delivered** in every run — this is the invariant, matching the in-tree precedent `internal/endpoint/smtp/smtp_test.go:360` `TestSMTPDelivery_AbortData`. The *surfaced* abort detail is **nondeterministic** (a race between the server's read and the client's abrupt `close()`), so the same unchanged input was run **10 times**. Observed distribution: reason `"connection reset by peer"` in **6/10** runs and `"unexpected EOF"` in **4/10**; a `554 5.0.0 Internal server error` is emitted in only **3/10** runs. `wrapErr` (`smtp.go:388`) maps the non-`SMTPError` abort to a generic `554` when it manages to write a response before the socket is gone. One representative run (the `connection reset by peer` path) — complete capture:
+**Result: 0 delivered** in every run — this is the invariant, matching the in-tree precedent `internal/endpoint/smtp/smtp_test.go:360` `TestSMTPDelivery_AbortData`. The *surfaced* abort detail is **nondeterministic** (a race between the server's read and the client's abrupt `close()`), so the same unchanged input was run **10 times**. Observed distribution: reason `"connection reset by peer"` in **6/10** runs and `"unexpected EOF"` in **4/10**; a `554 5.0.0 Internal server error` surfaces in only **3/10** runs of this abrupt-`close()` variant (a race over whether the server writes its response before the socket is torn down). `wrapErr` (`smtp.go:389`) maps the non-`SMTPError` abort to a generic `554`; that `554` is captured **deterministically** — on both the wire and the `io_debug` log — by the half-close variant in **Appendix B.E6**. One representative run (the `connection reset by peer` path) — complete capture:
 
 ```text
 ==================== EXPERIMENT E6 (conversation) ====================
@@ -405,7 +405,7 @@ smtp: aborted	{"msg_id":"09b39b33"}
 delivered messages captured: 0
 ```
 
-The alternate `unexpected EOF` → `554` path (also observed here, and deterministically reproduced by the clean-close hang in Section 7) is in **Appendix B.E6**. Either way: **0 delivered, connection aborted.**
+The alternate `unexpected EOF` → `554` path is captured **deterministically** in **Appendix B.E6** — a half-close (client `shutdown(SHUT_WR)` mid-body, read side kept open): the server reads EOF, logs `DATA error {"reason":"unexpected EOF"}`, and writes `554 5.0.0 Internal server error` to the still-open read side before closing. Either way: **0 delivered, connection aborted.**
 
 ### ELINE / ECMD — the line-length limit (2000), and why there is *no* clean asymmetry
 
@@ -481,7 +481,7 @@ smtp: aborted	{"msg_id":"c9ad5229"}
 delivered messages captured: 0
 ```
 
-→ additional ELINE runs showing the reset/`unexpected EOF` variants are in **Appendix B.ELINE**.
+→ additional ELINE runs — the observed same-input distribution across 64 repetitions plus complete captures of the `unexpected EOF` and (abrupt-close) `connection reset by peer` variants — are in **Appendix B.ELINE**.
 
 ### 552 — the message-size limit
 
@@ -1215,7 +1215,7 @@ delivered messages captured: 0
 
 **What lingers when things go wrong (observed):**
 
-**(a) Unterminated `DATA` hangs to the read timeout.** When the client sends `DATA` content but never a terminator and never closes, the connection blocks until the 10-minute `read_timeout` (`smtp.go:560`). Observed (bounded to a 6-second poll rather than waiting the full timeout): after the `354`, the server returned **nothing** for the entire poll, then on client close logged `DATA error {"reason":"unexpected EOF"}` → `554 5.0.0 Internal server error` → `aborted`, with 0 delivered. This is also the clean before/after state transition for E5: **empty (blocked, silent) before a terminator arrives.** Complete capture:
+**(a) Unterminated `DATA` hangs to the read timeout.** When the client sends `DATA` content but never a terminator and never closes, the connection blocks until the 10-minute `read_timeout` (`smtp.go:560`). Observed (bounded to a 6-second poll rather than waiting the full timeout): after the `354`, the server returned **nothing** for the entire poll — it stays blocked awaiting the `<CRLF>.<CRLF>` terminator. This is also the clean before/after state transition for E5: **empty (blocked, silent) before a terminator arrives.** (When the client subsequently goes away without a terminator, the reader hits EOF and the abort path fires deterministically: `DATA error {"reason":"unexpected EOF"}` → `554 5.0.0 Internal server error` → `aborted`, 0 delivered — captured in full in **Appendix B.E6**.) Complete capture of the silent-hang phase:
 
 ```text
 --- S->C --- b'220 probe.local ESMTP Service Ready\r\n'
@@ -1238,7 +1238,7 @@ delivered messages captured: 0
 >>> after 6.0s the server sent NOTHING: it is blocked awaiting the <CRLF>.<CRLF> terminator (read_timeout default 10m, smtp.go:560). Closing client now (bounded).
 ```
 
-**(b) Early/abrupt close → `DATA error` + `aborted`, nothing queued.** As quantified in E6 (Section 3), a close before the dot delivers 0; the logged reason is `connection reset by peer` or `unexpected EOF` depending on the close race, and a `554` is emitted only sometimes. Nothing is queued.
+**(b) Early/abrupt close → `DATA error` + `aborted`, nothing queued.** As quantified in E6 (Section 3), a close before the dot delivers 0; the logged reason is `connection reset by peer` (an abrupt RST close that leaves the server's response unread) or `unexpected EOF` (a clean or half close) depending on how the client tears the socket down, and on the abrupt-`close()` path the `554` reaches the client only sometimes (the write races the teardown). The half-close variant makes the `554` deterministic — captured in **Appendix B.E6**; the abrupt-RST reset reason is captured in **Appendix B.ELINE**. Nothing is queued.
 
 **(c) `smtp_downstream` leaves nothing on disk.** The probe's delivery target relays synchronously to the catch server; it does not spool. Confirmed by the artifact inventory below — the `state`/`runtime` directories are empty of files after 24 delivered messages.
 
@@ -1312,7 +1312,7 @@ Edge/limit paths additionally exercised: **ELINE** (over-long `DATA` line), **EC
 
 ### 8.2 Observed vs. inferred
 
-**Observed (with captured evidence in this document):** every delivery count and `msg_id`; the `354`/`250`/`500`/`552`/`421`/`554` response codes and their exact text; the two-message E7 smuggle; the `{5/5,5/5}` E8 distribution; the three proxy-mode outcomes and the normalize byte-rewrite proof; the unterminated-`DATA` silence and its `unexpected EOF`→`554` close; the empty state/runtime dirs and clean repo; and the EHLO capability set (no CHUNKING/BDAT).
+**Observed (with captured evidence in this document):** every delivery count and `msg_id`; the `354`/`250`/`500`/`552`/`421`/`554` response codes and their exact text; the two-message E7 smuggle; the `{5/5,5/5}` E8 distribution; the three proxy-mode outcomes and the normalize byte-rewrite proof; the unterminated-`DATA` silence (§7) and the deterministic `unexpected EOF`→`554 5.0.0` abort captured by the half-close variant (Appendix B.E6); the empty state/runtime dirs and clean repo; and the EHLO capability set (no CHUNKING/BDAT).
 
 **Corrected against runtime (earlier read-only guesses that the captures disproved):**
 - **E5** is **accepted and delivered**, not "never terminates." An earlier draft misread a pipelining-offset `RECV b''` as "still in DATA"; the actual bytes show the `\r\n.\r\n` terminator arriving in a later TCP segment and being detected normally.
@@ -1322,7 +1322,7 @@ Edge/limit paths additionally exercised: **ELINE** (over-long `DATA` line), **EC
 
 ### 8.3 Consolidated citations (verified against source at commit `26452dd8dd78`)
 
-**Maddy `internal/endpoint/smtp/smtp.go`:** `prepareBody` L283; `Received` header add L307; `Session.Data` L312; `accepted` log L334 (SMTP) / L377 (LMTP); `wrapErr` L388 with `*smtp.SMTPError` passthrough L429–434 and `" (msg ID = " + msgId + ")"` suffix L437; `EnableSMTPUTF8=true` L504; `write_timeout` L559; `read_timeout` L560; `max_message_size` L561; `io_debug` L565; `serv.Debug = Log.DebugWriter()` L604.
+**Maddy `internal/endpoint/smtp/smtp.go`:** `prepareBody` L283; `Received` header add L307; `Session.Data` L312; `accepted` log L334 (SMTP) / L377 (LMTP); `wrapErr` L389 with `*smtp.SMTPError` passthrough L429–434 and `" (msg ID = " + msgId + ")"` suffix L437; `EnableSMTPUTF8=true` L504; `write_timeout` L559; `read_timeout` L560; `max_message_size` L561; `io_debug` L565; `serv.Debug = Log.DebugWriter()` L604.
 **Maddy other:** `maddy.go` Version L41, `DefaultStateDirectory=/var/lib/maddy` L59, `Run` L102, `-debug` L104; `internal/log/log.go` `formatMsg` L135, `DebugWriter` L172, `ioutil.Discard` L174; `internal/target/remote/remote.go` mtasts-cache location L93, `os.MkdirAll` L145; `internal/target/queue/queue.go` location L229, `os.MkdirAll` L233; `.gitignore` `*mtasts-cache` L35, `*queue` L36.
 **`go-smtp` @ `1f576e0` (2019):** `data.go` `ErrDataTooLarge`/552 L38–39, `newDataReader` L51/L53, byte counter L56/L58, size check L67; `conn.go` transcript tee L68, `c.text=textproto.NewConn` L74, `handleData` L498, `354` L510, reader construct L519, drain `io.Copy(ioutil.Discard,r)` L521, LMTP `handleDataLMTP` L568; `server.go` `MaxLineLength=2000` L40/L76, `caps` (PIPELINING/8BITMIME/ENHANCEDSTATUSCODES; no CHUNKING/BDAT) L81, `handleConn` loop L154, `ErrTooLongLine`→`500` L155; `smtp.go` `validateLine` rejects `\n`/`\r` L23–24.
 **Go standard library `net/textproto/reader.go` (Go 1.18.10):** `dotReader.Read` L322; state constants `stateBeginLine/stateDot/stateData/stateCR/stateEOF` L328–333; `ErrUnexpectedEOF` (returned when the stream ends mid-body) L340–342; **the `stateDot` + `'\n'` → `stateEOF` transition (the exact line that accepts a bare-LF `.\n` terminator) L362–364**.
@@ -1830,8 +1830,8 @@ smtp tcp://127.0.0.1:2530 {
 Experiments shown in full inline are pointer-referenced here to avoid duplication; the remainder are reproduced in full below. Every capture is the complete, unedited output (probe conversation → Maddy `io_debug` transcript + ordered-JSON logs → delivered bytes).
 
 - **E1** (canonical) — shown in full in **§2**.
-- **E6** (early close, full 10-run context) — shown in full in **§3**.
-- **ELINE** (over-long DATA line) — shown in full in **§3**.
+- **E6** (early close) — the abrupt-`close()` 10-run context is in **§3**; the deterministic half-close `unexpected EOF`→`554` capture is in **B.E6** below.
+- **ELINE** (over-long DATA line) — the primary clean-`500` run is in **§3**; the 64-run same-input distribution and the `unexpected EOF` / abrupt-close `connection reset by peer` variant captures are in **B.ELINE** below.
 - **552** (max message size) — shown in full in **§3**.
 - **E7** (pipelined smuggle) — shown in full in **§4**.
 - **E8** (back-to-back, both runs) — shown in full in **§5**.
@@ -2228,6 +2228,215 @@ smtp: 221 2.0.0 Goodnight and good luck
 -------- delivered messages (new caught_* files) --------
 delivered [caught_006.raw, 320 bytes]:
 b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id e1251d50; Wed, 08 Jul\r\n 2026 06:14:55 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E5-missing-crlf\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nGLUED_NO_NEWLINE_BEFORE.\r\n\r\n'
+```
+
+### B.E6 — deterministic `unexpected EOF` → `554` via half-close (complete; 0 delivered)
+
+**Result — the deterministic form of the E6 abort.** The abrupt-`close()` E6 run in §3 surfaces the `554` only as a race (3/10). To capture the `554` on the wire on **every** run, the client half-closes: it sends the `DATA` headers plus a partial body with **no** terminator, then `shutdown(SHUT_WR)` (signalling EOF to the server) while keeping its read side open. The server's `net/textproto` dot-reader hits EOF mid-body and returns `io.ErrUnexpectedEOF`; Maddy's `Session.Data` logs `DATA error {"reason":"unexpected EOF"}` and `endp.wrapErr` (`smtp.go:389`) maps the non-`SMTPError` to the generic `554` — `EnhancedCodeNotSet` is promoted to `5.0.0` at `go-smtp/conn.go:663-666`, rendering `554 5.0.0 Internal server error (msg ID = …)`, which go-smtp writes to the still-open read side. **0 delivered**, and this reproduced on every run. Complete capture:
+
+```text
+==================== EXPERIMENT B.E6 half-close (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [110 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [131 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E6-halfclose\r\nX-Probe: boundary-test\r\n\r\nBody with no terminator at all'
+>>> HALF-CLOSE: client shutdown(SHUT_WR); read side kept open, polling for the server's final response
+--- S->C [53 bytes] --- b'554 5.0.0 Internal server error (msg ID = a0ba388f)\r\n'
+>>> server closed its side (recv returned empty)
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: RCPT TO:<rcpt@probe.local>
+
+smtp: incoming message	{"msg_id":"a0ba388f","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:51242"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"a0ba388f"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"a0ba388f"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"a0ba388f"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"a0ba388f"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"a0ba388f"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"a0ba388f"}
+[debug] smtp_downstream: connected	{"msg_id":"a0ba388f","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"a0ba388f"}
+smtp: RCPT ok	{"msg_id":"a0ba388f","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+smtp: From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E6-halfclose
+X-Probe: boundary-test
+
+Body with no terminator at all
+smtp: DATA error	{"msg_id":"a0ba388f","reason":"unexpected EOF"}
+smtp: 554 5.0.0 Internal server error (msg ID = a0ba388f)
+
+smtp: aborted	{"msg_id":"a0ba388f"}
+[debug] smtp: reset	
+
+-------- delivered messages (new caught_* files) --------
+delivered messages captured: 0
+```
+
+### B.ELINE — over-long `DATA` line: `unexpected EOF` and abrupt-close `connection reset by peer` variants (complete; 0 delivered)
+
+**Same-input distribution (run-to-run rigor).** The identical ELINE input — a 2500-byte `DATA` body line (exceeding `MaxLineLength` 2000) followed by `\r\n.\r\n` — was replayed **64 times** against the running server. Observed distribution: server-logged `DATA error {"reason":"unexpected EOF"}` in **36/64** runs, a clean `500 5.4.0 Too long line, closing connection` in **28/64** runs, and `connection reset by peer` in **0/64**; the invariant across all 64 was **0 delivered**. Which server-log reason appears is governed by *how the client tears the socket down*, not by the payload: a client that reads the response and then closes cleanly makes the server's read see EOF (`unexpected EOF`); a client that closes abruptly (RST) with the server's response still unread makes the server's read see `connection reset by peer`. That is why the `2/10` reset share in the §3 10-run sample did not recur in this drain-then-close re-run — the reset reason requires an abrupt RST close, exercised explicitly in (ii) below.
+
+**(i) `unexpected EOF` variant (same input; client drains then closes cleanly).** The server logs the `DATA error`, writes a `554 5.0.0 Internal server error (msg ID = …)` that the timed-out client never reads, and aborts. Complete capture:
+
+```text
+==================== EXPERIMENT ELINE (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [72 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [2599 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: ELINE\r\nX-Probe: boundary-test\r\n\r\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n.\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- S->C --- b'<no data - timed out>'
+CLIENT_OUTCOME=timeout
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: RCPT TO:<rcpt@probe.local>
+
+smtp: incoming message	{"msg_id":"10a6b616","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:41934"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"10a6b616"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"10a6b616"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"10a6b616"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"10a6b616"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"10a6b616"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"10a6b616"}
+[debug] smtp_downstream: connected	{"msg_id":"10a6b616","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"10a6b616"}
+smtp: RCPT ok	{"msg_id":"10a6b616","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+smtp: DATA error	{"msg_id":"10a6b616","reason":"unexpected EOF"}
+smtp: 554 5.0.0 Internal server error (msg ID = 10a6b616)
+
+smtp: aborted	{"msg_id":"10a6b616"}
+[debug] smtp: reset	
+
+-------- delivered messages (new caught_* files) --------
+delivered messages captured: 0
+```
+
+**(ii) `connection reset by peer` variant (same 2599-byte body; abrupt `SO_LINGER=0` RST close, server response left unread).** This is the close behaviour that deterministically produces the reset reason — the same reason-shape as the §3 abrupt-`close()` E6 run. The RST tears the socket down before the server can write its `554`, so only the `DATA error` + `aborted` are logged. Complete capture:
+
+```text
+==================== EXPERIMENT ELINE-abrupt (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [72 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [2599 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: ELINE\r\nX-Probe: boundary-test\r\n\r\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n.\r\n'
+>>> abrupt close with SO_LINGER=0 (RST), server response left unread
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: RCPT TO:<rcpt@probe.local>
+
+smtp: incoming message	{"msg_id":"50869fbf","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:54910"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"50869fbf"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"50869fbf"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"50869fbf"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"50869fbf"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"50869fbf"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"50869fbf"}
+[debug] smtp_downstream: connected	{"msg_id":"50869fbf","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"50869fbf"}
+smtp: RCPT ok	{"msg_id":"50869fbf","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+smtp: DATA error	{"msg_id":"50869fbf","reason":"read tcp 127.0.0.1:2525-\u003e127.0.0.1:54910: read: connection reset by peer"}
+smtp: aborted	{"msg_id":"50869fbf"}
+[debug] smtp: reset	
+
+-------- delivered messages (new caught_* files) --------
+delivered messages captured: 0
 ```
 
 ### B.ECMD — over-long command line, clean read-until-close (complete)
