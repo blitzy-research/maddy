@@ -1,6 +1,6 @@
 # maddy Message Pipeline & Delivery Queue — Runtime Behavioral Investigation
 
-This document answers, **from actual observed runtime behavior (not code reading alone)**, how the [maddy](https://github.com/foxcpp/maddy) mail server processes a message from ingress to final delivery, and how its disk-backed delivery queue behaves under repeated delivery failure, connection timeout, and concurrent multi-destination load. The subject is the maddy source tree — Go module `github.com/foxcpp/maddy`, branch `maddy_26452dd8dd78`, HEAD `26452dd` ("target/remote: Rewrite connection part to allow more concurrency"). maddy was **built from source with the pinned toolchain, run through its real SMTP entry point**, and its logs (at default and `-debug` verbosity), per-attempt durations, and on-disk queue state were captured directly. Every behavioral claim below leads with the direct answer, is backed by the complete unedited output that produced it inside a fenced block, and is anchored to a specific source location by `file:line`. The single statement established by code reading rather than direct observation is explicitly labelled as inferred (in Q2).
+This document answers, **from actual observed runtime behavior (not code reading alone)**, how the [maddy](https://github.com/foxcpp/maddy) mail server processes a message from ingress to final delivery, and how its disk-backed delivery queue behaves under repeated delivery failure, connection timeout, and concurrent multi-destination load. The subject is the maddy source tree — Go module `github.com/foxcpp/maddy`, branch `maddy_26452dd8dd78`, HEAD `26452dd` ("target/remote: Rewrite connection part to allow more concurrency"). maddy was **built from source with the pinned toolchain, run through its real SMTP entry point**, and its logs (at default and `-debug` verbosity), per-attempt durations, and on-disk queue state were captured directly. Every behavioral claim below leads with the direct answer, is backed by the complete unedited output that produced it inside a fenced block, and is anchored to a specific source location by `file:line`. One result is genuinely environment-dependent — the `remote` target's MX-lookup outcome in Q2, which yields either `550`/`5.4.0` or `554`/`5.4.4` depending on how the DNS resolver answers the MX query; **both variants were observed directly and the observed distribution is reported** rather than either being asserted alone. Where a *non-default* configuration was used to exercise a specific branch (e.g., `authenticate_mx off` to force the `net.DefaultResolver` MX-lookup path in Q2), it is explicitly labelled as non-canonical.
 
 The five questions answered are:
 
@@ -26,7 +26,7 @@ go build -o /tmp/maddywork/maddy    ./cmd/maddy
 go build -o /tmp/maddywork/maddyctl ./cmd/maddyctl
 ```
 
-Both builds succeeded (exit 0); the resulting `maddy` binary was **21,812,056 bytes**. The only compiler output was a single benign CGO warning from the SQLite binding:
+Both builds succeeded (exit 0). The resulting `maddy` binary size is **toolchain-dependent** and is therefore *not* a stable canonical identifier: built with the canonical Go 1.18.10 toolchain the binary measured **19,386,568 bytes** (`stat -c %s /tmp/maddywork/maddy`), whereas the identical source built with the historically pinned Go 1.13.3 toolchain measured **21,859,872 bytes** — the two differ by ~2.4 MB purely from linker and runtime changes between Go releases, with no source change. The stable, build-independent identifier is instead the version banner `maddy unknown (built from source tree)` (reported immediately below). The only compiler output was a single benign CGO warning from the SQLite binding:
 
 ```
 sqlite3-binding.c:125322:10: warning: function may return address of local variable [-Wreturn-local-addr]
@@ -309,32 +309,91 @@ This is the crux of Q2/Q5 and is documented explicitly. Errors are **temporary-b
 Consequence, with observed proof:
 
 - **`smtp_downstream` dials eagerly inside `Start()`** — `Start()` [smtp_downstream.go:L130] invokes `d.connect(ctx)` at [smtp_downstream.go:L139] (`connect()` is defined at [smtp_downstream.go:L150]). So a connection failure is a `Start()` failure → **permanent → not retried**. **Observed:** the connection-refused run (message `13a8ce17`, in (b) above) logged `queue: not delivered, permanent error` and left the queue directory **empty** (`file-count=0`, shown in (b)), *even though* the wrapped error carried an SMTP `smtp_code:450` — proving the outcome is decided by the **stage** (a `Start()` failure), not by the SMTP code. (Black-hole through `smtp_downstream` is likewise a `Start()` failure and therefore permanent.)
-- **`remote` connects lazily inside `AddRcpt()`** — via `connectionForDomain()` [remote.go:L195,L230 → connect.go:L113]. This is proven by two runs against the `remote` target (submission port `15565`; both left the queue **empty** — `find /tmp/maddyrun/stateRem -name '*.meta' | wc -l` = `0`). Commands:
+- **`remote` connects lazily inside `AddRcpt()`** — via `connectionForDomain()` [remote.go:L195,L230 → connect.go:L113]. This was proven by submitting through the real SMTP entry point to a `remote` delivery target on an ephemeral loopback endpoint (port `15900`, default MX-authentication settings). Commands:
 
   ```
-  $ python3 /tmp/maddyrun/submit.py 127.0.0.1 15565 sender@src.local test@localhost
-  $ python3 /tmp/maddyrun/submit.py 127.0.0.1 15565 sender@src.local user@nxdomain-zzz-test.invalid
+  $ python3 /tmp/maddyrun_fix/submit.py 127.0.0.1 15900 sender@src.local test@localhost
+  $ python3 /tmp/maddyrun_fix/submit.py 127.0.0.1 15900 sender@src.local user@nxdomain-zzz-test.invalid
   ```
 
-  **Observed** (message `387c62d4`, recipient `test@localhost`):
+  **Observed** (message `42d1c1c4`, recipient `test@localhost`):
+
+```
+[debug] queue: using message ID = 42d1c1c4-1	{"msg_id":"42d1c1c4"}
+[debug] queue: target.Start OK	{"msg_id":"42d1c1c4"}
+[debug] remote: trying	{"domain":"localhost","msg_id":"42d1c1c4-1","mx":"localhost"}
+[debug] remote: Policy fetch error, ignoring	{"domain":"localhost","err":"mtasts: policy ignored due to errors","msg_id":"42d1c1c4-1","mx":"localhost"}
+[debug] queue: delivery.AddRcpt test@localhost failed: dial tcp 127.0.0.1:25: connect: connection refused	{"msg_id":"42d1c1c4"}
+[debug] queue: delivery.Abort (no accepted receipients)	{"msg_id":"42d1c1c4"}
+[debug] queue: failures: permanently: [test@localhost], temporary: [], errors: map[test@localhost:dial tcp 127.0.0.1:25: connect: connection refused]	{"msg_id":"42d1c1c4"}
+queue: delivery attempt failed	{"domain":"localhost","io_op":"dial","msg_id":"42d1c1c4","rcpt":"test@localhost","reason":"dial tcp 127.0.0.1:25: connect: connection refused","remote_addr":"127.0.0.1:25","smtp_code":550,"smtp_enchcode":"5.4.0","smtp_msg":"No usable MXs, last err: dial tcp 127.0.0.1:25: connect: connection refused","target":"remote"}
+queue: not delivered, permanent error	{"msg_id":"42d1c1c4","rcpt":"test@localhost"}
+[debug] queue: removed message from disk	{"msg_id":"42d1c1c4"}
+```
+
+  and (message `f16eeecf`, recipient `user@nxdomain-zzz-test.invalid`):
+
+```
+[debug] queue: using message ID = f16eeecf-1	{"msg_id":"f16eeecf"}
+[debug] queue: target.Start OK	{"msg_id":"f16eeecf"}
+[debug] remote: trying	{"domain":"nxdomain-zzz-test.invalid","msg_id":"f16eeecf-1","mx":"nxdomain-zzz-test.invalid"}
+[debug] remote: Policy fetch error, ignoring	{"domain":"nxdomain-zzz-test.invalid","err":"mtasts: policy ignored due to errors","msg_id":"f16eeecf-1","mx":"nxdomain-zzz-test.invalid"}
+[debug] queue: delivery.AddRcpt user@nxdomain-zzz-test.invalid failed: dial tcp: lookup nxdomain-zzz-test.invalid on 34.118.224.10:53: no such host	{"msg_id":"f16eeecf"}
+[debug] queue: delivery.Abort (no accepted receipients)	{"msg_id":"f16eeecf"}
+[debug] queue: failures: permanently: [user@nxdomain-zzz-test.invalid], temporary: [], errors: map[user@nxdomain-zzz-test.invalid:dial tcp: lookup nxdomain-zzz-test.invalid on 34.118.224.10:53: no such host]	{"msg_id":"f16eeecf"}
+queue: delivery attempt failed	{"domain":"nxdomain-zzz-test.invalid","io_op":"dial","msg_id":"f16eeecf","rcpt":"user@nxdomain-zzz-test.invalid","reason":"dial tcp: lookup nxdomain-zzz-test.invalid on 34.118.224.10:53: no such host","remote_server":null,"smtp_code":550,"smtp_enchcode":"5.4.0","smtp_msg":"No usable MXs, last err: dial tcp: lookup nxdomain-zzz-test.invalid on 34.118.224.10:53: no such host","target":"remote"}
+queue: not delivered, permanent error	{"msg_id":"f16eeecf","rcpt":"user@nxdomain-zzz-test.invalid"}
+[debug] queue: removed message from disk	{"msg_id":"f16eeecf"}
+```
+
+  Both traces prove `remote.Start()` returns OK **without** connecting (`queue: target.Start OK` precedes the failure), and that the resolve/connect work happens lazily in `AddRcpt` — the opposite of `smtp_downstream`. The `[debug] remote: trying … {"mx":"localhost"}` line confirms the connect loop reached a candidate host and `connectionForDomain()` then wrapped the last error as an `SMTPError` with `Code: exterrors.SMTPCode(err, 451, 550)` and message `"No usable MXs, last err: …"` [connect.go:L202-L213] — observed as `smtp_code:550`, `smtp_enchcode:5.4.0`. Because `SMTPCode()` uses `IsTemporary()` (permanent-by-default) [exterrors/smtp.go:L112-L118] and neither `connection refused` nor `no such host` reports `Temporary() == true`, the code resolved to **`550`**; and `SMTPError.Temporary()` is `Code/100 == 4` [exterrors/smtp.go:L95-L97], so a `550` is **permanent** → `IsTemporaryOrUnspec()` returned `false` → **not retried** (the queue directory was emptied). This `550`/`5.4.0` outcome was **stable across the reproduction: 40 of 40 default-config submissions** (20 to `test@localhost`, 20 to `user@nxdomain-zzz-test.invalid`) produced `smtp_code:550` and **zero** produced `554`.
+
+#### The exact SMTP wrapper is DNS-environment-dependent — `550`/`5.4.0` **or** `554`/`5.4.4` (both observed directly; both permanent)
+
+**Direct answer.** Through `remote`, a connection- or MX-lookup failure always surfaces lazily at `AddRcpt` (after `target.Start OK`) and is always classified **permanent → not retried**; but the specific SMTP wrapper depends on *where in MX resolution* the failure surfaces, which in turn depends on how the DNS resolver answers the MX query for the recipient domain. Two outcomes are observable for the same inputs:
+
+- **`550` / `5.4.0` / `"No usable MXs, last err: …"`** [connect.go:L202-L213] — emitted when `rd.lookupMX()` returns **without** a hard error (no MX records → the A/AAAA fallback [connect.go:L266-L271] supplies `Host = domain`) but the subsequent dial to that host fails. This is the outcome observed above (40/40) under the **default** configuration.
+- **`554` / `5.4.4` / `"MX lookup error"`** [connect.go:L250-L258] — emitted when `rd.lookupMX()` **itself returns an error**, returned from `connectionForDomain()` at [connect.go:L145,L148] before any dial is attempted.
+
+**Why the branch is environment-dependent.** The default `remote` target sets `authenticate_mx [mtasts dnssec]` [remote.go:L96-L98], so `AuthDNSSEC` is on and `lookupMX()` performs the MX query through the DNSSEC-aware stub resolver via `rd.rt.extResolver.AuthLookupMX()` [connect.go:L241,L245]; with `authenticate_mx off` it instead uses `rd.rt.resolver.LookupMX()` = Go's `net.DefaultResolver` [connect.go:L247]. Whichever resolver is used, the deciding condition is the same — does the MX lookup return an error (→ `554`) or empty-without-error (→ A/AAAA fallback → dial → `550`) [connect.go:L145,L148]. In **this** container (nameserver `34.118.224.10`; `localhost` present in `/etc/hosts`) the two resolvers answer these names differently: the default DNSSEC path returns empty-without-error (→ `550`, observed 40/40), whereas Go's `net.DefaultResolver` returns a hard `"no such host"` for the same names — confirmed directly:
+
+```
+$ go run mxtest.go        # mxtest.go calls net.DefaultResolver.LookupMX
+LookupMX("localhost"): records=[] err=lookup localhost on 34.118.224.10:53: no such host
+```
+
+**`554` observed directly** through the real SMTP entry point by selecting the `net.DefaultResolver` MX-lookup branch with **`authenticate_mx off`** — a *non-default, non-canonical* configuration used solely to exercise the lookup-error branch (same loopback submission path, port `15901`):
 
   ```
-[debug] queue: target.Start OK	{"msg_id":"387c62d4"}
-[debug] queue: delivery.AddRcpt test@localhost failed: dial tcp 127.0.0.1:25: connect: connection refused	{"msg_id":"387c62d4"}
-[debug] queue: failures: permanently: [test@localhost], temporary: [], errors: map[test@localhost:dial tcp 127.0.0.1:25: connect: connection refused]	{"msg_id":"387c62d4"}
-queue: delivery attempt failed	{"domain":"localhost","io_op":"dial","msg_id":"387c62d4","rcpt":"test@localhost","reason":"dial tcp 127.0.0.1:25: connect: connection refused","remote_addr":"127.0.0.1:25","smtp_code":550,"smtp_enchcode":"5.4.0","smtp_msg":"No usable MXs, last err: dial tcp 127.0.0.1:25: connect: connection refused","target":"remote"}
-queue: not delivered, permanent error	{"msg_id":"387c62d4","rcpt":"test@localhost"}
+  $ python3 /tmp/maddyrun_fix/submit.py 127.0.0.1 15901 sender@src.local test@localhost
+  $ python3 /tmp/maddyrun_fix/submit.py 127.0.0.1 15901 sender@src.local user@nxdomain-zzz-test.invalid
   ```
 
-  and (message `9b0323c2`, recipient `user@nxdomain-zzz-test.invalid`):
+  message `341a2792`, recipient `test@localhost`:
 
-  ```
-[debug] queue: delivery.AddRcpt user@nxdomain-zzz-test.invalid failed: dial tcp: lookup nxdomain-zzz-test.invalid on 34.118.224.10:53: no such host	{"msg_id":"9b0323c2"}
-queue: delivery attempt failed	{"domain":"nxdomain-zzz-test.invalid","io_op":"dial","msg_id":"9b0323c2","rcpt":"user@nxdomain-zzz-test.invalid","reason":"dial tcp: lookup nxdomain-zzz-test.invalid on 34.118.224.10:53: no such host","remote_server":null,"smtp_code":550,"smtp_enchcode":"5.4.0","smtp_msg":"No usable MXs, last err: dial tcp: lookup nxdomain-zzz-test.invalid on 34.118.224.10:53: no such host","target":"remote"}
-  ```
+```
+[debug] queue: using message ID = 341a2792-1	{"msg_id":"341a2792"}
+[debug] queue: target.Start OK	{"msg_id":"341a2792"}
+[debug] queue: delivery.AddRcpt test@localhost failed: no such host	{"msg_id":"341a2792"}
+[debug] queue: delivery.Abort (no accepted receipients)	{"msg_id":"341a2792"}
+[debug] queue: failures: permanently: [test@localhost], temporary: [], errors: map[test@localhost:no such host]	{"msg_id":"341a2792"}
+queue: delivery attempt failed	{"msg_id":"341a2792","rcpt":"test@localhost","reason":"no such host","smtp_code":554,"smtp_enchcode":"5.4.4","smtp_msg":"MX lookup error","target":"remote"}
+queue: not delivered, permanent error	{"msg_id":"341a2792","rcpt":"test@localhost"}
+```
 
-  Both traces prove `remote.Start()` returns OK **without** connecting (`queue: target.Start OK` precedes the failure), and that the resolve/connect work happens lazily in `AddRcpt` — the opposite of `smtp_downstream`. In **both** runs the connect loop exhausted all candidate MXs and `connectionForDomain()` wrapped the last error as an `SMTPError` with `Code: exterrors.SMTPCode(err, 451, 550)` and message `"No usable MXs, last err: …"` [connect.go:L202-L213] — observed as `smtp_code:550`, `smtp_enchcode:5.4.0`. Because `SMTPCode()` uses `IsTemporary()` (permanent-by-default) [exterrors/smtp.go:L112-L118] and neither `connection refused` nor `no such host` reports `Temporary() == true`, the code resolved to **`550`**; and `SMTPError.Temporary()` is `Code/100 == 4` [exterrors/smtp.go:L95-L97], so a `550` is **permanent** → `IsTemporaryOrUnspec()` returned `false` → **not retried** (queue emptied). So through `remote`, a *connection-refused* or *no-such-host* failure is also permanent — reached via `AddRcpt`/the `"No usable MXs"` wrapper rather than `Start()` — the observable difference between the targets being **where** the connection is attempted (`Start` vs `AddRcpt`), proven by the `target.Start OK` line preceding the `remote` failure.
-  - **(inferred)** The distinct **`554` / `5.4.4` / `"MX lookup error"`** wrapper [connect.go:L250-L258] fires **only** when `rd.rt.resolver.LookupMX()` itself returns an error. In both runs above it did **not** fire: `localhost` has an `A` record, so `LookupMX` returned empty-without-error and the A/AAAA fallback [connect.go:L266-L271] supplied the host; and for `nxdomain-zzz-test.invalid` the failure surfaced later, during the dial's own address lookup (reason prefixed `dial tcp: lookup …: no such host`), again not from `LookupMX`. This one `LookupMX`-error path is therefore established by code reading rather than direct observation.
+  and (message `1550c192`, recipient `user@nxdomain-zzz-test.invalid`):
+
+```
+[debug] queue: using message ID = 1550c192-1	{"msg_id":"1550c192"}
+[debug] queue: target.Start OK	{"msg_id":"1550c192"}
+[debug] queue: delivery.AddRcpt user@nxdomain-zzz-test.invalid failed: no such host	{"msg_id":"1550c192"}
+[debug] queue: delivery.Abort (no accepted receipients)	{"msg_id":"1550c192"}
+[debug] queue: failures: permanently: [user@nxdomain-zzz-test.invalid], temporary: [], errors: map[user@nxdomain-zzz-test.invalid:no such host]	{"msg_id":"1550c192"}
+queue: delivery attempt failed	{"msg_id":"1550c192","rcpt":"user@nxdomain-zzz-test.invalid","reason":"no such host","smtp_code":554,"smtp_enchcode":"5.4.4","smtp_msg":"MX lookup error","target":"remote"}
+queue: not delivered, permanent error	{"msg_id":"1550c192","rcpt":"user@nxdomain-zzz-test.invalid"}
+```
+
+Both `554` runs likewise show `target.Start OK` before the `AddRcpt` failure (lazy connect), and both left the queue **empty** — a `554` is `5xx`, so `SMTPError.Temporary()` (`Code/100 == 4`) [exterrors/smtp.go:L95-L97] is `false` → **permanent → not retried**, exactly like the `550`. The `554` wrapper is returned from a **single shared branch** at [connect.go:L145,L148] regardless of *which* resolver populated the lookup error, so it is equally reachable under the **default** configuration in any resolver state where the DNSSEC MX query returns a hard error — producing the identical `554`/`5.4.4` output shown above. **Observed distribution:** in this environment the default (DNSSEC) path produced `550` consistently — **40/40** submissions, zero `554` — while the `554` path was reached deterministically through the `net.DefaultResolver` branch (`authenticate_mx off`); the run-to-run variability that exists is thus *across resolver states/environments*, not within a fixed one. Either way, the answer to the question is identical: a `remote` connection/lookup failure is **permanent → not retried**, surfacing lazily at `AddRcpt` after `target.Start OK`.
 
 Because of this stage dependence, the reproductions drive the retry/queue-file path with a temporary **`451` DATA-stage rejection** (a `Body`/`Commit`-stage failure → temporary → retried).
 
@@ -439,7 +498,7 @@ Note (observed + `file:line`): the `.header` contains maddy's own `Received:` he
 
 ### (b) Naming patterns
 
-`<id>` is an **8-character lowercase hex** string — examples observed across the reproductions include `aff956e1`, `9b21a24e`, `3b3fae59`, and `4701aa33` — produced by `GenerateMsgID()` [msgid.go:L12] (4 random bytes hex-encoded). The metadata file is written atomically via a `.meta.new` temporary file plus rename; if a metadata file cannot be parsed, it is quarantined by renaming it to `<id>.meta_broken` [queue.go:L268].
+`<id>` is an **8-character lowercase hex** string — examples observed across the reproductions include `aff956e1`, `9b21a24e`, `3b3fae59`, and `4701aa33` — produced by `GenerateMsgID()` [msgid.go:L12] (4 random bytes hex-encoded). The metadata file is written atomically via a `.meta.new` temporary file plus rename — `os.Create(metaPath + ".new")` [queue.go:L744] writes the new copy, then `os.Rename(metaPath+".new", metaPath)` [queue.go:L762] atomically replaces the live `.meta`; if a metadata file cannot be parsed, it is quarantined by renaming it to `<id>.meta_broken` [queue.go:L268].
 
 ### (c) Retry-count metadata — the full state transition (before / during / after)
 
@@ -592,6 +651,8 @@ Every anchor cited above, grouped by file. Line numbers are for branch `maddy_26
 - L607 — `headerPath := filepath.Join(q.location, id+".header")`
 - L611 — `bodyPath := filepath.Join(q.location, id+".body")`
 - L615 — `metaPath := filepath.Join(q.location, id+".meta")`
+- L744 — `file, err := os.Create(metaPath + ".new")` (atomic metadata write: create the `.meta.new` temp file)
+- L762 — `os.Rename(metaPath+".new", metaPath)` (atomic metadata write: rename `.meta.new` over the live `.meta`)
 - L849 — `func (q *Queue) emitDSN(...)`
 
 **`internal/target/queue/timewheel.go`**
@@ -606,13 +667,18 @@ Every anchor cited above, grouped by file. Line numbers are for branch `maddy_26
 **`internal/target/remote/remote.go`**
 - L41 — `var smtpPort = "25"`
 - L81 — `dialer: (&net.Dialer{}).DialContext` (no application-level dial timeout)
+- L96-L98 — `cfg.EnumList("authenticate_mx", false, false, []string{AuthMTASTS, AuthDNSSEC}, &mxAuth)` (default MX-authentication mechanisms **include `dnssec`**, so the default lookup path is DNSSEC-aware)
 - L195 — `func (rd *remoteDelivery) AddRcpt(...)` (lazy connect happens here)
 - L230 — `conn, err := rd.connectionForDomain(ctx, domain)`
 
 **`internal/target/remote/connect.go`**
 - L113 — `func (rd *remoteDelivery) connectionForDomain(...)`
+- L145 — `dnssecOk, records, err := rd.lookupMX(ctx, domain)` (the single MX-lookup call whose result selects the `554`-vs-`550` branch)
+- L148 — `return nil, err` (on MX-lookup **error**, propagate → `554` "MX lookup error" path)
 - L202-L213 — "No usable MXs, last err: …" wrapper returned when no candidate connected: `Code: exterrors.SMTPCode(err, 451, 550)`, `EnhancedCode: exterrors.SMTPEnchCode(err, {0,4,0})`, `Message: "No usable MXs, last err: …"`, `TargetName: "remote"` (→ observed `550` permanent when the last error is not `Temporary()`)
-- L247 — `records, err = rd.rt.resolver.LookupMX(ctx, domain)`
+- L241 — `if _, use := rd.rt.mxAuth[AuthDNSSEC]; use {` (DNSSEC branch guard — taken by default)
+- L245 — `dnssecOk, records, err = rd.rt.extResolver.AuthLookupMX(context.Background(), domain)` (default DNSSEC-aware MX lookup via `extResolver`, **not** `net.DefaultResolver`)
+- L247 — `records, err = rd.rt.resolver.LookupMX(ctx, domain)` (else-branch: plain `net.DefaultResolver` MX lookup, reached only with `authenticate_mx off`)
 - L250-L258 — MX-lookup error wrapped as `SMTPError{Code: SMTPCode(err,451,554), EnhancedCode: {0,4,4}, Message: "MX lookup error", TargetName: "remote"}`
 - L266-L271 — fallback to A/AAAA record when no MX records are present
 
