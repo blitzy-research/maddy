@@ -174,11 +174,11 @@ smtp: accepted	{"msg_id":"aff956e1"}
 
 ## Q2 — Retry & Timeout Behavior
 
-**Direct answer.** With a small `max_tries` and delivery pointed at a non-responsive destination, maddy makes **one connection attempt per scheduled try**; **each attempt's duration is dictated entirely by the OS TCP stack and the destination's behavior — maddy sets NO application-level dial or read timeout**; and successive tries are spaced by a **hardcoded exponential backoff starting at 15 minutes and doubling each time**. Each failed attempt emits **two** default-level log lines: `queue: delivery attempt failed` (one per recipient, carrying the error detail) and `queue: will retry` (carrying the attempt count and the next delay). With `max_tries = N` the schedule is **N + 1 total attempts** before the terminal bounce.
+**Direct answer.** With a small `max_tries` and delivery pointed at a non-responsive destination, maddy makes **one connection attempt per scheduled try**; **each attempt's duration is dictated entirely by the OS TCP stack and the destination's behavior — maddy sets NO application-level dial or read timeout**; and successive tries are spaced by a **hardcoded exponential backoff starting at 15 minutes and doubling each time**. Each failed attempt emits **two** default-level log lines: `queue: delivery attempt failed` (one per recipient, carrying the error detail) and `queue: will retry` (carrying the attempt count and the next delay). With `max_tries = N` the schedule is **N + 1 total attempts**, after which the message leaves the queue. For the temporary-failure path documented here that terminal removal is **silent** — the message is simply removed from disk with **no DSN/bounce emitted** (the `emitDSN()` call is guarded and is not reached; see (a) and the *Terminal branch* observation below).
 
 ### (a) Exact sequence of connection attempts
 
-On each scheduled try, the queue's delivery goroutine acquires the concurrency semaphore [queue.go:L283], logs `delivery attempt #<TriesCount+1>` [queue.go:L367], and the target opens exactly **one** TCP connection to the destination. On failure, if the attempt is not terminal, `meta.TriesCount++` [queue.go:L407] and the message is rescheduled on the time wheel at the computed `nextTryTime` via `q.wheel.Add(nextTryTime, ...)` [queue.go:L414,L420]; the in-memory body/headers are dropped and reloaded from disk on the next attempt. The **terminal condition** is `if meta.TriesCount == q.maxTries || len(partialErr.TemporaryFailed) == 0` [queue.go:L390]; when it holds, the message is bounced via `emitDSN()` [queue.go:L849, called at L401] and removed from disk via `removeFromDisk()` [queue.go:L600, called at L403]. Concretely, the two physically observed attempts (detailed below) form the sequence: **attempt #1 immediately on submit, attempt #2 exactly 15 minutes later.**
+On each scheduled try, the queue's delivery goroutine acquires the concurrency semaphore [queue.go:L283], logs `delivery attempt #<TriesCount+1>` [queue.go:L367], and the target opens exactly **one** TCP connection to the destination. On failure, if the attempt is not terminal, `meta.TriesCount++` [queue.go:L407] and the message is rescheduled on the time wheel at the computed `nextTryTime` via `q.wheel.Add(nextTryTime, ...)` [queue.go:L414,L420]; the in-memory body/headers are dropped and reloaded from disk on the next attempt. The **terminal condition** is `if meta.TriesCount == q.maxTries || len(partialErr.TemporaryFailed) == 0` [queue.go:L390]; when it holds, the message is **removed from disk** via `removeFromDisk()` [queue.go:L600, called unconditionally at L403]. A DSN/bounce via `emitDSN()` [queue.go:L849, called at L401] is **guarded** by [queue.go:L400] (`if len(meta.FailedRcpts)+len(meta.TemporaryFailedRcpts) != 0`) and is **not reached on the temporary-failure (451) retry path documented here**: `meta.TemporaryFailedRcpts` is a *dead field* — declared at [queue.go:L160] but never assigned anywhere in the tree — and `meta.FailedRcpts` is populated only by *permanent* failures ([queue.go:L382], appended from `partialErr.Failed`), whereas a temporary `451` is routed to `partialErr.TemporaryFailed → meta.To` [queue.go:L387]. Both counts are therefore zero, the L400 guard is false, and the message is dropped **silently, with no DSN**. (`emitDSN()` fires only when a message has accumulated *permanent* `FailedRcpts` **and** a `bounce`/DSN pipeline is configured; it early-returns when `q.dsnPipeline == nil` [queue.go:L851], which is the case both in this rig and in the shipped default.) This silent terminal removal is verified at runtime in the *Terminal branch* observation below. Concretely, the two physically observed attempts (detailed below) form the sequence: **attempt #1 immediately on submit, attempt #2 exactly 15 minutes later.**
 
 ### (b) Measured per-attempt timeout durations
 
@@ -430,7 +430,53 @@ queue: will retry	{"attempts_count":1,"msg_id":"aff956e1","next_try_delay":"14m5
 queue: will retry	{"attempts_count":2,"msg_id":"aff956e1","next_try_delay":"29m59.999998996s","rcpts":["user@dest.local"]}
 ```
 
-Instance B shows the same doubling for stability: `next_try_delay` `14m59.999999423s` → `29m59.999999194s`. Conclusion: the first backoff is **exactly 15 minutes** (gaps `900.003929 s` and `900.004403 s`; spread `0.000474 s`), and `next_try_delay` **doubles** (15 min → 30 min), matching `initialRetryTime = 15 min` and `retryTimeScale = 2` [queue.go:L185-L186,L414]. Attempts #1 and #2 were physically observed for both instances, and after attempt #2 each message remained on disk at `TriesCount:2` scheduled for attempt #3 (see Q4). The **N + 1** schedule then follows from the source: the terminal check `meta.TriesCount == q.maxTries` [queue.go:L390] is evaluated *before* the counter is incremented, so with `max_tries = 2` it fires on attempt #3 (`TriesCount == 2`), triggering `emitDSN()` [queue.go:L849] and removal from disk — i.e., attempts #1, #2, #3 then a bounce.
+Instance B shows the same doubling for stability: `next_try_delay` `14m59.999999423s` → `29m59.999999194s`. Conclusion: the first backoff is **exactly 15 minutes** (gaps `900.003929 s` and `900.004403 s`; spread `0.000474 s`), and `next_try_delay` **doubles** (15 min → 30 min), matching `initialRetryTime = 15 min` and `retryTimeScale = 2` [queue.go:L185-L186,L414]. Attempts #1 and #2 were physically observed for both instances, and after attempt #2 each message remained on disk at `TriesCount:2` scheduled for attempt #3 (see Q4). The **N + 1** schedule then follows from the source: the terminal check `meta.TriesCount == q.maxTries` [queue.go:L390] is evaluated *before* the counter is incremented, so with `max_tries = 2` it fires on attempt #3 (`TriesCount == 2`), entering the terminal branch [queue.go:L389-L403] — i.e., attempts #1, #2, #3, after which the message is removed from disk via `removeFromDisk()` [queue.go:L403]. That terminal removal is **silent** on this temporary-failure path: the `emitDSN()` call at [queue.go:L401] is gated by the L400 guard and is **not** reached (no bounce is emitted; see (a)). This terminal behavior was reproduced and observed directly, as shown next.
+
+### Terminal branch (retry exhaustion): silent removal, not a DSN bounce
+
+To observe the terminal branch [queue.go:L389-L403] directly — without waiting through the multi-attempt, doubling ~15-minute backoff schedule to reach it — the queue was configured with `max_tries 0`, which makes the terminal check `meta.TriesCount == q.maxTries` [queue.go:L390] true on **attempt #1 itself** (`0 == 0`). `max_tries` has no lower-bound validation (`cfg.Int("max_tries", false, false, 8, &q.maxTries)` [queue.go:L204]), and the terminal-branch code [queue.go:L389-L403] is identical regardless of the `max_tries` value — only *which* attempt is terminal changes. The rig is otherwise the Investigation-Setup rig (loopback `smtp → queue → smtp_downstream` against the `451`-at-DATA fake server); no `bounce {}`/DSN pipeline is configured, matching the shipped default. Config delta only:
+
+```
+queue q_f1 {
+    max_tries 0
+    max_parallelism 16
+    target smtp_downstream {
+        targets tcp://127.0.0.1:26526
+        attempt_starttls no
+        require_tls no
+        hostname test.local
+    }
+    location /tmp/maddyrun_f1/state/q_f1
+}
+```
+
+Submitting one message over SMTP and capturing maddy's `-debug` output from the delivery attempt through the terminal action (message `86a0500d`; epoch prefixes stripped for readability):
+
+```
+[debug] queue: delivery attempt #1 {"msg_id":"86a0500d"}
+[debug] queue: using message ID = 86a0500d-1 {"msg_id":"86a0500d"}
+[debug] smtp_downstream: connected {"downstream_server":"127.0.0.1","msg_id":"86a0500d-1"}
+[debug] smtp_downstream: connected {"msg_id":"86a0500d-1","remote_server":"127.0.0.1"}
+[debug] queue: target.Start OK {"msg_id":"86a0500d"}
+[debug] queue: delivery.AddRcpt user@dest.local OK {"msg_id":"86a0500d"}
+[debug] queue: delivery.Body OK {"msg_id":"86a0500d"}
+[debug] queue: delivery.Commit failed: temporary failure, try again later {"msg_id":"86a0500d"}
+[debug] queue: delivery.Commit OK {"msg_id":"86a0500d"}
+[debug] queue: failures: permanently: [], temporary: [user@dest.local], errors: map[user@dest.local:temporary failure, try again later] {"msg_id":"86a0500d"}
+queue: delivery attempt failed {"msg_id":"86a0500d","rcpt":"user@dest.local","reason":"temporary failure, try again later","remote_server":"127.0.0.1","smtp_code":451,"smtp_enchcode":"4.3.0","smtp_msg":"temporary failure, try again later","target":"smtp_downstream"}
+[debug] queue: removed message from disk {"msg_id":"86a0500d"}
+```
+
+The message reaches the terminal branch on attempt #1 and goes **directly** from `queue: delivery attempt failed {…smtp_code:451…}` to `[debug] queue: removed message from disk` [queue.go:L619] — and **nothing else**. Note the preceding `failures: permanently: [], temporary: [user@dest.local]` line: the *permanent* set is empty, so `meta.FailedRcpts` is empty. Consequently there is **no** `not delivered, permanent error` line (the `FailedRcpts` loop at [queue.go:L397-L398] has nothing to iterate), **no** `not delivered, temporary error` line (the loop at [queue.go:L393] iterates `TemporaryFailedRcpts`, the dead field), and **no** DSN/bounce activity whatsoever. Immediately afterward the queue directory is empty and no DSN/mailer-daemon message is persisted anywhere in the state directory:
+
+```
+$ ls -1 /tmp/maddyrun_f1/state/q_f1/ | wc -l
+0
+$ find /tmp/maddyrun_f1/state -type f
+   (no output — no queue files, and no DSN/mailer-daemon message written anywhere)
+```
+
+This is the direct runtime confirmation that, on the temporary-failure retry path, terminal exhaustion **removes the message silently** via `removeFromDisk()` [queue.go:L403]; the `emitDSN()` call [queue.go:L401] is gated by the L400 guard (`len(meta.FailedRcpts)+len(meta.TemporaryFailedRcpts) != 0`), which is deterministically false here (both sets empty), so it is never invoked. The behavior was **stable across two runs** — the second submission (message `9de7fb28`, to a different recipient) produced the identical `delivery attempt failed {…smtp_code:451…}` → `removed message from disk` sequence with no DSN and an empty queue. A DSN/bounce is emitted only when a message accumulates *permanent* `FailedRcpts` [queue.go:L382] **and** a DSN pipeline is configured (`emitDSN()` early-returns on `q.dsnPipeline == nil` [queue.go:L851]).
 
 ---
 
@@ -533,7 +579,7 @@ The metadata fields, by name and meaning:
 - **`To`** — the recipients still to retry.
 - **`RcptErrs`** — a map of recipient → `SMTPError`, each with `Code`, `EnhancedCode` (a 3-integer array, e.g. `[4,0,0]`), and `Message`.
 - **`FirstAttempt`** — fixed at enqueue time; **`LastAttempt`** — advances on each attempt.
-- **`FailedRcpts`** / **`TemporaryFailedRcpts`** — the permanently- and temporarily-failed recipient sets (`null` here).
+- **`FailedRcpts`** / **`TemporaryFailedRcpts`** — the permanently- and temporarily-failed recipient sets (`null` here). `TemporaryFailedRcpts` is in fact a *dead field* (declared at [queue.go:L160] but never assigned anywhere in the tree), and `FailedRcpts` is written only by *permanent* failures [queue.go:L382]; because both are empty on this temporary-failure path, the terminal DSN guard at [queue.go:L400] is false, so retry-exhaustion removes the message **silently with no bounce** (see Q2(a) and the *Terminal branch* observation).
 - **`MsgMeta`** — the embedded message metadata (`ID`, `OriginalFrom`, `SMTPOpts.Size`, `Quarantine`, etc.).
 
 ---
@@ -614,6 +660,7 @@ Every anchor cited above, grouped by file. Line numbers are for branch `maddy_26
 - L12 — `func GenerateMsgID() (string, error)` — 4 random bytes hex-encoded → 8-char lowercase hex
 
 **`internal/target/queue/queue.go`**
+- L160 — `TemporaryFailedRcpts []string` (a `QueueMetadata` struct field declared here but **never assigned** anywhere in the tree — a dead field, always empty)
 - L185 — `initialRetryTime: 15 * time.Minute`
 - L186 — `retryTimeScale:   2`
 - L187 — `postInitDelay:    10 * time.Second`
@@ -628,11 +675,13 @@ Every anchor cited above, grouped by file. Line numbers are for branch `maddy_26
 - L299 — `q.Log.Debugln("delivery semaphore acquired for", slot.ID)`
 - L365 — `func (q *Queue) tryDelivery(...)`
 - L367 — `dl.Debugf("delivery attempt #%d", meta.TriesCount+1)`
+- L382 — `meta.FailedRcpts = append(meta.FailedRcpts, partialErr.Failed...)` (the **only** writer of `FailedRcpts`; appends *permanent* failures from `partialErr.Failed`)
 - L384 — `dl.Error("delivery attempt failed", rcptErr, "rcpt", rcpt)`
 - L390 — terminal check: `if meta.TriesCount == q.maxTries || len(partialErr.TemporaryFailed) == 0`
 - L398 — `dl.Msg("not delivered, permanent error", "rcpt", rcpt)`
-- L401 — `q.emitDSN(meta, header)` (terminal bounce call)
-- L403 — `q.removeFromDisk(meta.MsgMeta)` (terminal removal call)
+- L400 — terminal DSN guard: `if len(meta.FailedRcpts)+len(meta.TemporaryFailedRcpts) != 0` (deterministically **false** on the temporary-failure path — both sets empty — so `emitDSN` is not reached)
+- L401 — `q.emitDSN(meta, header)` (**guarded by L400**; reached only when there are *permanent* `FailedRcpts` and a DSN pipeline is configured)
+- L403 — `q.removeFromDisk(meta.MsgMeta)` (terminal removal call — called **unconditionally**)
 - L407 — `meta.TriesCount++`
 - L413 — `nextTryTime := time.Now()` (fresh reschedule base for the backoff — not `meta.LastAttempt`)
 - L414 — `nextTryTime = nextTryTime.Add(q.initialRetryTime * time.Duration(math.Pow(q.retryTimeScale, float64(meta.TriesCount-1))))` (backoff)
@@ -651,9 +700,11 @@ Every anchor cited above, grouped by file. Line numbers are for branch `maddy_26
 - L607 — `headerPath := filepath.Join(q.location, id+".header")`
 - L611 — `bodyPath := filepath.Join(q.location, id+".body")`
 - L615 — `metaPath := filepath.Join(q.location, id+".meta")`
+- L619 — `dl.Debugf("removed message from disk")` (the only log emitted by `removeFromDisk`; debug-level — this is the entire terminal action on the temporary-failure path)
 - L744 — `file, err := os.Create(metaPath + ".new")` (atomic metadata write: create the `.meta.new` temp file)
 - L762 — `os.Rename(metaPath+".new", metaPath)` (atomic metadata write: rename `.meta.new` over the live `.meta`)
 - L849 — `func (q *Queue) emitDSN(...)`
+- L851 — `if q.dsnPipeline == nil { return }` (`emitDSN` early-returns when no `bounce`/DSN pipeline is configured — the case in this rig and the shipped default)
 
 **`internal/target/queue/timewheel.go`**
 - L21 — `updateNotify chan time.Time`
