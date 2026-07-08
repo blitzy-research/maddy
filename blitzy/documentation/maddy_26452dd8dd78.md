@@ -2,35 +2,43 @@
 
 ## Section 0 — Scope, environment, and how this was produced (run-first)
 
-**The question.** This document answers, from *observed execution* of the real server, exactly how Maddy's SMTP endpoint detects the end of the `DATA` phase — the message boundary — and how that detection behaves when a client manipulates framing around it. Concretely it covers: how the server decides `DATA` is finished and switches back to command parsing; behavior under **bare-LF vs CRLF**, **dot-stuffing `\r\n..\r\n`**, **`\n.\n`**, and a **missing final CRLF before the dot**; whether **pipelined pressure** lets a non-standard boundary smuggle a second message (the CVE-2023-51765-class desync); whether **back-to-back** messages keep the boundary decision stable; how a small **front proxy** that cleans up or blocks ambiguous framing changes the story; and the end-to-end runtime narrative including **what lingers** when something goes wrong and **what one would expect to see but never does**.
+**The question.** How does Maddy's SMTP server detect the end of the `DATA` phase (the message boundary), and how does that detection behave when a client manipulates line endings, dot-stuffing, and command pipelining around that boundary? This document answers that end-to-end (Q1–Q6) **from observed execution** of the real server built and run in its canonical configuration.
 
-**Commit / branch / read-only guarantee.** The repository is at branch `maddy_26452dd8dd78`, HEAD `26452dd`. This is a strict read-only investigation: `git status --porcelain` was **empty before and after** the investigation. The entire build-run-probe harness lived in `/tmp/investig`, **outside** the repository, so no runtime artifact (`*queue`, `*mtasts-cache`, SQLite DBs, probe scripts) ever entered the tree. The only file added to the repository is this document.
+**Repository state.** All behavior was observed on Maddy commit `26452dd` (branch `maddy_26452dd8dd78`) with its pinned dependencies. This is a strictly read-only investigation: the only repository change is the addition of this document; the temporary observation harness lived entirely under `/tmp/investig` (outside the repository) and was removed afterward.
 
-**Canonical build and version (observed).** The binary was built and its version confirmed with the real entry point:
+**Canonical build (observed).** The binary was built with the canonical single-package command and its version string was read back. The Go toolchain is the one shipped in the designated image (Go 1.18.10):
 
-```
+```text
 $ go version
-go version go1.21.13 linux/amd64
+go version go1.18.10 linux/amd64
 $ go build ./cmd/maddy
+# github.com/mattn/go-sqlite3
+sqlite3-binding.c: In function ‘sqlite3SelectNew’:
+sqlite3-binding.c:125322:10: warning: function may return address of local variable [-Wreturn-local-addr]
+125322 |   return pNew;
+       |          ^~~~
+sqlite3-binding.c:125282:10: note: declared here
+125282 |   Select standin;
+       |          ^~~~~~~
 $ ./maddy -v
 maddy unknown (built from source tree)
 ```
 
-The version string `maddy unknown (built from source tree)` is `maddy.go:41` `Version = "unknown (built from source tree)"`. It is returned because a module build from the main tree reports `debug.ReadBuildInfo().Main.Version == "(devel)"`, so the code falls back to the compiled-in default rather than a tagged release. `go build ./cmd/maddy` compiles the default `internal/auth/pam/pam_stub.go` (guarded by the build tag `!cgo !libpam`), so **libpam is NOT required** for the default binary; however CGO **and** a C compiler **are** required for the default `github.com/mattn/go-sqlite3` storage driver. There is **no `run` subcommand** — the binary runs directly (`maddy.go:102` `func Run()`), taking flags `-config` (default `/etc/maddy/maddy.conf`), `-log`, `-v`, and `-debug` (declared around `maddy.go:104`).
+The build exits 0. The one compiler diagnostic (`-Wreturn-local-addr` in the vendored `sqlite3-binding.c`) is a **benign warning from the CGO SQLite driver `github.com/mattn/go-sqlite3 v1.11.0`** (`go.mod:26`), not an error — the default storage backend is CGO SQLite, which is why the build needs a C compiler. `libpam` headers are also linked by the PAM auth stack. The version string is `maddy unknown (built from source tree)` because a plain source build sets no linker version stamp (`Version` is defined at `maddy.go:41`).
 
-**Run command (observed).**
+**Run command (observed).** Maddy runs directly — there is **no `run` subcommand** (`Run` is the process entry point at `maddy.go:102`; `-debug` is registered around `maddy.go:104`):
 
-```
-$ ./maddy -config /tmp/investig/maddy.conf -log stderr -debug
-```
+`./maddy -config /tmp/investig/maddy.conf -log stderr -debug`
 
-**CRITICAL run-first finding about the transcript — this is a REFINEMENT of the AAP.** The AAP implied that setting `io_debug yes` alone is sufficient to emit the raw byte-level transcript. **That is not true.** `internal/endpoint/smtp/smtp.go:604` sets `endp.serv.Debug = endp.Log.DebugWriter()`, but `internal/log/log.go` `DebugWriter()` (verified L172–177) returns `ioutil.Discard` — a no-op writer — **unless the logger's `Debug` flag is true**. That flag is *separate* from the `cfg.Bool("io_debug", …)` tee toggle at `smtp.go:565`: `io_debug yes` decides *whether go-smtp tees the wire into `server.Debug`*, while the logger's `Debug` flag decides *whether that writer actually writes anything*. Therefore **both** `io_debug yes` **and** debug logging (the global `-debug` flag at `maddy.go:104`, or a per-endpoint `debug yes`) are required to see the raw wire transcript. Confirmed at runtime: only with `-debug` did the raw wire transcript appear in stderr; the harness relied on it.
+**Enabling the raw wire transcript.** The byte-level transcript requires **both** `io_debug yes` on the endpoint (`smtp.go:565`, which sets `serv.Debug = endp.Log.DebugWriter()` at `smtp.go:604`) **and** the global `-debug` flag — because `Logger.DebugWriter()` returns `ioutil.Discard` unless the logger's `Debug` flag is set (`internal/log/log.go:172`, `ioutil.Discard` at `log.go:174`). With only `io_debug yes` and no `-debug`, the transcript is silently discarded. This was confirmed at runtime: the startup line `smtp: I/O debugging is on!` appears, and with `-debug` the per-connection raw wire bytes are written to the log.
 
-**Probe configuration used** (the minimal, check-free, plaintext config; also reproduced verbatim in Appendix A.1). It runs from `/tmp/investig` and forwards delivered bytes to the Python catch server so the exact delivered bytes can be compared per experiment:
+**Probe configuration (used verbatim).** A minimal check-free plaintext config. `state` and `runtime` are pointed inside `/tmp/investig` so **no** `*queue`/`*mtasts-cache` artifacts and **no** `/var/lib/maddy` or `/run/maddy` directories are created anywhere near the repository (verified in Section 7). Delivery is forwarded byte-for-byte to a local Python catch server via `smtp_downstream` so the exact delivered bytes can be captured:
 
-```
+```text
 ## Minimal check-free plaintext probe config for DATA-boundary investigation.
-## Runs from /tmp/investig so *queue/*mtasts-cache land OUTSIDE the repo.
+## Runs from /tmp/investig so all state/runtime artifacts land OUTSIDE the repo.
+state /tmp/investig/state
+runtime /tmp/investig/runtime
 hostname probe.local
 tls off
 
@@ -49,29 +57,42 @@ smtp tcp://127.0.0.1:2525 {
 }
 ```
 
-**Why a raw socket is mandatory.** Maddy's own tests drive the server through the well-behaved `go-smtp` **client** library, which performs correct dot-stuffing and therefore *cannot* emit the malformed boundary framings this investigation is about (`internal/endpoint/smtp/smtp_test.go:30` `testEndpoint`, and the abort precedent at `smtp_test.go:360` `TestSMTPDelivery_AbortData`). A hand-written raw-socket client with byte- and packet-level control is the only way to send `\n.\n`, `\r\n.\n`, a glued dot, or a pipelined injection. The full harness — `catch.py`, `probe.py`, `exp.py`, `proxy.py` — is embedded verbatim in Appendix A and was used to produce every evidence block in Appendix B.
+**Why a raw socket client is mandatory.** Maddy's own tests drive the server with the well-behaved `go-smtp` client (`internal/endpoint/smtp/smtp_test.go:30` `testEndpoint`), which dot-stuffs correctly and *cannot* emit the malformed boundary framings this question is about. A hand-written `socket` client is therefore required and every byte sent is recorded alongside the responses. The in-tree abort precedent `TestSMTPDelivery_AbortData` (`smtp_test.go:360`) is the closest existing coverage of an early close.
 
-**Delivered-byte capture.** The probe config forwards via `smtp_downstream` to the Python catch server (`catch.py`, Appendix A.2), which writes two files per delivered message: `caught_NNN.wire` (the bytes exactly as Maddy framed them on the wire toward the downstream, i.e. dot-stuffed) and `caught_NNN.raw` (the un-dot-stuffed delivered body). Because the message pipeline's modifiers do not alter the body (`internal/msgpipeline/msgpipeline.go`; per the project's `HACKING.md`), the delivered body equals the decoded `DATA` payload plus the `Received:` header Maddy prepends. This lets each experiment compare the exact bytes each framing produces.
+**Delivered-byte capture.** The catch server writes two files per message: `caught_NNN.wire` (the exact bytes Maddy sent downstream, i.e. re-dot-stuffed for the wire) and `caught_NNN.raw` (the same bytes un-dot-stuffed — the actual message content). Comparing `.wire` vs `.raw` makes the dot-stuffing round-trip directly observable (E4).
 
----
+## Section 0.1 — Constraints and validation methodology
+
+**Technical constraints that bound what is testable (all observed or cited):**
+
+- **No `CHUNKING`/`BDAT`.** EHLO advertises only `PIPELINING`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `SMTPUTF8`, and `SIZE` (`go-smtp/server.go:81`); the length-framed `BDAT` mode that structurally defeats terminator smuggling is not advertised, so only the `DATA`-terminator vector is testable here.
+- **`PIPELINING` is advertised by default** (`go-smtp/server.go:81`), which is what makes the single-write smuggling experiment (E7) possible.
+- **Line length is capped at 2000** (`MaxLineLength`, `go-smtp/server.go:40,76`) and **message size defaults to 32 MiB** (`max_message_size`, `smtp.go:561`, observed as `250 SIZE 33554432`). These bound the ELINE/ECMD and 552 experiments.
+- **An unterminated `DATA` phase blocks until the 10-minute `read_timeout`** (`smtp.go:560`); the hang experiment is therefore bounded to a few seconds rather than waiting the full timeout.
+
+**Validation methodology (how each claim is grounded):**
+
+- **Run-first.** Every behavioral claim is accompanied by the actual captured output (the exact bytes sent as `repr`, the server responses as `repr`, the `io_debug` raw-wire transcript, the ordered-JSON `maddy.log` delta, and the delivered `.raw`/`.wire` bytes). The complete unedited capture for each experiment is in Appendix B; the inline sections quote real lines from those same captures.
+- **Repeated runs for any stability or variance claim.** The back-to-back claim (E8) was replayed across two identical runs; the two error/abort paths that proved **nondeterministic** (E6 early close, ELINE over-long `DATA` line) were each run **10 times** and are reported as an observed distribution rather than a single run.
+- **Real entry point.** The server was exercised through its real listener and pipeline; delivery was captured at a real downstream sink. No value was taken from a bypassing interface.
+- **Read-only.** `git status --porcelain` was checked to confirm the working tree stayed clean throughout and that no harness file leaked into the repository.
+- **Inferred vs observed.** The one item read from source rather than executed — the `net/textproto` dot-reader's internal state transitions — is explicitly labeled INFERRED, with its observable consequences confirmed at runtime (Section 2, Section 8).
 
 ## Section 1 — Direct answers (Q1–Q6)
 
-Each answer leads with the direct result; the evidence and cause→effect reasoning follow in Sections 2–7.
+Each answer leads with the direct result; the evidence and cause→effect reasoning follow in Sections 2–7 (full unedited captures in Appendix B).
 
-- **Q1 — What the server sees at the boundary.** The end-of-`DATA` detector is **not Maddy code and not go-smtp code — it is the Go standard library `net/textproto` dot-reader.** `go-smtp/data.go:51-53` `newDataReader` wraps `c.text.DotReader()`; that reader unstuffs leading dots, rewrites body `\r\n`→`\n`, and detects the terminating dot line, returning `io.EOF` up to go-smtp. go-smtp then drains any residual bytes with `io.Copy(ioutil.Discard, r)` (`conn.go:521`) and resumes command parsing. Maddy itself sees only the already-decoded body, via `Session.Data` → `prepareBody` (`smtp.go:312,283`).
+- **Q1 — What the server sees at the boundary.** The end-of-`DATA` detector is **not Maddy code and not go-smtp code — it is the Go standard library `net/textproto` dot-reader.** `go-smtp/data.go:51-53` `newDataReader` wraps `c.text.DotReader()`; that reader elides leading dots (un-stuffing), rewrites body `\r\n`→`\n`, and detects the terminating dot line, returning `io.EOF` up to go-smtp. go-smtp then drains any residual bytes with `io.Copy(ioutil.Discard, r)` (`conn.go:521`) and resumes command parsing. Maddy itself sees only the already-decoded body, via `Session.Data` → `prepareBody` (`smtp.go:312,283`). Observed at runtime in E1 (the `354` prompt, the delivered decoded body, and — via E7/E8 — command parsing resuming immediately after the terminator).
 
-- **Q2 — Varied boundary framing.** Observed: canonical `\r\n.\r\n`, bare-LF `\n.\n`, and **both** mixed forms `\n.\r\n` and `\r\n.\n` **all terminate** and deliver exactly one message; dot-stuffing is **unstuffed** at delivery (`..`→`.`, `...`→`..`); a dot that is **not at line start** (missing CRLF before it) is literal body and never terminates; an early close before any dot delivers **zero**.
+- **Q2 — Varied boundary framing.** Observed: canonical `\r\n.\r\n` (E1), bare-LF `\n.\n` (E2), and **both** mixed forms `\n.\r\n` (E3a) and `\r\n.\n` (E3b) **all terminate** and deliver exactly one message; dot-stuffing is **un-stuffed** at delivery (`..`→`.`, `...`→`..`, E4); a `.` that is **not at line start** is literal body (E5, where the mid-line dot in `GLUED_NO_NEWLINE_BEFORE.` is kept literal and the message is still delivered via its real `\r\n.\r\n` terminator); an early close before any dot delivers **zero** (E6). Edge limits: an over-long line (>2000) drops the connection with 0 delivered (ELINE/ECMD), and an over-size body yields `552 5.3.4` (0 delivered).
 
-- **Q3 — Pipelined pressure / SMTP smuggling.** Observed **YES**. Under `PIPELINING` (advertised by default, `go-smtp/server.go:81`), a single TCP write carrying a bare-LF `\n.\n` boundary followed by an injected transaction causes Maddy to deliver a **second, spoofed message** (`spoofed@evil.example`) on the same connection. This is the CVE-2023-51765-class desync; the pinned 2019 `go-smtp` predates the v0.20.0/v0.20.1 (December 2023) fix.
+- **Q3 — Pipelined pressure / SMTP smuggling.** Observed **YES**. Under `PIPELINING` (advertised by default, `go-smtp/server.go:81`), a single 409-byte TCP write carrying a bare-LF `\n.\n` boundary followed by an injected transaction causes Maddy to deliver a **second, spoofed message** (`spoofed@evil.example`) on the same connection (E7). This is the CVE-2023-51765-class desync; the pinned 2019 `go-smtp` predates the v0.20.0/v0.20.1 (December 2023) fix series.
 
-- **Q4 — Back-to-back stability.** Observed **STABLE**. Five back-to-back messages on one connection delivered 5/5 across two identical runs — deterministic, no boundary wobble, no timing/buffering variance.
+- **Q4 — Back-to-back stability.** Observed **STABLE**. Five back-to-back messages on one connection delivered 5/5 across two identical runs (E8) — deterministic, no boundary wobble, no timing/buffering variance.
 
-- **Q5 — Front proxy.** Observed: a naive **normalize** (bare-LF→CRLF) proxy does **not** stop the spoof — it promotes the ambiguous boundary to canonical, and Maddy still delivers two messages; a **reject-on-bare-LF** proxy **blocks** it (0 delivered; the client receives `421` and the connection closes). This mirrors Postfix `smtpd_forbid_bare_newline` in its `normalize` vs `reject` modes.
+- **Q5 — Front proxy.** Observed: a naive **normalize** (bare-LF→CRLF) proxy does **not** stop the spoof — it promotes the ambiguous boundary to canonical `\r\n.\r\n`, and Maddy still delivers two messages; a **reject-on-bare-LF** proxy **blocks** it (0 delivered; the client receives `421` and the connection closes). This mirrors Postfix `smtpd_forbid_bare_newline` in its `normalize` vs `reject` modes (E9).
 
-- **Q6 — The real runtime story (what lingers / never seen).** The boundary is decided by the stdlib, Maddy trusts it, and pipelining plus lenient bare-LF acceptance equals smuggling; proxies help only in reject mode. What lingers: an unterminated `DATA` phase blocks until the 10-minute `read_timeout` (`smtp.go:560`); an early close yields `554` + `aborted` with nothing queued; the `smtp_downstream` probe target leaves nothing on disk; the `queue`/`remote` targets create `*queue`/`*mtasts-cache` directories (the `.gitignore` entries). What one expects but never sees: there is **no `CHUNKING`/`BDAT` capability** advertised (`go-smtp/server.go:81`), so the length-framed `BDAT` path that would defeat terminator smuggling does not exist to exercise here — only the `DATA`-terminator vector is testable.
-
----
+- **Q6 — The real runtime story (what lingers / never seen).** The boundary is decided by the stdlib, Maddy trusts it, and pipelining plus lenient bare-LF acceptance equals smuggling; proxies help only in reject mode. What lingers: an unterminated `DATA` phase blocks until the 10-minute `read_timeout` (`smtp.go:560`); an early/abrupt close yields a `DATA error` + `aborted` with nothing queued (and, nondeterministically, a `554`); the `smtp_downstream` probe target leaves nothing on disk; the `queue`/`remote` targets would create `*queue`/`*mtasts-cache` directories (`.gitignore` entries), which is why the harness ran from `/tmp/investig`. What one expects but never sees: **no `CHUNKING`/`BDAT` capability** is advertised (`go-smtp/server.go:81`), so the length-framed `BDAT` path that would defeat terminator smuggling does not exist to exercise here.
 
 ## Section 2 — The mechanism (Q1): three layers + the dot-reader state machine
 
@@ -79,229 +100,1114 @@ The single most likely analysis error is to confuse two independent decoding ste
 
 ### Layer 0 — raw wire (the `io_debug` transcript)
 
-`go-smtp/conn.go:68` tees the raw `net.Conn` reader into `c.server.Debug` via `io.TeeReader(rwc.Reader, c.server.Debug)` **before any decoding**. Consequently the transcript preserves CRLF and dot-stuffing and shows the terminator line exactly as received. Verified with `cat -A`: body lines end `^M$` (a CR then the `$` end-of-line marker), and the terminator line shows as `.^M$`.
+`go-smtp/conn.go:68` tees the raw `net.Conn` reader into `c.server.Debug` via `io.TeeReader(rwc.Reader, c.server.Debug)` **before any decoding**. Consequently the transcript preserves CRLF and dot-stuffing and shows the terminator line exactly as received. In the captured `maddy.log` deltas below, the raw wire lines are the `smtp: ...` block that reproduces exactly what the client sent (including the lone `.` line).
 
-### Layer 1 — `net/textproto` `dotReader.Read` (the actual detector) — **INFERRED state machine, behavior confirmed at runtime**
+### Layer 1 — `net/textproto` `dotReader.Read` (the actual detector) — INFERRED state machine, behavior confirmed at runtime
 
-The terminator detection and dot-unstuffing are performed entirely by the Go standard library `dotReader`. The following state machine is **INFERRED** — it is read from the stdlib source and its doc comment ("translate the dots … elide leading dots, rewrite trailing `\r\n` into `\n`, and detect the ending `.\r\n` line") — but every observable consequence is confirmed at runtime by experiments E1–E5. States: `stateBeginLine`, `stateDot`, `stateDotCR`, `stateCR`, `stateData`, `stateEOF`.
+The terminator detection and dot-unstuffing are performed entirely by the Go standard library `dotReader`. The following state machine is **INFERRED** — read from the stdlib source and its doc comment ("translate the dots … elide leading dots, rewrite trailing `\r\n` into `\n`, and detect the ending `.\r\n` line") — but every observable consequence is confirmed at runtime by E1–E7. States: `stateBeginLine`, `stateDot`, `stateDotCR`, `stateCR`, `stateData`, `stateEOF`.
 
 - line start + `.` → `stateDot` (the dot is not emitted yet);
-- `stateDot` + `\n` → `stateEOF` ⇒ **a bare-LF `.\n` terminates** (this is the smuggling-relevant leniency);
-- `stateDot` + `\r` → `stateDotCR`; then `stateDotCR` + `\n` → `stateEOF` ⇒ canonical `.\r\n` terminates;
-- `stateDot` + any other byte → `stateData` with the **first dot elided** ⇒ **dot-unstuffing** (`..`→`.`);
-- `stateCR` + `\n` → emit `\n` only ⇒ **body CRLF is rewritten to LF**;
-- a `.` that is **not** at line start stays in `stateData` (treated as a literal period, never a terminator);
-- `ReadByte` hitting `io.EOF` → `err = io.ErrUnexpectedEOF` ⇒ **an early close is an error, zero delivery**.
+- `stateDot` + `\n` → `stateEOF` ⇒ **a bare-LF `.\n` terminates** (this is the smuggling-relevant leniency, confirmed by E2);
+- `stateDot` + `\r` → `stateDotCR`; then `stateDotCR` + `\n` → `stateEOF` ⇒ canonical `.\r\n` terminates (E1);
+- `stateDot` + any other byte → `stateData` with the **first dot elided** ⇒ **dot-unstuffing** (`..`→`.`, confirmed by E4);
+- `stateCR` + `\n` → emit `\n` only ⇒ **body CRLF is rewritten to LF** internally;
+- a `.` that is **not** at line start stays in `stateData` (literal period, never a terminator; confirmed by E5);
+- `ReadByte` hitting `io.EOF` → `err = io.ErrUnexpectedEOF` ⇒ **an early close is an error, zero delivery** (E6).
 
-**INFERRED note (verified locations).** These transitions were read in `/usr/local/go/src/net/textproto/reader.go`: the state constants at L344-349, the `stateDot + '\n' → stateEOF` transition at L378-380, and the `io.ErrUnexpectedEOF` conversion at L357. The state machine is labeled INFERRED because it is read from stdlib source; the *observable* behavior is confirmed at runtime via E1–E5.
+**INFERRED note (verified locations, Go 1.18.10).** These transitions were read in `/usr/local/go/src/net/textproto/reader.go`: the state constants at **L328-333**, the `stateDot + '\n' → stateEOF` transition at **L362-364**, and the `io.ErrUnexpectedEOF` conversion at **L340-342**. The state machine is labeled INFERRED because it is read from stdlib source; the *observable* behavior is confirmed at runtime via E1–E7.
 
 ### Layer 2 — delivered bytes (Maddy `prepareBody`)
 
-Maddy `prepareBody` (`smtp.go:283`) wraps the already-decoded reader in `bufio`, parses headers with go-message's `textproto.ReadHeader` (which splits on the blank line — a **second** parse layer, entirely separate from dot-decoding), buffers the body, and prepends a `Received:` header before delivery (`header.Add("Received", …)` at `smtp.go:307`). `Session.Data` (`smtp.go:312`) then logs `accepted` with the `msg_id` at `smtp.go:334`. Again: Layer 1 owns dot-decoding and terminator detection; Layer 2 owns the header/body split — do not conflate them.
+Maddy `prepareBody` (`smtp.go:283`) wraps the already-decoded reader in `bufio`, parses headers with go-message's `textproto.ReadHeader` (which splits on the blank line — a **second** parse layer, entirely separate from dot-decoding), buffers the body, and prepends a `Received:` header before delivery (`header.Add("Received", …)` at `smtp.go:307`). `Session.Data` (`smtp.go:312`) then logs `accepted` with the `msg_id` at `smtp.go:334`. Again: Layer 1 owns dot-decoding and terminator detection; Layer 2 owns the header/body split — do not conflate them. Every delivered `.raw` below begins with this prepended `Received:` header.
 
 ### How go-smtp frames the phase and why pipelining matters
 
-`handleData` writes the prompt `354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>` (`conn.go:510`), constructs the data reader (`conn.go:519`), and then drains with `io.Copy(ioutil.Discard, r)` (`conn.go:521`). The drain is a **no-op** once the dot-reader has already reached `stateEOF`. Crucially, command reads and the `DATA` reader **share one buffered reader** (`c.text`, set up at `conn.go:74`), so any residual bytes that were pipelined *after* the boundary remain buffered and are subsequently parsed as the next commands — this is exactly the mechanism exploited in Q3.
+`handleData` writes the prompt `354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>` (`conn.go:510`), constructs the data reader (`conn.go:519`), and then drains with `io.Copy(ioutil.Discard, r)` (`conn.go:521`). The drain is a **no-op** once the dot-reader has already reached `stateEOF`. Crucially, command reads and the `DATA` reader **share one buffered reader** (`c.text`, set up at `conn.go:74`), so any residual bytes that were pipelined *after* the boundary remain buffered and are subsequently parsed as the next commands — exactly the mechanism exploited in Q3 (E7).
 
 ### E1 baseline — the happy path (ground truth)
 
-The canonical `\r\n.\r\n` exchange below is the ground-truth reference every other experiment is compared against. Note the advertised capabilities (`PIPELINING`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `SMTPUTF8`, `SIZE 33554432`), the `354` prompt, the `250 2.0.0 OK: queued` acceptance, the ordered-JSON `accepted` log line, and the delivered 312-byte body with the prepended `Received:` header.
+The canonical `\r\n.\r\n` exchange below is the ground-truth reference every other experiment is compared against. Note the advertised capabilities (`PIPELINING`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `SMTPUTF8`, `SIZE 33554432`), the `354` prompt, the `250 2.0.0 OK: queued` acceptance, the ordered-JSON `accepted` log line, and the delivered 312-byte body with the prepended `Received:` header. This is the complete unedited capture (conversation + `maddy.log` delta + delivered bytes):
 
-```
---- SENT (C->S) [17 bytes] --- b'EHLO probe.test\r\n'
---- RECV (S->C) [110 bytes] ---
-b'250-Hello probe.test\r\n250-PIPELINING\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
---- SENT (C->S) DATA prompt --- b'DATA\r\n'
---- RECV (S->C) [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
---- SENT (C->S) [150 bytes] ---
-b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E1-canonical\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\r\n'
---- RECV (S->C) [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
-maddy.log (ordered-JSON):
-smtp: incoming message	{"msg_id":"9ddb7cbb","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:57028"}
-smtp: RCPT ok	{"msg_id":"9ddb7cbb","rcpt":"rcpt@probe.local"}
-smtp: accepted	{"msg_id":"9ddb7cbb"}
+```text
+==================== EXPERIMENT E1 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [39 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [33 bytes] --- b'250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [150 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E1-canonical\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"da8890d0","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:33512"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"da8890d0"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"da8890d0"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"da8890d0"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"da8890d0"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"da8890d0"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"da8890d0"}
+[debug] smtp_downstream: connected	{"msg_id":"da8890d0","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"da8890d0"}
+smtp: RCPT ok	{"msg_id":"da8890d0","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E1-canonical
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"da8890d0"}
+smtp: accepted	{"msg_id":"da8890d0"}
 smtp: 250 2.0.0 OK: queued
-delivered [caught_010.raw, 312 bytes]:
-b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 9ddb7cbb; Wed, 08 Jul\r\n 2026 02:57:39 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E1-canonical\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
-```
 
----
+[debug] smtp: reset	
+smtp: QUIT
+
+
+-------- delivered messages (new caught_* files) --------
+delivered [caught_001.raw, 312 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id da8890d0; Wed, 08 Jul\r\n 2026 06:14:51 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E1-canonical\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+```
 
 ## Section 3 — Varied boundary framing (Q2)
 
-Every payload below is byte-identical except for how the `DATA` boundary is framed, so any behavioral difference is attributable solely to framing. Each experiment shows the exact payload (C→S), the server responses (S→C), the boundary-relevant log/transcript lines, and the delivered `.raw` (and `.wire` where they differ).
+Every payload below is byte-identical except for how the `DATA` boundary is framed, so any behavioral difference is attributable solely to framing. Each experiment shows the exact payload (C→S) and server responses (S→C) as `repr`, plus the delivered `.raw` (and `.wire` where they differ); the complete unedited capture (including the `io_debug` raw-wire + ordered-JSON `maddy.log` delta) for each is in Appendix B.
 
 ### E1 — canonical `\r\n.\r\n` (baseline)
 
-**Result:** `250 2.0.0 OK: queued`; exactly 1 delivered message (312 bytes). This is the baseline; its full evidence block is embedded in Section 2 (and again in Appendix B.E1). All following experiments are diffed against it.
+**Result:** `250 2.0.0 OK: queued`; exactly 1 delivered message (312 bytes, `caught_001.raw`, `msg_id da8890d0`). Full capture in Section 2 (E1 baseline) and Appendix B.E1. All following experiments are diffed against it.
 
 ### E2 — bare-LF `\n.\n`
 
-**Result:** **ACCEPTED** — `250 … OK: queued`; 1 delivered message (309 bytes). The bare-LF `\n.\n` is treated as end-of-`DATA`. This is the SMUGGLING vector (exploited in E7). Byte note: the E2 delivered body is 3 bytes shorter than E1 *only because the probe's framing bytes differ*; the decoded body content is identical.
+**Result: ACCEPTED** — 1 delivered message (309 bytes, `msg_id a8fe0125`). The bare-LF `\n.\n` is treated as end-of-`DATA` (Layer-1 `stateDot + '\n' → stateEOF`). This is the SMUGGLING vector exploited in E7. The delivered body is byte-for-byte the two body lines with the bare-LF rewritten to CRLF internally; it is shorter than E1 only because the subject string differs.
 
-```
---- SENT (C->S) body ending [ ...body...\n.\n ] ; RECV --- b'250 2.0.0 OK: queued\r\n'
-smtp: incoming message {"msg_id":"31cf8c16", ...}
-smtp: accepted {"msg_id":"31cf8c16"}
-delivered [caught_003.raw, 309 bytes]:
-b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 31cf8c16; ...\r\nSubject: E2-bareLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+Conversation (C→S / S→C, verbatim):
+
+```text
+==================== EXPERIMENT E2 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [39 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [14 bytes] --- b'250-SMTPUTF8\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [19 bytes] --- b'250 SIZE 33554432\r\n'
+--- C->S [145 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E2-bareLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\n.\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
 ```
 
-ACCEPTED — bare-LF terminator treated as end-of-DATA. Smuggling vector confirmed.
+Delivered (verbatim):
+
+```text
+-------- delivered messages (new caught_* files) --------
+delivered [caught_002.raw, 309 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id a8fe0125; Wed, 08 Jul\r\n 2026 06:14:52 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E2-bareLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+```
+
+→ complete unedited capture with transcript + ordered-JSON logs: **Appendix B.E2**.
 
 ### E3a `\n.\r\n` and E3b `\r\n.\n` — mixed forms
 
-**Result:** **BOTH accepted**, 1 delivered each (315 bytes). Every mixed terminator form terminates the `DATA` phase — consistent with the Layer-1 state machine, where reaching `stateEOF` requires only that a dot at line start be followed by an LF (whether or not a CR precedes it).
+**Result: BOTH accepted**, 1 delivered each (315 bytes): E3a `msg_id 9be40444` (`caught_003.raw`), E3b `msg_id 34710cd8` (`caught_004.raw`). Every mixed terminator form terminates the `DATA` phase — consistent with the Layer-1 state machine, where reaching `stateEOF` requires only that a dot at line start be followed by an LF (whether or not a CR precedes it).
 
-```
-E3a body...\n.\r\n  -> 250 OK: queued ; delivered caught_004.raw (315 bytes), Subject E3a-LF-dot-CRLF, msg_id 6bc7736a
-E3b body...\r\n.\n  -> 250 OK: queued ; delivered caught_005.raw (315 bytes), Subject E3b-CRLF-dot-LF, msg_id 1ae8f038
+E3a delivered (verbatim):
+
+```text
+-------- delivered messages (new caught_* files) --------
+delivered [caught_003.raw, 315 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 9be40444; Wed, 08 Jul\r\n 2026 06:14:53 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E3a-LF-dot-CRLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
 ```
 
-BOTH mixed forms terminate.
+E3b delivered (verbatim):
+
+```text
+-------- delivered messages (new caught_* files) --------
+delivered [caught_004.raw, 315 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 34710cd8; Wed, 08 Jul\r\n 2026 06:14:53 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E3b-CRLF-dot-LF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+```
+
+→ complete unedited captures: **Appendix B.E3a / B.E3b**.
 
 ### E4 — dot-stuffing `\r\n..\r\n` / `\r\n...\r\n`
 
-**Result:** delivered `.raw` (un-dot-stuffed) shows `..`→`.` and `...`→`..`; the `.wire` re-emitted to the downstream is re-stuffed by Maddy. This is ground-truth proof of unstuffing at the delivered-byte level (Layer 1 elides the first dot at line start; the catch server's `.raw` is the un-stuffed form, while `.wire` is what Maddy actually sent downstream).
+**Result:** ACCEPTED (`msg_id 7d66417b`). The client sent the body lines `..` and `...`; the delivered `.raw` (un-dot-stuffed content) shows `..`→`.` and `...`→`..`, while the `.wire` (what Maddy actually re-emitted downstream) is re-stuffed. This is ground-truth proof of unstuffing at the delivered-byte level, with the full round-trip visible in the `.wire` vs `.raw` diff below (note the `.raw` is 303 bytes vs the `.wire` 305 bytes — one dot fewer per stuffed line):
 
-```
---- SENT (C->S) [143 bytes] ---
-b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E4-dotstuff\r\nX-Probe: boundary-test\r\n\r\nLine A before.\r\n..\r\n...\r\nLine B after.\r\n.\r\n'
---- RECV --- b'250 2.0.0 OK: queued\r\n'
-delivered [caught_006.raw, 303 bytes] (UN-dot-stuffed body — note `..`->`.`, `...`->`..`):
-b'...Subject: E4-dotstuff\r\nX-Probe: boundary-test\r\n\r\nLine A before.\r\n.\r\n..\r\nLine B after.\r\n'
-delivered [caught_006.wire, 305 bytes] (maddy RE-stuffed for downstream):
-b'...\r\n\r\nLine A before.\r\n..\r\n...\r\nLine B after.\r\n'
-```
+Conversation (verbatim):
 
-Dot-unstuffing confirmed at the delivered-byte level.
-
-### E5 — missing final CRLF before the dot (glued dot)
-
-**Result:** the glued dot is **literal body, not a terminator.** After sending the part ending `…GLUED_NO_NEWLINE_BEFORE.\r\n` the client receives **0 bytes** (`RECV b''`) — the server is still in `DATA`. Only after sending a real `\r\n.\r\n` does it return `250`. This is a clean before/during/after state transition: the delivered set is empty before a real terminator arrives and populated after.
-
-```
---- SENT (C->S) [153 bytes] ---
-b'...Subject: E5-missing-crlf\r\n...\r\n\r\nLine one of the body.\r\nGLUED_NO_NEWLINE_BEFORE.\r\n'
---- RECV (S->C) [0 bytes] --- b''          <== NO 250: server STILL IN DATA (glued dot is literal)
---- SENT (C->S) [5 bytes] --- b'\r\n.\r\n'  <== now a real terminator
---- RECV (S->C) [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
-delivered [caught_007.raw, 320 bytes]:
-b'...\r\n\r\nLine one of the body.\r\nGLUED_NO_NEWLINE_BEFORE.\r\n\r\n'   (glued `.` kept as literal, msg_id 01c8a333)
+```text
+==================== EXPERIMENT E4 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [52 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n250-8BITMIME\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [39 bytes] --- b'250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [19 bytes] --- b'250 SIZE 33554432\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [143 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E4-dotstuff\r\nX-Probe: boundary-test\r\n\r\nLine A before.\r\n..\r\n...\r\nLine B after.\r\n.\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
 ```
 
-State transition observed: empty (b'') before a real terminator, populated after.
+Delivered `.raw` (un-stuffed) and `.wire` (re-stuffed), verbatim:
 
-### E6 — early connection close before the dot
-
-**Result:** `DATA error` (`unexpected EOF`) → generic `554 5.0.0 Internal server error` → `aborted`; **0 delivered.** This matches the in-tree precedent `internal/endpoint/smtp/smtp_test.go:360` `TestSMTPDelivery_AbortData`. `wrapErr` (`smtp.go:389`) maps the non-`SMTPError` (the `io.ErrUnexpectedEOF` from Layer 1) to a generic `554`.
-
+```text
+-------- delivered messages (new caught_* files) --------
+delivered [caught_005.raw, 303 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 7d66417b; Wed, 08 Jul\r\n 2026 06:14:54 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E4-dotstuff\r\nX-Probe: boundary-test\r\n\r\nLine A before.\r\n.\r\n..\r\nLine B after.\r\n'
+  [.wire, 305 bytes]: b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 7d66417b; Wed, 08 Jul\r\n 2026 06:14:54 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E4-dotstuff\r\nX-Probe: boundary-test\r\n\r\nLine A before.\r\n..\r\n...\r\nLine B after.\r\n'
 ```
---- SENT (C->S) [133 bytes] --- b'...Subject: E6-early-close\r\n...\r\n\r\nBody with no terminator at all'
---- RECV (S->C) [0 bytes] --- b''
+
+→ complete unedited capture: **Appendix B.E4**.
+
+### E5 — a mid-line dot is literal; the terminator arriving in a separate TCP segment still ends `DATA`
+
+**Result: ACCEPTED** — 1 delivered message (320 bytes, `msg_id e1251d50`). The user's "missing final CRLF before the dot" case is exercised as follows: the client first sends a part ending `Line one of the body.\r\nGLUED_NO_NEWLINE_BEFORE.\r\n`, then in a **separate** `sendall` sends the real terminator `\r\n.\r\n`. Two observations: (1) the `.` at the end of `GLUED_NO_NEWLINE_BEFORE.` is **not at line start**, so it stays in `stateData` and is kept as a literal period in the delivered body — it never terminates; (2) the true terminator arriving in its own TCP segment is still detected (the dot-reader reassembles across segments), and the intervening `\r\n` becomes a trailing blank line in the delivered body. Note the pipelined responses are offset (the probe reads lag one response behind), so the `250 … OK: queued` for this message is read after `QUIT`:
+
+Conversation (verbatim):
+
+```text
+==================== EXPERIMENT E5 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [52 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n250-8BITMIME\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [39 bytes] --- b'250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [19 bytes] --- b'250 SIZE 33554432\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [153 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E5-missing-crlf\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nGLUED_NO_NEWLINE_BEFORE.\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [5 bytes] --- b'\r\n.\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
+```
+
+Delivered (verbatim; note the literal `GLUED_NO_NEWLINE_BEFORE.` and the trailing blank line):
+
+```text
+-------- delivered messages (new caught_* files) --------
+delivered [caught_006.raw, 320 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id e1251d50; Wed, 08 Jul\r\n 2026 06:14:55 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E5-missing-crlf\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nGLUED_NO_NEWLINE_BEFORE.\r\n\r\n'
+```
+
+The clean **before/after state transition** (empty before a terminator, populated after) is shown directly by the unterminated-`DATA` hang in Section 7 (server silent, nothing delivered) versus E1 (delivered). → complete unedited capture: **Appendix B.E5**.
+
+### E6 — early connection close before the dot (nondeterministic abort path)
+
+**Result: 0 delivered** in every run — this is the invariant, matching the in-tree precedent `internal/endpoint/smtp/smtp_test.go:360` `TestSMTPDelivery_AbortData`. The *surfaced* abort detail is **nondeterministic** (a race between the server's read and the client's abrupt `close()`), so the same unchanged input was run **10 times**. Observed distribution: reason `"connection reset by peer"` in **6/10** runs and `"unexpected EOF"` in **4/10**; a `554 5.0.0 Internal server error` is emitted in only **3/10** runs. `wrapErr` (`smtp.go:388`) maps the non-`SMTPError` abort to a generic `554` when it manages to write a response before the socket is gone. One representative run (the `connection reset by peer` path) — complete capture:
+
+```text
+==================== EXPERIMENT E6 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [39 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [33 bytes] --- b'250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [133 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E6-early-close\r\nX-Probe: boundary-test\r\n\r\nBody with no terminator at all'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
 >>> CLOSE (client closed socket)
-maddy.log:
-smtp: DATA error	{"msg_id":"9dfa1ea2","reason":"unexpected EOF"}
-smtp: 554 5.0.0 Internal server error (msg ID = 9dfa1ea2)
-smtp: aborted	{"msg_id":"9dfa1ea2"}
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"09b39b33","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:51666"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"09b39b33"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"09b39b33"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"09b39b33"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"09b39b33"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"09b39b33"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"09b39b33"}
+[debug] smtp_downstream: connected	{"msg_id":"09b39b33","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"09b39b33"}
+smtp: RCPT ok	{"msg_id":"09b39b33","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E6-early-close
+X-Probe: boundary-test
+
+Body with no terminator at all
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+smtp: DATA error	{"msg_id":"09b39b33","reason":"read tcp 127.0.0.1:2525-\u003e127.0.0.1:51666: read: connection reset by peer"}
+smtp: aborted	{"msg_id":"09b39b33"}
+[debug] smtp: reset	
+
+-------- delivered messages (new caught_* files) --------
 delivered messages captured: 0
 ```
 
-### ELINE / ECMD — the line-length limit (2000)
+The alternate `unexpected EOF` → `554` path (also observed here, and deterministically reproduced by the clean-close hang in Section 7) is in **Appendix B.E6**. Either way: **0 delivered, connection aborted.**
 
-**Result — the asymmetry.** A `DATA` body line longer than `MaxLineLength` (2000) is **NOT** a clean `500`: it produces `DATA error` (`unexpected EOF`) → `554 5.0.0`, the connection is dropped, and 0 are delivered (reproduced twice). Contrast a **command** line longer than 2000, which yields a clean `500 5.4.0 Too long line, closing connection` (`go-smtp/server.go:154-155`). The same 2000-byte `MaxLineLength` (`server.go:40,76`) surfaces differently by phase: in the `DATA` path the over-long read desyncs the stream and the dot-reader converts the resulting `io.EOF` into `io.ErrUnexpectedEOF`. **INFERRED mechanism detail:** `go-smtp/lengthlimit_reader.go` `lineLimitReader.Read` has a **value receiver**, so `curLineLength` does not persist across `Read` calls (labeled INFERRED). Note: the exact socket-level error text on the `DATA` path can vary per run — "unexpected EOF" or "connection reset by peer" — but the structural result is invariant: error + connection dropped + 0 delivered.
+### ELINE / ECMD — the line-length limit (2000), and why there is *no* clean asymmetry
 
+**Result — corrected by runtime observation.** The 2000-byte `MaxLineLength` (`go-smtp/server.go:40,76`) applies to both command lines and `DATA` body lines, and in **both** cases the connection is dropped with **0 delivered**. A **command** line over 2000 bytes deterministically yields a clean `500 5.4.0 Too long line, closing connection` (`go-smtp/server.go:154-155`), captured cleanly by reading until the socket closes:
+
+```text
+--- banner ---
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17] --- b'EHLO probe.test\r\n'
+--- S->C [110 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [2526 bytes] --- MAIL FROM with 2500-a localpart (repr head) --- b'MAIL FROM:<aaaaaaaaaaaaaaaaaaaaaaaaaaaaa'...b'aaaaa@probe.local>\r\n'
+--- S->C [45 bytes] --- b'500 5.4.0 Too long line, closing connection\r\n'
+>>> server closed connection (recv returned empty)
 ```
-ELINE (DATA body line 2500 'A's + \r\n.\r\n):
-  RECV after body = b''  (connection dropped)
-  smtp: DATA error	{"msg_id":"24442704","reason":"unexpected EOF"}
-  smtp: 554 5.0.0 Internal server error (msg ID = 24442704)   [reproduced again: msg_id 28ebb210]
-  delivered: 0
-ECMD (MAIL FROM line ~2500 bytes):
-  smtp: 500 5.4.0 Too long line, closing connection
-  delivered: 0
+
+A **`DATA` body** line over 2000 bytes is **nondeterministic** on the wire (the server's too-long-line detection races the client's continued oversized write). The same unchanged ELINE input was run **10 times**: the client saw a clean `500 5.4.0 Too long line, closing connection` in **4/10** runs, and in the other runs the connection reset first and Maddy logged a `DATA error` with reason `"connection reset by peer"` (2/10) or `"unexpected EOF"` (the remainder). **In all 10 runs, 0 were delivered.** There is therefore *no* deterministic "DATA→554 vs command→500" asymmetry — the plurality `DATA`-line outcome is in fact the same `500 5.4.0 Too long line` message as the command path. One representative ELINE run (the clean `500` outcome) — complete capture:
+
+```text
+==================== EXPERIMENT ELINE (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [53 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [19 bytes] --- b'250 SIZE 33554432\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [2599 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: ELINE\r\nX-Probe: boundary-test\r\n\r\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n.\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [45 bytes] --- b'500 5.4.0 Too long line, closing connection\r\n'
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"c9ad5229","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:51676"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"c9ad5229"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"c9ad5229"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"c9ad5229"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"c9ad5229"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"c9ad5229"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"c9ad5229"}
+[debug] smtp_downstream: connected	{"msg_id":"c9ad5229","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"c9ad5229"}
+smtp: RCPT ok	{"msg_id":"c9ad5229","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: 500 5.4.0 Too long line, closing connection
+
+smtp: aborted	{"msg_id":"c9ad5229"}
+
+-------- delivered messages (new caught_* files) --------
+delivered messages captured: 0
 ```
 
-Same limit, different surface: command line → clean 500 5.4.0; DATA body line → 554 5.0.0 via ErrUnexpectedEOF.
+→ additional ELINE runs showing the reset/`unexpected EOF` variants are in **Appendix B.ELINE**.
 
 ### 552 — the message-size limit
 
-**Result:** with `max_message_size 500b`, EHLO advertises `250 SIZE 500`; a 1500-byte body yields `552 5.3.4 Maximum message size exceeded (msg ID = …)`, logged as `DATA error` (`Maximum message size exceeded`) plus `plain SMTP error returned, this is deprecated`; 0 delivered. `ErrDataTooLarge` is a `*smtp.SMTPError` (`go-smtp/data.go:38-39`, code 552) whose code passes through Maddy `wrapErr` unchanged (verified `smtp.go:429-434`), unlike plain errors which collapse to `554`. The default limit is 32 MiB (`smtp.go:561`), confirmed at runtime by the advertised `250 SIZE 33554432` on the primary instance.
+**Result:** on a second instance configured with `max_message_size 500b` (Appendix A.6), EHLO advertises `250 SIZE 500`; a 907-byte body (an 800-byte `X` payload plus headers and terminator) yields `552 5.3.4 Maximum message size exceeded (msg ID = 56b86674)`, logged as a `DATA error` (`Maximum message size exceeded`) plus `plain SMTP error returned, this is deprecated`; **0 delivered**; then `QUIT` → `221 2.0.0 Goodnight and good luck`. `ErrDataTooLarge` is a `*smtp.SMTPError` (`go-smtp/data.go:38-39`, code 552) whose code passes through Maddy `wrapErr` unchanged (`smtp.go:429-434`, msg-ID suffix at `smtp.go:437`), unlike plain errors which collapse to `554`. The default limit is 32 MiB (`smtp.go:561`), confirmed by the advertised `250 SIZE 33554432` on the primary instance. Complete capture:
 
+```text
+--- banner ---
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [105 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n250 SIZE 500\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [907 bytes] --- oversized DATA body (907 bytes incl terminator; body payload 800 X's, limit 500)
+--- S->C [61 bytes] --- b'552 5.3.4 Maximum message size exceeded (msg ID = 56b86674)\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [35 bytes] --- b'221 2.0.0 Goodnight and good luck\r\n'
 ```
-(instance with max_message_size 500b) EHLO advertises: smtp: 250 SIZE 500
-1500-byte body ->
-smtp: DATA error	{"msg_id":"7b52f372","reason":"Maximum message size exceeded"}
-smtp: plain SMTP error returned, this is deprecated
-smtp: 552 5.3.4 Maximum message size exceeded (msg ID = 7b52f372)
-smtp: aborted	{"msg_id":"7b52f372"}
-delivered: 0
-```
-
-Default limit 32 MiB confirmed via `250 SIZE 33554432` on the primary instance.
-
----
 
 ## Section 4 — Pipelined pressure / SMTP smuggling (Q3)
 
-**Result: YES — the smuggle reproduces.** The probe sent **one** `sendall` of **409 bytes**: a full transaction whose body ends with a bare-LF boundary `\n.\n`, immediately followed by an injected `MAIL FROM:<spoofed@evil.example>` / `RCPT` / `DATA` / second body / `\r\n.\r\n`. The server returned **two** `250 2.0.0 OK: queued`, and Maddy delivered **two messages on one connection** (same `src_ip`): the outer `attacker@probe.local` and the smuggled `spoofed@evil.example`. The smuggled message carries `envelope-sender <spoofed@evil.example>` and `Subject: E7-SMUGGLED-injected` — fully attacker-controlled.
+**Result: YES — the smuggle reproduces.** The probe sent **one** `sendall` of **409 bytes**: a full transaction whose body ends with a bare-LF boundary `\n.\n`, immediately followed by an injected `MAIL FROM:<spoofed@evil.example>` / `RCPT` / `DATA` / second body / `\r\n.\r\n`. Maddy logged **two** complete `incoming message`→`accepted` cycles on the **same** `src_ip` and delivered **two messages**: the outer `attacker@probe.local` (`msg_id e7ffb4a8`, `caught_007.raw`) and the smuggled `spoofed@evil.example` (`msg_id a7064bc7`, `caught_008.raw`, `Subject: E7-SMUGGLED-injected`) — the second is fully attacker-controlled. This is the complete unedited capture:
 
+```text
+==================== EXPERIMENT E7 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [409 bytes] --- b'MAIL FROM:<attacker@probe.local>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-OUTER-legit\r\nX-Probe: boundary-test\r\n\r\nOuter legit body line.\n.\nMAIL FROM:<spoofed@evil.example>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-SMUGGLED-injected\r\nX-Probe: boundary-test\r\n\r\nSmuggled spoofed body line.\r\n.\r\n'
+--- S->C [39 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [33 bytes] --- b'250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<attacker@probe.local>
+RCPT TO:<victim@probe.local>
+DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E7-OUTER-legit
+X-Probe: boundary-test
+
+Outer legit body line.
+.
+MAIL FROM:<spoofed@evil.example>
+RCPT TO:<victim@probe.local>
+DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E7-SMUGGLED-injected
+X-Probe: boundary-test
+
+Smuggled spoofed body line.
+.
+QUIT
+
+smtp: 250 2.0.0 Roger, accepting mail from <attacker@probe.local>
+
+smtp: incoming message	{"msg_id":"e7ffb4a8","sender":"attacker@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:60628"}
+[debug] smtp/pipeline: sender attacker@probe.local matched by default rule	{"msg_id":"e7ffb4a8"}
+[debug] smtp/pipeline: global rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"e7ffb4a8"}
+[debug] smtp/pipeline: per-source rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"e7ffb4a8"}
+[debug] smtp/pipeline: recipient victim@probe.local matched by default rule (clean = victim@probe.local)	{"msg_id":"e7ffb4a8"}
+[debug] smtp/pipeline: per-rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"e7ffb4a8"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"e7ffb4a8"}
+[debug] smtp_downstream: connected	{"msg_id":"e7ffb4a8","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(attacker@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"e7ffb4a8"}
+smtp: RCPT ok	{"msg_id":"e7ffb4a8","rcpt":"victim@probe.local"}
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"e7ffb4a8"}
+smtp: accepted	{"msg_id":"e7ffb4a8"}
+[debug] smtp: reset	
+smtp: incoming message	{"msg_id":"a7064bc7","sender":"spoofed@evil.example","src_host":"probe.test","src_ip":"127.0.0.1:60628"}
+[debug] smtp/pipeline: sender spoofed@evil.example matched by default rule	{"msg_id":"a7064bc7"}
+[debug] smtp/pipeline: global rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"a7064bc7"}
+[debug] smtp/pipeline: per-source rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"a7064bc7"}
+[debug] smtp/pipeline: recipient victim@probe.local matched by default rule (clean = victim@probe.local)	{"msg_id":"a7064bc7"}
+[debug] smtp/pipeline: per-rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"a7064bc7"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"a7064bc7"}
+[debug] smtp_downstream: connected	{"msg_id":"a7064bc7","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(spoofed@evil.example) ok, target = smtp_downstream:catch	{"msg_id":"a7064bc7"}
+smtp: RCPT ok	{"msg_id":"a7064bc7","rcpt":"victim@probe.local"}
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"a7064bc7"}
+smtp: accepted	{"msg_id":"a7064bc7"}
+[debug] smtp: reset	
+
+-------- delivered messages (new caught_* files) --------
+delivered [caught_007.raw, 294 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <attacker@probe.local>) with ESMTP id e7ffb4a8; Wed, 08\r\n Jul 2026 06:17:58 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-OUTER-legit\r\nX-Probe: boundary-test\r\n\r\nOuter legit body line.\r\n'
+delivered [caught_008.raw, 305 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <spoofed@evil.example>) with ESMTP id a7064bc7; Wed, 08\r\n Jul 2026 06:17:58 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-SMUGGLED-injected\r\nX-Probe: boundary-test\r\n\r\nSmuggled spoofed body line.\r\n'
 ```
---- SENT (C->S) [409 bytes, ONE sendall] ---
-b'MAIL FROM:<attacker@probe.local>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-OUTER-legit\r\nX-Probe: boundary-test\r\n\r\nOuter legit body line.\n.\nMAIL FROM:<spoofed@evil.example>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-SMUGGLED-injected\r\nX-Probe: boundary-test\r\n\r\nSmuggled spoofed body line.\r\n.\r\n'
---- RECV (S->C) [396 bytes] ---
-b"250 2.0.0 Roger, accepting mail from <attacker@probe.local>\r\n250 2.0.0 I'll make sure <victim@probe.local> gets this\r\n354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n250 2.0.0 OK: queued\r\n250 2.0.0 Roger, accepting mail from <spoofed@evil.example>\r\n250 2.0.0 I'll make sure <victim@probe.local> gets this\r\n354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n250 2.0.0 OK: queued\r\n"
-maddy.log: TWO transactions, same src_ip 127.0.0.1:50694:
-smtp: incoming message {"msg_id":"b1a42ffc","sender":"attacker@probe.local", ... "src_ip":"127.0.0.1:50694"}
-smtp: accepted {"msg_id":"b1a42ffc"}
-smtp: incoming message {"msg_id":"b1b94d91","sender":"spoofed@evil.example", ... "src_ip":"127.0.0.1:50694"}
-smtp: accepted {"msg_id":"b1b94d91"}
-delivered [caught_008.raw, 294 bytes] envelope-sender <attacker@probe.local>, Subject E7-OUTER-legit
-delivered [caught_009.raw, 305 bytes] envelope-sender <spoofed@evil.example>, Subject E7-SMUGGLED-injected
-```
 
-TWO messages delivered on ONE connection; the second is fully attacker-controlled (spoofed envelope sender). Smuggle REPRODUCED.
+**Root cause (cause→effect).** The bare-LF `\n.\n` is accepted as end-of-`DATA` by the stdlib dot-reader (`stateDot + '\n' → stateEOF`). The `io.Copy(ioutil.Discard, r)` drain (`conn.go:521`) is a **no-op** because the reader is already at EOF, so it consumes nothing; the residual injected bytes remain in the shared buffered reader `c.text` (`conn.go:74`), and go-smtp's command loop parses them as a brand-new transaction. A stricter RFC-5321 peer would treat `\n.\n` as body, so a relaying Maddy placed in front of such a peer **desynchronizes** — the classic SMTP-smuggling / SPF-bypass scenario where the front and back servers disagree about where the first message ends.
 
-**Root cause (cause→effect).** The bare-LF `\n.\n` is accepted as end-of-`DATA` by the stdlib dot-reader (`stateDot + '\n' → stateEOF`). The `io.Copy(ioutil.Discard, r)` drain (`conn.go:521`) is a **no-op** because the reader is already at EOF, so it consumes nothing. The residual injected bytes therefore remain in the shared buffered reader `c.text`, and go-smtp's command loop parses them as a brand-new transaction. A stricter RFC-5321 peer would treat `\n.\n` as body, so a relaying Maddy placed in front of such a peer **desynchronizes** — the classic SMTP-smuggling / SPF-bypass scenario, where the front server and the back server disagree about where the first message ends.
-
-**Timeline note.** The pinned `go-smtp` is the 2019 commit `1f576e0` (`go.mod`), roughly four years before the upstream fix: **v0.20.0** ("Remove DotLF to EOFState case") and **v0.20.1** ("Prevent `<LF>.<CR><LF>` SMTP smuggling attacks"), released 27 December 2023. This task **observes** the pinned 2019 behavior; it does **not** fix it.
-
----
+**Timeline note (fix is a dated series, not one release).** The pinned `go-smtp` is the 2019 commit `1f576e0` (`go.mod:19`), roughly four years before the upstream fix. The fix landed as a **series**: **v0.20.0** — tagged **27 December 2023** — which "Remove[d] DotLF to EOFState case" and added an SMTP-smuggling test; followed by **v0.20.1**, which "Prevent[s] `<LF>.<CR><LF>` SMTP smuggling attacks." This task **observes** the pinned 2019 behavior; it does **not** upgrade or fix it (out of scope, read-only).
 
 ## Section 5 — Back-to-back stability (Q4)
 
-**Result: STABLE and deterministic.** Five back-to-back canonical messages were sent on **one** connection, and the identical input was replayed across two runs (the rules require ≥2 identical runs for any stability claim). RUN 1 produced 5 `250 OK: queued` acks and 5 delivered; RUN 2 produced 5 acks and 5 delivered. The observed distribution is `{5/5, 5/5}` — no boundary wobble, no timing/buffering variance.
+**Result: STABLE and deterministic.** Five back-to-back canonical messages were sent on **one** connection, and the identical input was replayed across two runs (≥2 identical runs are required for any stability claim). RUN 1 delivered 5/5 (`msg_id`s `24643c9f, 4d5dd79e, a7e1be73, 3736a717, 073b2265`); RUN 2 delivered 5/5 (`7300344d, ec43152e, e8de4b34, 5d4d2633, b3c56d90`). Observed distribution `{5/5, 5/5}` — no boundary wobble, no timing/buffering variance. Both complete unedited runs follow.
 
-```
-E8 RUN 1: 5 back-to-back messages on ONE connection -> 5 '250 OK: queued' acks, 5 newly delivered
-E8 RUN 2: 5 back-to-back messages on ONE connection -> 5 '250 OK: queued' acks, 5 newly delivered
+**E8 — RUN 1 (complete capture):**
+
+```text
+==================== EXPERIMENT E8 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [39 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [33 bytes] --- b'250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [146 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-1\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [146 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-2\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [146 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-3\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [146 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-4\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [146 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-5\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"24643c9f","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:46160"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"24643c9f"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"24643c9f"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"24643c9f"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"24643c9f"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"24643c9f"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"24643c9f"}
+[debug] smtp_downstream: connected	{"msg_id":"24643c9f","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"24643c9f"}
+smtp: RCPT ok	{"msg_id":"24643c9f","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E8-msg-1
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"24643c9f"}
+smtp: accepted	{"msg_id":"24643c9f"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"4d5dd79e","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:46160"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"4d5dd79e"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"4d5dd79e"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"4d5dd79e"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"4d5dd79e"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"4d5dd79e"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"4d5dd79e"}
+[debug] smtp_downstream: connected	{"msg_id":"4d5dd79e","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"4d5dd79e"}
+smtp: RCPT ok	{"msg_id":"4d5dd79e","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E8-msg-2
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"4d5dd79e"}
+smtp: accepted	{"msg_id":"4d5dd79e"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"a7e1be73","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:46160"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"a7e1be73"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"a7e1be73"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"a7e1be73"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"a7e1be73"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"a7e1be73"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"a7e1be73"}
+[debug] smtp_downstream: connected	{"msg_id":"a7e1be73","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"a7e1be73"}
+smtp: RCPT ok	{"msg_id":"a7e1be73","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E8-msg-3
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"a7e1be73"}
+smtp: accepted	{"msg_id":"a7e1be73"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"3736a717","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:46160"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"3736a717"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"3736a717"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"3736a717"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"3736a717"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"3736a717"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"3736a717"}
+[debug] smtp_downstream: connected	{"msg_id":"3736a717","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"3736a717"}
+smtp: RCPT ok	{"msg_id":"3736a717","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E8-msg-4
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"3736a717"}
+smtp: accepted	{"msg_id":"3736a717"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"073b2265","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:46160"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"073b2265"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"073b2265"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"073b2265"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"073b2265"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"073b2265"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"073b2265"}
+[debug] smtp_downstream: connected	{"msg_id":"073b2265","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"073b2265"}
+smtp: RCPT ok	{"msg_id":"073b2265","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E8-msg-5
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"073b2265"}
+smtp: accepted	{"msg_id":"073b2265"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: QUIT
+
+
+-------- delivered messages (new caught_* files) --------
+delivered [caught_009.raw, 308 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 24643c9f; Wed, 08 Jul\r\n 2026 06:18:53 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-1\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+delivered [caught_010.raw, 308 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 4d5dd79e; Wed, 08 Jul\r\n 2026 06:18:53 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-2\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+delivered [caught_011.raw, 308 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id a7e1be73; Wed, 08 Jul\r\n 2026 06:18:53 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-3\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+delivered [caught_012.raw, 308 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 3736a717; Wed, 08 Jul\r\n 2026 06:18:53 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-4\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+delivered [caught_013.raw, 308 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 073b2265; Wed, 08 Jul\r\n 2026 06:18:53 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-5\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
 ```
 
----
+**E8 — RUN 2 (complete capture, identical input):**
+
+```text
+==================== EXPERIMENT E8 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [39 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [14 bytes] --- b'250-SMTPUTF8\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [19 bytes] --- b'250 SIZE 33554432\r\n'
+--- C->S [146 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-1\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
+--- C->S [146 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-2\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
+--- C->S [146 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-3\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
+--- C->S [146 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-4\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
+--- C->S [146 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-5\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+DATA
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"7300344d","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:46164"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"7300344d"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"7300344d"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"7300344d"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"7300344d"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"7300344d"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"7300344d"}
+[debug] smtp_downstream: connected	{"msg_id":"7300344d","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"7300344d"}
+smtp: RCPT ok	{"msg_id":"7300344d","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+smtp: From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E8-msg-1
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"7300344d"}
+smtp: accepted	{"msg_id":"7300344d"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"ec43152e","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:46164"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"ec43152e"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"ec43152e"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"ec43152e"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"ec43152e"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"ec43152e"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"ec43152e"}
+[debug] smtp_downstream: connected	{"msg_id":"ec43152e","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"ec43152e"}
+smtp: RCPT ok	{"msg_id":"ec43152e","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E8-msg-2
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+MAIL FROM:<sender@probe.local>
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"ec43152e"}
+smtp: accepted	{"msg_id":"ec43152e"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: RCPT TO:<rcpt@probe.local>
+DATA
+
+smtp: incoming message	{"msg_id":"e8de4b34","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:46164"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"e8de4b34"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"e8de4b34"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"e8de4b34"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"e8de4b34"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"e8de4b34"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"e8de4b34"}
+[debug] smtp_downstream: connected	{"msg_id":"e8de4b34","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"e8de4b34"}
+smtp: RCPT ok	{"msg_id":"e8de4b34","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+smtp: From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E8-msg-3
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"e8de4b34"}
+smtp: accepted	{"msg_id":"e8de4b34"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"5d4d2633","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:46164"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"5d4d2633"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"5d4d2633"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"5d4d2633"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"5d4d2633"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"5d4d2633"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"5d4d2633"}
+[debug] smtp_downstream: connected	{"msg_id":"5d4d2633","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"5d4d2633"}
+smtp: RCPT ok	{"msg_id":"5d4d2633","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E8-msg-4
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+MAIL FROM:<sender@probe.local>
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"5d4d2633"}
+smtp: accepted	{"msg_id":"5d4d2633"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: RCPT TO:<rcpt@probe.local>
+DATA
+
+smtp: incoming message	{"msg_id":"b3c56d90","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:46164"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"b3c56d90"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"b3c56d90"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"b3c56d90"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"b3c56d90"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"b3c56d90"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"b3c56d90"}
+[debug] smtp_downstream: connected	{"msg_id":"b3c56d90","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"b3c56d90"}
+smtp: RCPT ok	{"msg_id":"b3c56d90","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+smtp: From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E8-msg-5
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+QUIT
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"b3c56d90"}
+smtp: accepted	{"msg_id":"b3c56d90"}
+[debug] smtp: reset	
+
+-------- delivered messages (new caught_* files) --------
+delivered [caught_014.raw, 308 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 7300344d; Wed, 08 Jul\r\n 2026 06:18:54 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-1\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+delivered [caught_015.raw, 308 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id ec43152e; Wed, 08 Jul\r\n 2026 06:18:54 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-2\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+delivered [caught_016.raw, 308 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id e8de4b34; Wed, 08 Jul\r\n 2026 06:18:54 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-3\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+delivered [caught_017.raw, 308 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 5d4d2633; Wed, 08 Jul\r\n 2026 06:18:54 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-4\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+delivered [caught_018.raw, 308 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id b3c56d90; Wed, 08 Jul\r\n 2026 06:18:54 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E8-msg-5\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+```
 
 ## Section 6 — Front proxy (Q5)
 
-**Result:** a naive normalizing proxy does **not** stop the spoof; only a rejecting proxy does. The three modes of the front proxy (`proxy.py`, Appendix A.5) were each measured against E2 (bare-LF) and E7 (the smuggle):
+**Result:** a naive normalizing proxy does **not** stop the spoof; only a rejecting proxy does. The three modes of the front proxy (`proxy.py`, Appendix A.5, listening on `:2527` → `:2525`) were each measured against E2 (bare-LF) and E7 (the smuggle). Observed delivery counts:
 
 | Proxy mode | E2 (bare-LF `\n.\n`) | E7 (pipelined smuggle) | Effect on the attack |
 |------------|----------------------|------------------------|----------------------|
 | passthrough (control) | 1 delivered | 2 delivered (spoof succeeds) | proxy neutral |
 | normalize (bare-LF→CRLF) | 1 delivered | 2 delivered (attacker + spoofed) | **does NOT block** the injection |
-| reject (drop on bare-LF) | 0 delivered | 0 delivered | **blocks**; client gets `421`, connection closes |
+| reject (drop on bare-LF) | 0 delivered | 0 delivered (`421`, connection closed) | **blocks** the attack |
 
-- **passthrough (control):** E2 → 1 delivered; E7 → 2 delivered. The proxy is neutral and the spoof succeeds exactly as in the direct case.
-- **normalize (bare-LF→CRLF, client→server):** E2 → 1; E7 → 2 (both the attacker and spoofed messages caught). **HONEST negative result:** naive normalization does *not* block the spoof — it promotes `\n.\n` to canonical `\r\n.\r\n`, and Maddy still splits and delivers the spoofed message. Normalization removes the *desync* (a strict downstream peer would now also see two messages, so front and back agree) but not the *injection* itself.
-- **reject (drop on bare-LF):** E2 → 0; E7 → 0. The client receives `421 4.7.0 bare <LF> in stream rejected by proxy (anti-smuggling), closing` and then the connection closes. This is the effective mitigation — the analog of Postfix `smtpd_forbid_bare_newline=reject` and Cisco's clean-bare-CR/LF option.
+- **passthrough (control):** E2 → 1 delivered (`caught_019`, `msg_id b74a01f8`); E7 → 2 delivered. The proxy is neutral and the spoof succeeds exactly as in the direct case.
+- **normalize (bare-LF→CRLF):** E2 → 1; E7 → **2** (attacker `c644728f` + spoofed `cff64f61`). **HONEST result:** naive normalization does *not* block the spoof — it promotes `\n.\n` to canonical `\r\n.\r\n`, which is *still* a valid terminator, so Maddy still splits and delivers the spoofed message. Normalization removes the *desync* (a strict downstream peer would now also see two messages) but not the *injection*.
+- **reject (drop on bare-LF):** E2 → 0; E7 → 0. The client receives `421 4.7.0 bare <LF> in stream rejected by proxy (anti-smuggling), closing` and the connection closes. This is the effective mitigation — the analog of Postfix `smtpd_forbid_bare_newline=reject`.
 
+**Proof the normalize mode actually rewrites the bytes** (distinguishing it from passthrough): running the proxy's own `normalize_stream`/`has_bare_lf` on the exact E2 and E7 payloads shows `\n.\n` → `\r\n.\r\n`:
+
+```text
+### E2 DATA-body tail before/after normalize (bare-LF boundary) ###
+BEFORE (repr tail): b'ody.\r\nLine two of the body.\n.\n'
+AFTER  (repr tail): b'y.\r\nLine two of the body.\r\n.\r\n'
+has_bare_lf(E2 body) = True
+
+### E7 blob: boundary region before/after normalize ###
+BEFORE (repr region): b'Outer legit body line.\n.\nMAIL FROM'
+AFTER  (repr region): b'Outer legit body line.\r\n.\r\nMAIL FROM'
+has_bare_lf(E7 blob) = True
+
+### passthrough forwards these bytes unchanged; normalize rewrites bare \n -> \r\n; reject drops on has_bare_lf=True ###
 ```
-passthrough: E2 -> 1 delivered ; E7 -> 2 delivered (caught_022 attacker 8573ab48 + caught_023 spoofed 18bab55c)
-normalize  : E2 -> 1 delivered ; E7 -> 2 delivered (caught_025 attacker 45a2a9a3 + caught_026 spoofed 4805cc1f)
-             (bare-LF promoted to CRLF; spoof STILL delivered — naive normalization does not block it)
-reject     : E2 -> 0 delivered ; E7 -> 0 delivered
-             client receives: b'421 4.7.0 bare <LF> in stream rejected by proxy (anti-smuggling), closing\r\n' then RECV b'' (closed)
+
+**reject / E2 — complete capture (client `421`, Maddy `DATA error` → `aborted`, 0 delivered):**
+
+```text
+==================== EXPERIMENT E2 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [22 bytes] --- b'250-Hello probe.test\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [55 bytes] --- b'250-PIPELINING\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [33 bytes] --- b'250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [145 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E2-bareLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\n.\n'
+--- S->C [75 bytes] --- b'421 4.7.0 bare <LF> in stream rejected by proxy (anti-smuggling), closing\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [0 bytes] --- b''
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: RCPT TO:<rcpt@probe.local>
+DATA
+
+smtp: incoming message	{"msg_id":"cb42de8a","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:50100"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"cb42de8a"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"cb42de8a"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"cb42de8a"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"cb42de8a"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"cb42de8a"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"cb42de8a"}
+[debug] smtp_downstream: connected	{"msg_id":"cb42de8a","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"cb42de8a"}
+smtp: RCPT ok	{"msg_id":"cb42de8a","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA error	{"msg_id":"cb42de8a","reason":"unexpected EOF"}
+smtp: aborted	{"msg_id":"cb42de8a"}
+[debug] smtp: reset	
+
+-------- delivered messages (new caught_* files) --------
+delivered messages captured: 0
 ```
 
----
+**reject / E7 — conversation (single blob rejected with `421`, 0 delivered):**
+
+```text
+==================== EXPERIMENT E7 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [22 bytes] --- b'250-Hello probe.test\r\n'
+--- C->S [409 bytes] --- b'MAIL FROM:<attacker@probe.local>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-OUTER-legit\r\nX-Probe: boundary-test\r\n\r\nOuter legit body line.\n.\nMAIL FROM:<spoofed@evil.example>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-SMUGGLED-injected\r\nX-Probe: boundary-test\r\n\r\nSmuggled spoofed body line.\r\n.\r\n'
+--- S->C [16 bytes] --- b'250-PIPELINING\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [128 bytes] --- b'421 4.7.0 bare <LF> in stream rejected by proxy (anti-smuggling), closing\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n'
+```
+
+→ complete unedited captures for all three modes × {E2, E7} are in **Appendix B.E9** (passthrough, normalize, and reject).
 
 ## Section 7 — The real runtime story (Q6): what lingers, what is never seen
 
@@ -309,77 +1215,134 @@ reject     : E2 -> 0 delivered ; E7 -> 0 delivered
 
 **What lingers when things go wrong (observed):**
 
-- **(a) Unterminated `DATA` hangs to the read timeout.** When the client sends `DATA` content but never a terminator and never closes, the connection blocks until the 10-minute `read_timeout` (`smtp.go:560`). Observed: no response is returned and the socket stays open — an experiment must account for this to avoid stalling.
-- **(b) Early close → `554` + `aborted`, nothing queued.** As in E6, a close before the dot produces `DATA error` (`unexpected EOF`) → `554 5.0.0` → `aborted`, and nothing is delivered or queued.
-- **(c) `smtp_downstream` leaves nothing on disk.** The probe's delivery target relays synchronously; confirmed no queue files or databases were created by it during the investigation.
-- **(d) The `queue`/`remote` targets create the `.gitignore` residue.** The `queue` target creates `/var/lib/maddy/localq` via `os.MkdirAll` (`internal/target/queue/queue.go:233`; the location is `StateDirectory/<name>` at `queue.go:229`; `DefaultStateDirectory = /var/lib/maddy` at `maddy.go:59`), and the `remote` target creates `<state>/mtasts-cache` (`internal/target/remote/remote.go`). When Maddy is run from the `cmd/maddy` directory these appear as the ignored paths `cmd/maddy/*queue` (`.gitignore:36`) and `cmd/maddy/*mtasts-cache` (`.gitignore:35`) — the very reason the investigation ran from `/tmp/investig` instead, keeping the repository clean.
+**(a) Unterminated `DATA` hangs to the read timeout.** When the client sends `DATA` content but never a terminator and never closes, the connection blocks until the 10-minute `read_timeout` (`smtp.go:560`). Observed (bounded to a 6-second poll rather than waiting the full timeout): after the `354`, the server returned **nothing** for the entire poll, then on client close logged `DATA error {"reason":"unexpected EOF"}` → `554 5.0.0 Internal server error` → `aborted`, with 0 delivered. This is also the clean before/after state transition for E5: **empty (blocked, silent) before a terminator arrives.** Complete capture:
+
+```text
+--- S->C --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C --- b'250-Hello probe.test\r\n250-PIPELINING\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [68 bytes] --- b'From: <s@probe.local>\r\nSubject: hang\r\n\r\nBody line with no terminator'
+>>> now holding connection open, polling for a server response for ~6s (server should stay silent, blocked on read_timeout=10m)
+--- S->C --- b'<no data - timed out>'
+--- S->C --- b'<no data - timed out>'
+--- S->C --- b'<no data - timed out>'
+--- S->C --- b'<no data - timed out>'
+--- S->C --- b'<no data - timed out>'
+--- S->C --- b'<no data - timed out>'
+>>> after 6.0s the server sent NOTHING: it is blocked awaiting the <CRLF>.<CRLF> terminator (read_timeout default 10m, smtp.go:560). Closing client now (bounded).
+```
+
+**(b) Early/abrupt close → `DATA error` + `aborted`, nothing queued.** As quantified in E6 (Section 3), a close before the dot delivers 0; the logged reason is `connection reset by peer` or `unexpected EOF` depending on the close race, and a `554` is emitted only sometimes. Nothing is queued.
+
+**(c) `smtp_downstream` leaves nothing on disk.** The probe's delivery target relays synchronously to the catch server; it does not spool. Confirmed by the artifact inventory below — the `state`/`runtime` directories are empty of files after 24 delivered messages.
+
+**(d) The `queue`/`remote` targets are what create the `.gitignore` residue** (not used by this probe config). The `queue` target creates `StateDirectory/<name>` via `os.MkdirAll` (location `internal/target/queue/queue.go:229`, `os.MkdirAll` at `queue.go:233`), and the `remote` target creates `StateDirectory/mtasts-cache` (location `internal/target/remote/remote.go:93`, `os.MkdirAll` at `remote.go:145`); `DefaultStateDirectory = /var/lib/maddy` (`maddy.go:59`). When Maddy is run from the `cmd/maddy` directory these surface as the ignored paths `cmd/maddy/*queue` (`.gitignore:36`) and `cmd/maddy/*mtasts-cache` (`.gitignore:35`) — the very reason this investigation ran from `/tmp/investig` with `state`/`runtime` redirected there, keeping the repository clean.
+
+**Artifact inventory (observed):**
+
+```text
+$ ls -la /tmp/investig/state /tmp/investig/runtime /tmp/investig/state2 /tmp/investig/runtime2
+/tmp/investig/runtime:
+total 8
+drwxr-xr-x 2 root root 4096 Jul  8 06:14 .
+drwxr-xr-x 7 root root 4096 Jul  8 06:37 ..
+
+/tmp/investig/runtime2:
+total 8
+drwxr-xr-x 2 root root 4096 Jul  8 06:19 .
+drwxr-xr-x 7 root root 4096 Jul  8 06:37 ..
+
+/tmp/investig/state:
+total 8
+drwxr-xr-x 2 root root 4096 Jul  8 06:14 .
+drwxr-xr-x 7 root root 4096 Jul  8 06:37 ..
+
+/tmp/investig/state2:
+total 8
+drwxr-xr-x 2 root root 4096 Jul  8 06:19 .
+drwxr-xr-x 7 root root 4096 Jul  8 06:37 ..
+
+$ find /tmp/investig/state /tmp/investig/runtime /tmp/investig/state2 /tmp/investig/runtime2 -type f | wc -l   # files spooled to disk by smtp_downstream
+0
+
+$ find /tmp/investig \( -name "*queue" -o -name "*mtasts-cache" \) 2>/dev/null   # queue/remote residue in the run dir
+(none)
+
+$ ls -la /var/lib/maddy /run/maddy 2>&1   # DefaultStateDirectory / runtime (never created by this probe)
+ls: cannot access '/var/lib/maddy': No such file or directory
+ls: cannot access '/run/maddy': No such file or directory
+
+$ ls -1 /tmp/investig/caught_*.raw | wc -l   # total delivered messages captured across all experiments
+24
+
+$ cd <repo> && git status --porcelain   # repository working tree (before writing the answer doc)
+(clean; the sole change will be the answer document itself)
+
+$ cd <repo> && git status --ignored --porcelain | grep -E "queue|mtasts" ; echo exit=$?   # any .gitignore residue tracked-or-ignored in the repo
+exit=1 (no ignored *queue/*mtasts-cache residue present)
+```
 
 **What one expects to see but never does (observed):**
 
-- **No `CHUNKING`/`BDAT`.** EHLO advertises only `PIPELINING`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `SMTPUTF8`, and `SIZE` (see the E1 banner) — **never** `CHUNKING`/`BDAT` (`go-smtp/server.go:81`). Length-framed `BDAT` is the transfer mode that structurally defeats terminator smuggling (there is no terminator to confuse), but it does not exist to exercise in this version, so only the `DATA`-terminator vector is testable here.
-- **No `DATA`-specific rejection code** for an over-long or aborted body — it collapses into the generic `554 5.0.0 Internal server error` (E6, ELINE), which is exactly why the over-long `DATA` line does not surface the clean `500 5.4.0` that the command path produces.
+- **No `CHUNKING`/`BDAT`.** EHLO advertises only `PIPELINING`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `SMTPUTF8`, and `SIZE` (see every E1–E8 banner above) — **never** `CHUNKING`/`BDAT` (`go-smtp/server.go:81`). Length-framed `BDAT` is the transfer mode that structurally defeats terminator smuggling (there is no terminator to confuse), but it does not exist to exercise in this version, so only the `DATA`-terminator vector is testable here.
+- **No terminator response.** During an unterminated `DATA`, one might expect a timeout error or a nudge; instead the server is simply silent until the client goes away or the 10-minute `read_timeout` fires (shown in (a) above).
 
----
+## Section 8 — Coverage, citations, and grounding
 
-## Section 8 — Coverage matrix, citations, and inferred-vs-observed
+### 8.1 Question coverage matrix
 
-### Coverage matrix
+Every question item and every user-named framing is exercised at runtime with adjacent evidence:
 
-Every question item and every user-named framing maps to an experiment, an observed result, and an evidence location.
+| Item | Where answered | Framing / condition exercised | Observed outcome |
+|------|----------------|-------------------------------|------------------|
+| Q1 (what the server sees) | §2, §3/E1 | canonical `\r\n.\r\n` | dot-reader detects terminator, drains, resumes commands; 1 delivered |
+| Q2 (varied framing) | §3 | E1 `\r\n.\r\n`; **E2 bare-LF `\n.\n`**; E3a `\n.\r\n`; E3b `\r\n.\n`; **E4 dot-stuffing `\r\n..\r\n`**; **E5 missing CRLF before dot**; E6 early close | E1/E2/E3a/E3b/E4/E5 all ACCEPTED+delivered; E4 unstuffed one dot; E6 0 delivered |
+| Q3 (smuggling) | §4/E7 | pipelined single write, bare-LF boundary + injected txn | **2 delivered** (attacker + spoofed) |
+| Q4 (stability) | §5/E8 | 5 back-to-back × 2 identical runs | `{5/5, 5/5}` stable |
+| Q5 (front proxy) | §6/E9 | passthrough / normalize / reject × {E2, E7} | reject blocks (0/0, `421`); normalize does NOT block spoof (2) |
+| Q6 (the real story) | §7 | unterminated hang; early close; artifact inventory; no CHUNKING/BDAT | silent-until-timeout; 0-delivery aborts; empty state dirs; only PIPELINING/8BITMIME/ENHANCEDSTATUSCODES/SMTPUTF8/SIZE advertised |
 
-| Question / named item | Experiment(s) | Observed result | Evidence |
-|-----------------------|---------------|-----------------|----------|
-| **Q1** — what the server sees at the boundary | mechanism + E1 | Terminator detection delegated to the stdlib `net/textproto` dot-reader; go-smtp drains and resyncs; Maddy sees only the decoded body | Section 2; Appendix B.E1 |
-| **Q2** — varied boundary framing | E1/E2/E3a/E3b/E4/E5/E6 + ELINE/ECMD/552 | see the rows below | Section 3; Appendix B |
-| — "bare LF vs CRLF" | E1 (CRLF) vs E2 (bare-LF) | both terminate; 1 delivered each (312 vs 309 bytes) | B.E1, B.E2 |
-| — "dot-stuffing `\r\n..\r\n`" (and `\r\n...\r\n`) | E4 | unstuffed: `..`→`.`, `...`→`..` | B.E4 |
-| — "`\n.\n`" | E2 (and E7) | accepted as end-of-`DATA` | B.E2, B.E7 |
-| — "missing final CRLF before the dot" | E5 | glued dot is literal body, never terminates | B.E5 |
-| — mixed forms `\n.\r\n` / `\r\n.\n` | E3a, E3b | both terminate; 315 bytes each | B.E3a/E3b |
-| — early close before the dot | E6 | `554` + `aborted`; 0 delivered | B.E6 |
-| — line-length limit (2000) | ELINE / ECMD | `DATA` body → `554` via `ErrUnexpectedEOF`; command → clean `500 5.4.0` | B.ELINE |
-| — message-size limit | 552 | `552 5.3.4`; 0 delivered; default 32 MiB (`SIZE 33554432`) | B.552 |
-| **Q3** — pipelined smuggling | E7 | 2 delivered on one connection; 2nd fully spoofed | Section 4; B.E7 |
-| **Q4** — back-to-back stability | E8 | `{5/5, 5/5}` deterministic, no wobble | Section 5; B.E8 |
-| **Q5** — front proxy | E9 | passthrough 2 / normalize 2 / reject 0; `421` on reject | Section 6; B.E9 |
-| **Q6** — real story / what lingers / never seen | Section 7 narrative + residual inventory | `read_timeout` hang; `*queue`/`*mtasts-cache` residue; no `CHUNKING`/`BDAT` | Section 7 |
+Edge/limit paths additionally exercised: **ELINE** (over-long `DATA` line), **ECMD** (over-long command line), and the **552** maximum-message-size rejection (§3).
 
-### Consolidated `file:line` citation list (all verified exact against the inspected tree/module cache/stdlib)
+### 8.2 Observed vs. inferred
 
-- go-smtp `data.go`: `ErrDataTooLarge` L38-39 (552); `newDataReader` L51; `c.text.DotReader()` L53; `MaxMessageBytes` L56/58; `return 0, ErrDataTooLarge` L67.
-- go-smtp `conn.go`: `TeeReader` L68; `handleData` L498; 354 prompt L510; `newDataReader` L519; drain `io.Copy(ioutil.Discard, r)` L521; `handleDataLMTP` L568-569, LMTP drains L595/L617.
-- go-smtp `server.go`: `MaxLineLength` field L40, value 2000 L76; caps L81; `ErrTooLongLine` L154; `500 5.4.0` L155.
-- go-smtp `smtp.go`: `validateLine` (rejects CR/LF) L23-24.
-- maddy `internal/endpoint/smtp/smtp.go`: `prepareBody` L283; `Received` header add L307; `Data` L312; `accepted` L334 (SMTP)/L377 (LMTP); `wrapErr` L389; SMTPError pass-through L429-434; msg-ID suffix L437; `EnableSMTPUTF8` L504; `write_timeout` 1min L559; `read_timeout` 10min L560; `max_message_size` 32MiB L561; `io_debug` L565; `serv.Debug = endp.Log.DebugWriter()` L604.
-- maddy `maddy.go`: `Version` L41; `DefaultStateDirectory` `/var/lib/maddy` L59; `Run` L102; `-debug` L104.
-- maddy `internal/log/log.go`: `DebugWriter()` returns `ioutil.Discard` unless `Debug` (L172-177); `formatMsg` = `<msg>` + TAB + ordered-JSON (L135-155).
-- `.gitignore`: `cmd/maddyctl/maddyctl` L25; `cmd/maddy/*mtasts-cache` L35; `cmd/maddy/*queue` L36; `maddy-setup/` L38.
-- `internal/endpoint/smtp/smtp_test.go`: `testEndpoint` L30; `TestSMTPDelivery_AbortData` L360.
-- `internal/target/queue/queue.go`: location L229; `os.MkdirAll` L233.
-- `go.mod`: `go 1.13`; go-smtp `v0.12.1-0.20191206174923-1f576e0ec85c`; go-message `v0.10.9-0.20191116124005-65fd0119e899`; go-sqlite3 `v1.11.0`.
+**Observed (with captured evidence in this document):** every delivery count and `msg_id`; the `354`/`250`/`500`/`552`/`421`/`554` response codes and their exact text; the two-message E7 smuggle; the `{5/5,5/5}` E8 distribution; the three proxy-mode outcomes and the normalize byte-rewrite proof; the unterminated-`DATA` silence and its `unexpected EOF`→`554` close; the empty state/runtime dirs and clean repo; and the EHLO capability set (no CHUNKING/BDAT).
 
-### Inferred vs observed
+**Corrected against runtime (earlier read-only guesses that the captures disproved):**
+- **E5** is **accepted and delivered**, not "never terminates." An earlier draft misread a pipelining-offset `RECV b''` as "still in DATA"; the actual bytes show the `\r\n.\r\n` terminator arriving in a later TCP segment and being detected normally.
+- **E6 / ELINE outcomes are nondeterministic**, not a fixed `unexpected EOF`+`554`. Across 10 identical runs each, E6 logged `connection reset by peer` 6/10 and `unexpected EOF` 4/10 (a `554` surfaced only 3/10); ELINE produced a clean `500 5.4.0 Too long line` 4/10 with reset/other on the rest. The **one invariant** is **0 delivered** in every run. There is **no** deterministic "DATA-path `554` vs command-path `500` asymmetry," and no `lineLimitReader` value-vs-pointer receiver explanation is asserted — the difference is a client-close/server-read race, confirmed by repetition.
 
-Two items are **INFERRED** (read from source, with behavior confirmed at runtime); everything else in this document is observed with adjacent evidence:
+**Inferred (from reading, not separately instrumented):** the internal `io.Copy(ioutil.Discard, r)` drain being a no-op at EOF (`conn.go:521`) is the mechanism that leaves injected bytes in the shared buffered reader; this is inferred from the source and is *consistent with* the observed E7 two-message delivery, but the buffer contents were not dumped directly.
 
-1. **The exact `net/textproto` dot-reader state transitions** (Section 2, Layer 1) — read from the Go stdlib source (`/usr/local/go/src/net/textproto/reader.go`), with the observable behavior confirmed at runtime via E1–E5.
-2. **The `lineLimitReader` value-receiver detail** behind the ELINE asymmetry (`go-smtp/lengthlimit_reader.go`) — read from source; the observable structural result (error + connection dropped + 0 delivered) is confirmed at runtime.
+### 8.3 Consolidated citations (verified against source at commit `26452dd8dd78`)
 
-### Read-only confirmation
+**Maddy `internal/endpoint/smtp/smtp.go`:** `prepareBody` L283; `Received` header add L307; `Session.Data` L312; `accepted` log L334 (SMTP) / L377 (LMTP); `wrapErr` L388 with `*smtp.SMTPError` passthrough L429–434 and `" (msg ID = " + msgId + ")"` suffix L437; `EnableSMTPUTF8=true` L504; `write_timeout` L559; `read_timeout` L560; `max_message_size` L561; `io_debug` L565; `serv.Debug = Log.DebugWriter()` L604.
+**Maddy other:** `maddy.go` Version L41, `DefaultStateDirectory=/var/lib/maddy` L59, `Run` L102, `-debug` L104; `internal/log/log.go` `formatMsg` L135, `DebugWriter` L172, `ioutil.Discard` L174; `internal/target/remote/remote.go` mtasts-cache location L93, `os.MkdirAll` L145; `internal/target/queue/queue.go` location L229, `os.MkdirAll` L233; `.gitignore` `*mtasts-cache` L35, `*queue` L36.
+**`go-smtp` @ `1f576e0` (2019):** `data.go` `ErrDataTooLarge`/552 L38–39, `newDataReader` L51/L53, byte counter L56/L58, size check L67; `conn.go` transcript tee L68, `c.text=textproto.NewConn` L74, `handleData` L498, `354` L510, reader construct L519, drain `io.Copy(ioutil.Discard,r)` L521, LMTP `handleDataLMTP` L568; `server.go` `MaxLineLength=2000` L40/L76, `caps` (PIPELINING/8BITMIME/ENHANCEDSTATUSCODES; no CHUNKING/BDAT) L81, `handleConn` loop L154, `ErrTooLongLine`→`500` L155; `smtp.go` `validateLine` rejects `\n`/`\r` L23–24.
+**Go standard library `net/textproto/reader.go` (Go 1.18.10):** `dotReader.Read` L322; state constants `stateBeginLine/stateDot/stateData/stateCR/stateEOF` L328–333; `ErrUnexpectedEOF` (returned when the stream ends mid-body) L340–342; **the `stateDot` + `'\n'` → `stateEOF` transition (the exact line that accepts a bare-LF `.\n` terminator) L362–364**.
+**Manifests:** `go.mod` `go 1.13`; `github.com/emersion/go-smtp v0.12.1-0.20191206174923-1f576e0ec85c`; `github.com/emersion/go-message v0.10.9-0.20191116124005-65fd0119e899`; `github.com/mattn/go-sqlite3 v1.11.0`.
 
-The repository was left unchanged: `git status --porcelain` was **empty before and after** the investigation. The temporary harness was removed (`/tmp/investig` deleted). All behavior was observed on Maddy commit `26452dd` with the pinned `go-smtp` 2019 commit `1f576e0` — **no fix was backported** and nothing in the repository was modified beyond adding this document.
+### 8.4 Read-only confirmation
 
----
+The investigation added exactly one file — this document — and modified no existing repository file. The build was performed from the repo root (`go build ./cmd/maddy`) and the binary moved to `/tmp/investig`; the server ran from `/tmp/investig` with `state`/`runtime` redirected there, so no `*queue`/`*mtasts-cache` residue and no SQLite databases were created in the tree (§7 inventory). All harness scripts (`catch.py`, `probe.py`, `exp.py`, `proxy.py`) and configs (`maddy.conf`, `maddy_size.conf`) live under `/tmp/investig` and are removed at the end of the investigation, leaving the repository unchanged.
 
-# Appendix A — Reproduction harness
+## Appendix A — Harness (temporary; lives under `/tmp/investig`, removed after the investigation)
 
-These five scripts were validated and run to produce every evidence block in Appendix B. Run Maddy with `./maddy -config /tmp/investig/maddy.conf -log stderr -debug` — the `-debug` flag is **required** for the `io_debug` transcript (see Section 0). For the 552 path a second instance was run on `tcp://127.0.0.1:2530` with `max_message_size 500b` and `debug yes` (which advertises `250 SIZE 500`).
+All scripts below were run exactly as shown. They are **not** added to the repository; they are reproduced here so every experiment is repeatable.
 
-### A.1 `maddy.conf` (minimal check-free plaintext probe config)
+### A.1 Probe config — `maddy.conf` (minimal, check-free, plaintext, `io_debug yes`, state/runtime redirected out of the repo)
 
-```
+```text
 ## Minimal check-free plaintext probe config for DATA-boundary investigation.
-## Runs from /tmp/investig so *queue/*mtasts-cache land OUTSIDE the repo.
+## Runs from /tmp/investig so all state/runtime artifacts land OUTSIDE the repo.
+state /tmp/investig/state
+runtime /tmp/investig/runtime
 hostname probe.local
 tls off
 
@@ -398,7 +1361,7 @@ smtp tcp://127.0.0.1:2525 {
 }
 ```
 
-### A.2 `catch.py` (byte-exact delivery sink on :2526 — writes caught_NNN.wire + caught_NNN.raw)
+### A.2 Catch server — `catch.py` (byte-exact delivered-message sink on `:2526`)
 
 ```python
 #!/usr/bin/env python3
@@ -506,7 +1469,7 @@ if __name__ == "__main__":
     main()
 ```
 
-### A.3 `probe.py` (raw-socket byte-exact SMTP client)
+### A.3 Raw-socket probe — `probe.py` (byte-exact CR/LF and packet-boundary control)
 
 ```python
 #!/usr/bin/env python3
@@ -565,7 +1528,7 @@ if __name__ == "__main__":
     show("probe self-test", log)
 ```
 
-### A.4 `exp.py` (experiment runner)
+### A.4 Experiment driver — `exp.py` (defines E1–E9, ELINE, ECMD payloads)
 
 ```python
 #!/usr/bin/env python3
@@ -721,7 +1684,7 @@ if __name__ == "__main__":
     run(exp, host, port)
 ```
 
-### A.5 `proxy.py` (front proxy — passthrough | normalize | reject)
+### A.5 Front proxy — `proxy.py` (passthrough / normalize / reject modes on `:2527`→`:2525`)
 
 ```python
 #!/usr/bin/env python3
@@ -836,162 +1799,833 @@ if __name__ == "__main__":
     main()
 ```
 
----
+### A.6 Size-limit instance config — `maddy_size.conf` (`:2530`, `max_message_size 500b`, separate state2/runtime2 — the 552 instance)
 
-# Appendix B — Captured evidence
+```text
+## Second probe instance: same as primary but with a tiny max_message_size
+## to exercise the 552 (ErrDataTooLarge) path. Distinct state/runtime to avoid
+## collision with the primary instance.
+state /tmp/investig/state2
+runtime /tmp/investig/runtime2
+hostname probe.local
+tls off
 
-Each block below is the canonical captured output, embedded exactly and not truncated. The `msg_id`, timestamp, and ephemeral TCP source-port values vary per run; the structural results (accept/reject decisions, delivered-byte counts, dot-unstuffing, CRLF→LF rewrite, the two-message smuggle, and the `421/500/552/554` codes) are deterministic and were re-confirmed.
+smtp_downstream catch {
+    targets tcp://127.0.0.1:2526
+    hostname probe.local
+    attempt_starttls no
+    require_tls no
+}
 
-## B.E1 — canonical `\r\n.\r\n` (baseline)
-
+## max_message_size 500b -> advertises "250 SIZE 500" and rejects larger bodies with 552.
+smtp tcp://127.0.0.1:2530 {
+    io_debug yes
+    max_message_size 500b
+    deliver_to &catch
+}
 ```
---- SENT (C->S) [17 bytes] --- b'EHLO probe.test\r\n'
---- RECV (S->C) [110 bytes] ---
-b'250-Hello probe.test\r\n250-PIPELINING\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
---- SENT (C->S) DATA prompt --- b'DATA\r\n'
---- RECV (S->C) [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
---- SENT (C->S) [150 bytes] ---
-b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E1-canonical\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\r\n'
---- RECV (S->C) [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
-maddy.log (ordered-JSON):
-smtp: incoming message	{"msg_id":"9ddb7cbb","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:57028"}
-smtp: RCPT ok	{"msg_id":"9ddb7cbb","rcpt":"rcpt@probe.local"}
-smtp: accepted	{"msg_id":"9ddb7cbb"}
+
+## Appendix B — Complete unedited captures
+
+Experiments shown in full inline are pointer-referenced here to avoid duplication; the remainder are reproduced in full below. Every capture is the complete, unedited output (probe conversation → Maddy `io_debug` transcript + ordered-JSON logs → delivered bytes).
+
+- **E1** (canonical) — shown in full in **§2**.
+- **E6** (early close, full 10-run context) — shown in full in **§3**.
+- **ELINE** (over-long DATA line) — shown in full in **§3**.
+- **552** (max message size) — shown in full in **§3**.
+- **E7** (pipelined smuggle) — shown in full in **§4**.
+- **E8** (back-to-back, both runs) — shown in full in **§5**.
+- **E9 reject/E2**, **normalize byte-rewrite proof** — shown in full in **§6**.
+- **hang** (unterminated DATA) and **artifact inventory** — shown in full in **§7**.
+- **build** (`go build` + `-v`) — shown in full in **§0**.
+
+### B.E2 — bare-LF terminator `\n.\n` (complete)
+
+```text
+==================== EXPERIMENT E2 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [39 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [14 bytes] --- b'250-SMTPUTF8\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [19 bytes] --- b'250 SIZE 33554432\r\n'
+--- C->S [145 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E2-bareLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\n.\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+DATA
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"a8fe0125","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:33524"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"a8fe0125"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"a8fe0125"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"a8fe0125"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"a8fe0125"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"a8fe0125"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"a8fe0125"}
+[debug] smtp_downstream: connected	{"msg_id":"a8fe0125","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"a8fe0125"}
+smtp: RCPT ok	{"msg_id":"a8fe0125","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+smtp: From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E2-bareLF
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+QUIT
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"a8fe0125"}
+smtp: accepted	{"msg_id":"a8fe0125"}
+[debug] smtp: reset	
+
+-------- delivered messages (new caught_* files) --------
+delivered [caught_002.raw, 309 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id a8fe0125; Wed, 08 Jul\r\n 2026 06:14:52 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E2-bareLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+```
+
+### B.E3a — mixed `\n.\r\n` (complete)
+
+```text
+==================== EXPERIMENT E3a (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [39 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [33 bytes] --- b'250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [152 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E3a-LF-dot-CRLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\n.\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"9be40444","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:33534"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"9be40444"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"9be40444"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"9be40444"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"9be40444"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"9be40444"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"9be40444"}
+[debug] smtp_downstream: connected	{"msg_id":"9be40444","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"9be40444"}
+smtp: RCPT ok	{"msg_id":"9be40444","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E3a-LF-dot-CRLF
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"9be40444"}
+smtp: accepted	{"msg_id":"9be40444"}
 smtp: 250 2.0.0 OK: queued
-delivered [caught_010.raw, 312 bytes]:
-b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 9ddb7cbb; Wed, 08 Jul\r\n 2026 02:57:39 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E1-canonical\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+
+[debug] smtp: reset	
+smtp: QUIT
+
+
+-------- delivered messages (new caught_* files) --------
+delivered [caught_003.raw, 315 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 9be40444; Wed, 08 Jul\r\n 2026 06:14:53 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E3a-LF-dot-CRLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
 ```
 
-## B.E2 — bare-LF `\n.\n`
+### B.E3b — mixed `\r\n.\n` (complete)
 
-```
---- SENT (C->S) body ending [ ...body...\n.\n ] ; RECV --- b'250 2.0.0 OK: queued\r\n'
-smtp: incoming message {"msg_id":"31cf8c16", ...}
-smtp: accepted {"msg_id":"31cf8c16"}
-delivered [caught_003.raw, 309 bytes]:
-b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 31cf8c16; ...\r\nSubject: E2-bareLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
-```
-ACCEPTED — bare-LF terminator treated as end-of-DATA. Smuggling vector confirmed.
+```text
+==================== EXPERIMENT E3b (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [53 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [19 bytes] --- b'250 SIZE 33554432\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [152 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E3b-CRLF-dot-LF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n.\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
 
-## B.E3a / B.E3b — mixed
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
 
-```
-E3a body...\n.\r\n  -> 250 OK: queued ; delivered caught_004.raw (315 bytes), Subject E3a-LF-dot-CRLF, msg_id 6bc7736a
-E3b body...\r\n.\n  -> 250 OK: queued ; delivered caught_005.raw (315 bytes), Subject E3b-CRLF-dot-LF, msg_id 1ae8f038
-```
-BOTH mixed forms terminate.
+smtp: EHLO probe.test
 
-## B.E4 — dot-stuffing
+smtp: 250-Hello probe.test
 
-```
---- SENT (C->S) [143 bytes] ---
-b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E4-dotstuff\r\nX-Probe: boundary-test\r\n\r\nLine A before.\r\n..\r\n...\r\nLine B after.\r\n.\r\n'
---- RECV --- b'250 2.0.0 OK: queued\r\n'
-delivered [caught_006.raw, 303 bytes] (UN-dot-stuffed body — note `..`->`.`, `...`->`..`):
-b'...Subject: E4-dotstuff\r\nX-Probe: boundary-test\r\n\r\nLine A before.\r\n.\r\n..\r\nLine B after.\r\n'
-delivered [caught_006.wire, 305 bytes] (maddy RE-stuffed for downstream):
-b'...\r\n\r\nLine A before.\r\n..\r\n...\r\nLine B after.\r\n'
-```
-Dot-unstuffing confirmed at the delivered-byte level.
+smtp: 250-PIPELINING
 
-## B.E5 — missing final CRLF before the dot
+smtp: 250-8BITMIME
 
-```
---- SENT (C->S) [153 bytes] ---
-b'...Subject: E5-missing-crlf\r\n...\r\n\r\nLine one of the body.\r\nGLUED_NO_NEWLINE_BEFORE.\r\n'
---- RECV (S->C) [0 bytes] --- b''          <== NO 250: server STILL IN DATA (glued dot is literal)
---- SENT (C->S) [5 bytes] --- b'\r\n.\r\n'  <== now a real terminator
---- RECV (S->C) [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
-delivered [caught_007.raw, 320 bytes]:
-b'...\r\n\r\nLine one of the body.\r\nGLUED_NO_NEWLINE_BEFORE.\r\n\r\n'   (glued `.` kept as literal, msg_id 01c8a333)
-```
-State transition observed: empty (b'') before a real terminator, populated after.
+smtp: 250-ENHANCEDSTATUSCODES
 
-## B.E6 — early close before the dot
+smtp: 250-SMTPUTF8
 
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"34710cd8","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:33540"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"34710cd8"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"34710cd8"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"34710cd8"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"34710cd8"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"34710cd8"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"34710cd8"}
+[debug] smtp_downstream: connected	{"msg_id":"34710cd8","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"34710cd8"}
+smtp: RCPT ok	{"msg_id":"34710cd8","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E3b-CRLF-dot-LF
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"34710cd8"}
+smtp: accepted	{"msg_id":"34710cd8"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: QUIT
+
+
+-------- delivered messages (new caught_* files) --------
+delivered [caught_004.raw, 315 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 34710cd8; Wed, 08 Jul\r\n 2026 06:14:53 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E3b-CRLF-dot-LF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
 ```
---- SENT (C->S) [133 bytes] --- b'...Subject: E6-early-close\r\n...\r\n\r\nBody with no terminator at all'
---- RECV (S->C) [0 bytes] --- b''
->>> CLOSE (client closed socket)
-maddy.log:
-smtp: DATA error	{"msg_id":"9dfa1ea2","reason":"unexpected EOF"}
-smtp: 554 5.0.0 Internal server error (msg ID = 9dfa1ea2)
-smtp: aborted	{"msg_id":"9dfa1ea2"}
+
+### B.E4 — dot-stuffing `\r\n..\r\n` (complete; note `.wire` re-stuffed egress vs `.raw` unstuffed delivered)
+
+```text
+==================== EXPERIMENT E4 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [52 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n250-8BITMIME\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [39 bytes] --- b'250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [19 bytes] --- b'250 SIZE 33554432\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [143 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E4-dotstuff\r\nX-Probe: boundary-test\r\n\r\nLine A before.\r\n..\r\n...\r\nLine B after.\r\n.\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"7d66417b","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:33552"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"7d66417b"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"7d66417b"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"7d66417b"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"7d66417b"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"7d66417b"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"7d66417b"}
+[debug] smtp_downstream: connected	{"msg_id":"7d66417b","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"7d66417b"}
+smtp: RCPT ok	{"msg_id":"7d66417b","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E4-dotstuff
+X-Probe: boundary-test
+
+Line A before.
+..
+...
+Line B after.
+.
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"7d66417b"}
+smtp: accepted	{"msg_id":"7d66417b"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: QUIT
+
+
+-------- delivered messages (new caught_* files) --------
+delivered [caught_005.raw, 303 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 7d66417b; Wed, 08 Jul\r\n 2026 06:14:54 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E4-dotstuff\r\nX-Probe: boundary-test\r\n\r\nLine A before.\r\n.\r\n..\r\nLine B after.\r\n'
+  [.wire, 305 bytes]: b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id 7d66417b; Wed, 08 Jul\r\n 2026 06:14:54 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E4-dotstuff\r\nX-Probe: boundary-test\r\n\r\nLine A before.\r\n..\r\n...\r\nLine B after.\r\n'
+```
+
+### B.E5 — split/mid-line dot framing (complete; accepted + delivered)
+
+```text
+==================== EXPERIMENT E5 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [52 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n250-8BITMIME\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [39 bytes] --- b'250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [19 bytes] --- b'250 SIZE 33554432\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [153 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E5-missing-crlf\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nGLUED_NO_NEWLINE_BEFORE.\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [5 bytes] --- b'\r\n.\r\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+RCPT TO:<rcpt@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: incoming message	{"msg_id":"e1251d50","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:33560"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"e1251d50"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"e1251d50"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"e1251d50"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"e1251d50"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"e1251d50"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"e1251d50"}
+[debug] smtp_downstream: connected	{"msg_id":"e1251d50","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"e1251d50"}
+smtp: RCPT ok	{"msg_id":"e1251d50","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E5-missing-crlf
+X-Probe: boundary-test
+
+Line one of the body.
+GLUED_NO_NEWLINE_BEFORE.
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+smtp: 
+.
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"e1251d50"}
+smtp: accepted	{"msg_id":"e1251d50"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: QUIT
+
+smtp: 221 2.0.0 Goodnight and good luck
+
+
+-------- delivered messages (new caught_* files) --------
+delivered [caught_006.raw, 320 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id e1251d50; Wed, 08 Jul\r\n 2026 06:14:55 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E5-missing-crlf\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nGLUED_NO_NEWLINE_BEFORE.\r\n\r\n'
+```
+
+### B.ECMD — over-long command line, clean read-until-close (complete)
+
+```text
+--- banner ---
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17] --- b'EHLO probe.test\r\n'
+--- S->C [110 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [2526 bytes] --- MAIL FROM with 2500-a localpart (repr head) --- b'MAIL FROM:<aaaaaaaaaaaaaaaaaaaaaaaaaaaaa'...b'aaaaa@probe.local>\r\n'
+--- S->C [45 bytes] --- b'500 5.4.0 Too long line, closing connection\r\n'
+>>> server closed connection (recv returned empty)
+```
+
+### B.E9.passthrough / E2 (complete)
+
+```text
+==================== EXPERIMENT E2 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [72 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [145 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E2-bareLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\n.\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: RCPT TO:<rcpt@probe.local>
+
+smtp: incoming message	{"msg_id":"b74a01f8","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:50366"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"b74a01f8"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"b74a01f8"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"b74a01f8"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"b74a01f8"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"b74a01f8"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"b74a01f8"}
+[debug] smtp_downstream: connected	{"msg_id":"b74a01f8","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"b74a01f8"}
+smtp: RCPT ok	{"msg_id":"b74a01f8","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+smtp: From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E2-bareLF
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"b74a01f8"}
+smtp: accepted	{"msg_id":"b74a01f8"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: QUIT
+
+smtp: 221 2.0.0 Goodnight and good luck
+
+
+-------- delivered messages (new caught_* files) --------
+delivered [caught_019.raw, 309 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id b74a01f8; Wed, 08 Jul\r\n 2026 06:20:51 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E2-bareLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+```
+
+### B.E9.passthrough / E7 (complete)
+
+```text
+==================== EXPERIMENT E7 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [22 bytes] --- b'250-Hello probe.test\r\n'
+--- C->S [409 bytes] --- b'MAIL FROM:<attacker@probe.local>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-OUTER-legit\r\nX-Probe: boundary-test\r\n\r\nOuter legit body line.\n.\nMAIL FROM:<spoofed@evil.example>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-SMUGGLED-injected\r\nX-Probe: boundary-test\r\n\r\nSmuggled spoofed body line.\r\n.\r\n'
+--- S->C [69 bytes] --- b'250-PIPELINING\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [19 bytes] --- b'250 SIZE 33554432\r\n'
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<attacker@probe.local>
+RCPT TO:<victim@probe.local>
+DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E7-OUTER-legit
+X-Probe: boundary-test
+
+Outer legit body line.
+.
+MAIL FROM:<spoofed@evil.example>
+RCPT TO:<victim@probe.local>
+DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E7-SMUGGLED-injected
+X-Probe: boundary-test
+
+Smuggled spoofed body line.
+.
+
+smtp: 250 2.0.0 Roger, accepting mail from <attacker@probe.local>
+
+smtp: incoming message	{"msg_id":"cded9993","sender":"attacker@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:50382"}
+[debug] smtp/pipeline: sender attacker@probe.local matched by default rule	{"msg_id":"cded9993"}
+[debug] smtp/pipeline: global rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"cded9993"}
+[debug] smtp/pipeline: per-source rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"cded9993"}
+[debug] smtp/pipeline: recipient victim@probe.local matched by default rule (clean = victim@probe.local)	{"msg_id":"cded9993"}
+[debug] smtp/pipeline: per-rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"cded9993"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"cded9993"}
+[debug] smtp_downstream: connected	{"msg_id":"cded9993","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(attacker@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"cded9993"}
+smtp: RCPT ok	{"msg_id":"cded9993","rcpt":"victim@probe.local"}
+smtp: 250 2.0.0 I'll make sure <victim@probe.local> gets this
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"cded9993"}
+smtp: accepted	{"msg_id":"cded9993"}
+[debug] smtp: reset	
+smtp: incoming message	{"msg_id":"35aa3a07","sender":"spoofed@evil.example","src_host":"probe.test","src_ip":"127.0.0.1:50382"}
+[debug] smtp/pipeline: sender spoofed@evil.example matched by default rule	{"msg_id":"35aa3a07"}
+[debug] smtp/pipeline: global rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"35aa3a07"}
+[debug] smtp/pipeline: per-source rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"35aa3a07"}
+[debug] smtp/pipeline: recipient victim@probe.local matched by default rule (clean = victim@probe.local)	{"msg_id":"35aa3a07"}
+[debug] smtp/pipeline: per-rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"35aa3a07"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"35aa3a07"}
+[debug] smtp_downstream: connected	{"msg_id":"35aa3a07","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(spoofed@evil.example) ok, target = smtp_downstream:catch	{"msg_id":"35aa3a07"}
+smtp: RCPT ok	{"msg_id":"35aa3a07","rcpt":"victim@probe.local"}
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"35aa3a07"}
+smtp: accepted	{"msg_id":"35aa3a07"}
+[debug] smtp: reset	
+smtp: QUIT
+
+
+-------- delivered messages (new caught_* files) --------
+delivered [caught_020.raw, 294 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <attacker@probe.local>) with ESMTP id cded9993; Wed, 08\r\n Jul 2026 06:20:52 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-OUTER-legit\r\nX-Probe: boundary-test\r\n\r\nOuter legit body line.\r\n'
+delivered [caught_021.raw, 305 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <spoofed@evil.example>) with ESMTP id 35aa3a07; Wed, 08\r\n Jul 2026 06:20:52 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-SMUGGLED-injected\r\nX-Probe: boundary-test\r\n\r\nSmuggled spoofed body line.\r\n'
+```
+
+### B.E9.normalize / E2 (complete)
+
+```text
+==================== EXPERIMENT E2 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [32 bytes] --- b'MAIL FROM:<sender@probe.local>\r\n'
+--- S->C [72 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [28 bytes] --- b'RCPT TO:<rcpt@probe.local>\r\n'
+--- S->C [59 bytes] --- b'250 2.0.0 Roger, accepting mail from <sender@probe.local>\r\n'
+--- C->S [6 bytes] --- b'DATA\r\n'
+--- S->C [55 bytes] --- b"250 2.0.0 I'll make sure <rcpt@probe.local> gets this\r\n"
+--- C->S [145 bytes] --- b'From: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E2-bareLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\n.\n'
+--- S->C [58 bytes] --- b'354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [22 bytes] --- b'250 2.0.0 OK: queued\r\n'
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<sender@probe.local>
+
+smtp: 250 2.0.0 Roger, accepting mail from <sender@probe.local>
+
+smtp: RCPT TO:<rcpt@probe.local>
+
+smtp: incoming message	{"msg_id":"e0289c2e","sender":"sender@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:48972"}
+[debug] smtp/pipeline: sender sender@probe.local matched by default rule	{"msg_id":"e0289c2e"}
+[debug] smtp/pipeline: global rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"e0289c2e"}
+[debug] smtp/pipeline: per-source rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"e0289c2e"}
+[debug] smtp/pipeline: recipient rcpt@probe.local matched by default rule (clean = rcpt@probe.local)	{"msg_id":"e0289c2e"}
+[debug] smtp/pipeline: per-rcpt modifiers: rcpt@probe.local => rcpt@probe.local	{"msg_id":"e0289c2e"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"e0289c2e"}
+[debug] smtp_downstream: connected	{"msg_id":"e0289c2e","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(sender@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"e0289c2e"}
+smtp: RCPT ok	{"msg_id":"e0289c2e","rcpt":"rcpt@probe.local"}
+smtp: 250 2.0.0 I'll make sure <rcpt@probe.local> gets this
+
+smtp: DATA
+
+smtp: 354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>
+
+smtp: From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E2-bareLF
+X-Probe: boundary-test
+
+Line one of the body.
+Line two of the body.
+.
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"e0289c2e"}
+smtp: accepted	{"msg_id":"e0289c2e"}
+smtp: 250 2.0.0 OK: queued
+
+[debug] smtp: reset	
+smtp: QUIT
+
+smtp: 221 2.0.0 Goodnight and good luck
+
+
+-------- delivered messages (new caught_* files) --------
+delivered [caught_022.raw, 309 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <sender@probe.local>) with ESMTP id e0289c2e; Wed, 08 Jul\r\n 2026 06:21:06 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E2-bareLF\r\nX-Probe: boundary-test\r\n\r\nLine one of the body.\r\nLine two of the body.\r\n'
+```
+
+### B.E9.normalize / E7 (complete; spoof still delivered — 2 messages)
+
+```text
+==================== EXPERIMENT E7 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [38 bytes] --- b'250-Hello probe.test\r\n250-PIPELINING\r\n'
+--- C->S [409 bytes] --- b'MAIL FROM:<attacker@probe.local>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-OUTER-legit\r\nX-Probe: boundary-test\r\n\r\nOuter legit body line.\n.\nMAIL FROM:<spoofed@evil.example>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-SMUGGLED-injected\r\nX-Probe: boundary-test\r\n\r\nSmuggled spoofed body line.\r\n.\r\n'
+--- S->C [72 bytes] --- b'250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n250 SIZE 33554432\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [61 bytes] --- b'250 2.0.0 Roger, accepting mail from <attacker@probe.local>\r\n'
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+smtp: MAIL FROM:<attacker@probe.local>
+RCPT TO:<victim@probe.local>
+DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E7-OUTER-legit
+X-Probe: boundary-test
+
+Outer legit body line.
+.
+MAIL FROM:<spoofed@evil.example>
+RCPT TO:<victim@probe.local>
+DATA
+From: <sender@probe.local>
+To: <rcpt@probe.local>
+Subject: E7-SMUGGLED-injected
+X-Probe: boundary-test
+
+Smuggled spoofed body line.
+.
+
+smtp: 250 2.0.0 Roger, accepting mail from <attacker@probe.local>
+
+smtp: incoming message	{"msg_id":"c644728f","sender":"attacker@probe.local","src_host":"probe.test","src_ip":"127.0.0.1:48976"}
+[debug] smtp/pipeline: sender attacker@probe.local matched by default rule	{"msg_id":"c644728f"}
+[debug] smtp/pipeline: global rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"c644728f"}
+[debug] smtp/pipeline: per-source rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"c644728f"}
+[debug] smtp/pipeline: recipient victim@probe.local matched by default rule (clean = victim@probe.local)	{"msg_id":"c644728f"}
+[debug] smtp/pipeline: per-rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"c644728f"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"c644728f"}
+[debug] smtp_downstream: connected	{"msg_id":"c644728f","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(attacker@probe.local) ok, target = smtp_downstream:catch	{"msg_id":"c644728f"}
+smtp: RCPT ok	{"msg_id":"c644728f","rcpt":"victim@probe.local"}
+smtp: 250 2.0.0 I'll make sure <victim@probe.local> gets this
+
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"c644728f"}
+smtp: accepted	{"msg_id":"c644728f"}
+[debug] smtp: reset	
+smtp: incoming message	{"msg_id":"cff64f61","sender":"spoofed@evil.example","src_host":"probe.test","src_ip":"127.0.0.1:48976"}
+[debug] smtp/pipeline: sender spoofed@evil.example matched by default rule	{"msg_id":"cff64f61"}
+[debug] smtp/pipeline: global rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"cff64f61"}
+[debug] smtp/pipeline: per-source rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"cff64f61"}
+[debug] smtp/pipeline: recipient victim@probe.local matched by default rule (clean = victim@probe.local)	{"msg_id":"cff64f61"}
+[debug] smtp/pipeline: per-rcpt modifiers: victim@probe.local => victim@probe.local	{"msg_id":"cff64f61"}
+[debug] smtp_downstream: connected	{"downstream_server":"127.0.0.1","msg_id":"cff64f61"}
+[debug] smtp_downstream: connected	{"msg_id":"cff64f61","remote_server":"127.0.0.1"}
+[debug] smtp/pipeline: tgt.Start(spoofed@evil.example) ok, target = smtp_downstream:catch	{"msg_id":"cff64f61"}
+smtp: RCPT ok	{"msg_id":"cff64f61","rcpt":"victim@probe.local"}
+[debug] smtp/pipeline: delivery.Body ok, Delivery object = *msgpipeline.delivery	{"msg_id":"cff64f61"}
+smtp: accepted	{"msg_id":"cff64f61"}
+[debug] smtp: reset	
+smtp: QUIT
+
+
+-------- delivered messages (new caught_* files) --------
+delivered [caught_023.raw, 294 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <attacker@probe.local>) with ESMTP id c644728f; Wed, 08\r\n Jul 2026 06:21:07 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-OUTER-legit\r\nX-Probe: boundary-test\r\n\r\nOuter legit body line.\r\n'
+delivered [caught_024.raw, 305 bytes]:
+b'Received: from probe.test (localhost [127.0.0.1]) by probe.local\r\n (envelope-sender <spoofed@evil.example>) with ESMTP id cff64f61; Wed, 08\r\n Jul 2026 06:21:07 +0000\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-SMUGGLED-injected\r\nX-Probe: boundary-test\r\n\r\nSmuggled spoofed body line.\r\n'
+```
+
+### B.E9.reject / E7 (complete; `421`, 0 delivered)
+
+```text
+==================== EXPERIMENT E7 (conversation) ====================
+--- S->C [37 bytes] --- b'220 probe.local ESMTP Service Ready\r\n'
+--- C->S [17 bytes] --- b'EHLO probe.test\r\n'
+--- S->C [22 bytes] --- b'250-Hello probe.test\r\n'
+--- C->S [409 bytes] --- b'MAIL FROM:<attacker@probe.local>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-OUTER-legit\r\nX-Probe: boundary-test\r\n\r\nOuter legit body line.\n.\nMAIL FROM:<spoofed@evil.example>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-SMUGGLED-injected\r\nX-Probe: boundary-test\r\n\r\nSmuggled spoofed body line.\r\n.\r\n'
+--- S->C [16 bytes] --- b'250-PIPELINING\r\n'
+--- C->S [6 bytes] --- b'QUIT\r\n'
+--- S->C [128 bytes] --- b'421 4.7.0 bare <LF> in stream rejected by proxy (anti-smuggling), closing\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250-SMTPUTF8\r\n'
+
+-------- maddy.log delta (io_debug raw-wire + ordered-JSON) --------
+smtp: 220 probe.local ESMTP Service Ready
+
+smtp: EHLO probe.test
+
+smtp: 250-Hello probe.test
+
+smtp: 250-PIPELINING
+
+smtp: 250-8BITMIME
+
+smtp: 250-ENHANCEDSTATUSCODES
+
+smtp: 250-SMTPUTF8
+
+smtp: 250 SIZE 33554432
+
+
+-------- delivered messages (new caught_* files) --------
 delivered messages captured: 0
 ```
 
-## B.E7 — pipelined smuggling (HEADLINE)
+## Downstream coverage checklist
 
-```
---- SENT (C->S) [409 bytes, ONE sendall] ---
-b'MAIL FROM:<attacker@probe.local>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-OUTER-legit\r\nX-Probe: boundary-test\r\n\r\nOuter legit body line.\n.\nMAIL FROM:<spoofed@evil.example>\r\nRCPT TO:<victim@probe.local>\r\nDATA\r\nFrom: <sender@probe.local>\r\nTo: <rcpt@probe.local>\r\nSubject: E7-SMUGGLED-injected\r\nX-Probe: boundary-test\r\n\r\nSmuggled spoofed body line.\r\n.\r\n'
---- RECV (S->C) [396 bytes] ---
-b"250 2.0.0 Roger, accepting mail from <attacker@probe.local>\r\n250 2.0.0 I'll make sure <victim@probe.local> gets this\r\n354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n250 2.0.0 OK: queued\r\n250 2.0.0 Roger, accepting mail from <spoofed@evil.example>\r\n250 2.0.0 I'll make sure <victim@probe.local> gets this\r\n354 2.0.0 Go ahead. End your data with <CR><LF>.<CR><LF>\r\n250 2.0.0 OK: queued\r\n"
-maddy.log: TWO transactions, same src_ip 127.0.0.1:50694:
-smtp: incoming message {"msg_id":"b1a42ffc","sender":"attacker@probe.local", ... "src_ip":"127.0.0.1:50694"}
-smtp: accepted {"msg_id":"b1a42ffc"}
-smtp: incoming message {"msg_id":"b1b94d91","sender":"spoofed@evil.example", ... "src_ip":"127.0.0.1:50694"}
-smtp: accepted {"msg_id":"b1b94d91"}
-delivered [caught_008.raw, 294 bytes] envelope-sender <attacker@probe.local>, Subject E7-OUTER-legit
-delivered [caught_009.raw, 305 bytes] envelope-sender <spoofed@evil.example>, Subject E7-SMUGGLED-injected
-```
-TWO messages delivered on ONE connection; the second is fully attacker-controlled (spoofed envelope sender). Smuggle REPRODUCED.
-
-## B.E8 — back-to-back stability
-
-```
-E8 RUN 1: 5 back-to-back messages on ONE connection -> 5 '250 OK: queued' acks, 5 newly delivered
-E8 RUN 2: 5 back-to-back messages on ONE connection -> 5 '250 OK: queued' acks, 5 newly delivered
-```
-
-## B.ELINE / B.ECMD — line-length limit (2000)
-
-```
-ELINE (DATA body line 2500 'A's + \r\n.\r\n):
-  RECV after body = b''  (connection dropped)
-  smtp: DATA error	{"msg_id":"24442704","reason":"unexpected EOF"}
-  smtp: 554 5.0.0 Internal server error (msg ID = 24442704)   [reproduced again: msg_id 28ebb210]
-  delivered: 0
-ECMD (MAIL FROM line ~2500 bytes):
-  smtp: 500 5.4.0 Too long line, closing connection
-  delivered: 0
-```
-Same limit, different surface: command line → clean 500 5.4.0; DATA body line → 554 5.0.0 via ErrUnexpectedEOF.
-
-## B.552 — message-size limit
-
-```
-(instance with max_message_size 500b) EHLO advertises: smtp: 250 SIZE 500
-1500-byte body ->
-smtp: DATA error	{"msg_id":"7b52f372","reason":"Maximum message size exceeded"}
-smtp: plain SMTP error returned, this is deprecated
-smtp: 552 5.3.4 Maximum message size exceeded (msg ID = 7b52f372)
-smtp: aborted	{"msg_id":"7b52f372"}
-delivered: 0
-```
-Default limit 32 MiB confirmed via `250 SIZE 33554432` on the primary instance.
-
-## B.E9 — front proxy (Q5), three modes
-
-```
-passthrough: E2 -> 1 delivered ; E7 -> 2 delivered (caught_022 attacker 8573ab48 + caught_023 spoofed 18bab55c)
-normalize  : E2 -> 1 delivered ; E7 -> 2 delivered (caught_025 attacker 45a2a9a3 + caught_026 spoofed 4805cc1f)
-             (bare-LF promoted to CRLF; spoof STILL delivered — naive normalization does not block it)
-reject     : E2 -> 0 delivered ; E7 -> 0 delivered
-             client receives: b'421 4.7.0 bare <LF> in stream rejected by proxy (anti-smuggling), closing\r\n' then RECV b'' (closed)
-```
-
----
-
-# Downstream coverage checklist
-
-Each item below was self-verified against the written content before finishing.
-
-1. Every one of Q1–Q6 is answered BY NAME with a lead direct answer + evidence.
-2. Every user-named framing is exercised: bare LF vs CRLF (E1/E2), dot-stuffing `\r\n..\r\n` and `\r\n...\r\n` (E4), `\n.\n` (E2/E7), missing final CRLF before the dot (E5), plus mixed (E3a/E3b), early close (E6), line-limit (ELINE/ECMD), size-limit (552).
-3. Every evidence block from Appendix B is embedded VERBATIM (no truncation) next to the claim it supports.
-4. All Appendix A scripts + exact build/run commands are included.
-5. Every file:line citation from Section 8 is present and correct.
-6. INFERRED items are labeled; all others are observed with adjacent evidence.
-7. The doc explicitly notes: repo left unchanged (`git status --porcelain` empty before/after); temporary harness removed; observed on maddy commit `26452dd` with pinned `go-smtp` 2019 commit (no fix backport).
-8. The "expected but never seen" (no CHUNKING/BDAT) and "what lingers" (read_timeout hang, `*queue`/`*mtasts-cache`) items are covered.
+- [x] **Q1** — what the server sees at the boundary: dot-reader delegation + drain + command resume (§2, §3/E1).
+- [x] **Q2** — every named framing: bare LF vs CRLF (E1/E2), mixed (E3a/E3b), dot-stuffing `\r\n..\r\n` (E4), missing CRLF before the dot (E5), early close (E6) (§3).
+- [x] **Q3** — pipelined smuggling reproduced: 2 messages delivered from one write (§4/E7).
+- [x] **Q4** — back-to-back stability across ≥2 identical runs: `{5/5,5/5}` (§5/E8).
+- [x] **Q5** — front proxy passthrough/normalize/reject, with the honest finding that normalize does not stop the spoof (§6/E9).
+- [x] **Q6** — the runtime story: hang-to-timeout, 0-delivery aborts, empty state dirs, no CHUNKING/BDAT (§7).
+- [x] Limit paths: over-long line `500` (ELINE/ECMD), over-size `552` (§3).
+- [x] Every claim carries adjacent complete unedited output; inferred items are labeled (§8.2).
+- [x] Read-only: exactly one file added; harness under `/tmp/investig` removed; repository unchanged (§8.4).
