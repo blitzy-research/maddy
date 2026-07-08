@@ -1027,22 +1027,24 @@ Final coverage pass over every question, scenario, and named item. Each box is c
 This is a documentation-only task involving two distinct git references that must not be conflated:
 
 - **Source repository under investigation** (must remain byte-unchanged): `foxcpp/maddy`, **source branch `maddy_26452dd8dd78`**, **source commit `26452dd8dd787dc455278b0fdd296f4a5432c768`** (`target/remote: Rewrite connection part to allow more concurrency`). This is the exact commit whose runtime behavior every section above documents. No file in the maddy source tree was created, modified, or deleted.
-- **Destination repository / review branch** (where the single deliverable is committed): branch **`blitzy-62bbeeda-df48-4e6a-b6a4-dda6742e6660`**. The only persistent output is this documentation file, `blitzy/documentation/maddy_26452dd8dd78.md`, added as a single additive commit **on top of** the source commit `26452dd8…` (the deliverable commit's parent is the investigation target).
+- **Destination repository / review branch** (where the single deliverable file is committed): branch **`blitzy-62bbeeda-df48-4e6a-b6a4-dda6742e6660`**. The only persistent output is this documentation file, `blitzy/documentation/maddy_26452dd8dd78.md`, added in additive documentation commit(s) layered **on top of** the source commit `26452dd8…`. Every deliverable commit is a descendant of the investigation target, so the source commit `26452dd8…` remains an **ancestor** of the branch `HEAD`; no file in the maddy source tree is touched by any of them.
 
-Verified with git (stable, commit-strategy-independent commands):
+Verified with git (stable, commit-count-independent commands):
 
 ```
 $ git rev-parse --abbrev-ref HEAD                          # destination review branch
 blitzy-62bbeeda-df48-4e6a-b6a4-dda6742e6660
 $ git rev-parse 26452dd8dd787dc455278b0fdd296f4a5432c768   # source commit exists, byte-unchanged
 26452dd8dd787dc455278b0fdd296f4a5432c768
+$ git merge-base --is-ancestor 26452dd8dd787dc455278b0fdd296f4a5432c768 HEAD ; echo $?
+0                                                          # source commit IS an ancestor of HEAD
 $ git log --oneline -1 26452dd8dd787dc455278b0fdd296f4a5432c768
 26452dd target/remote: Rewrite connection part to allow more concurrency
 $ git status --porcelain                                   # no source-tree change
             (no output — zero entries)
 ```
 
-`git status --porcelain` returns **zero lines** — no file in the maddy source tree was created, modified, or deleted. The destination `HEAD` is the documentation commit on branch `blitzy-62bbeeda-…`; its parent is the source commit `26452dd8…` on source branch `maddy_26452dd8dd78`. Note that `git rev-parse HEAD` returns the *deliverable* commit hash, **not** `26452dd8…`; the source commit under investigation is HEAD's parent, shown above via its full hash and subject so the two are unambiguous.
+`git status --porcelain` returns **zero lines** — no file in the maddy source tree was created, modified, or deleted. The branch `HEAD` is a documentation commit on branch `blitzy-62bbeeda-…`; the source commit `26452dd8…` (on source branch `maddy_26452dd8dd78`) is an **ancestor** of `HEAD` — reachable through the additive documentation commit(s) that carry this file — as confirmed above by `git merge-base --is-ancestor … HEAD` returning exit status `0`. Note that `git rev-parse HEAD` returns a *deliverable* commit hash, **not** `26452dd8…`; the source commit under investigation is an ancestor of `HEAD` (one or more additive documentation commits back), identified above by its full hash and subject so the two are unambiguous.
 
 ### 11.2 Ephemeral artifacts: removed workdirs vs. preserved evidence set
 
