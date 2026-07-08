@@ -346,7 +346,7 @@ queue: not delivered, permanent error	{"msg_id":"f16eeecf","rcpt":"user@nxdomain
 [debug] queue: removed message from disk	{"msg_id":"f16eeecf"}
 ```
 
-  Both traces prove `remote.Start()` returns OK **without** connecting (`queue: target.Start OK` precedes the failure), and that the resolve/connect work happens lazily in `AddRcpt` — the opposite of `smtp_downstream`. The `[debug] remote: trying … {"mx":"localhost"}` line confirms the connect loop reached a candidate host and `connectionForDomain()` then wrapped the last error as an `SMTPError` with `Code: exterrors.SMTPCode(err, 451, 550)` and message `"No usable MXs, last err: …"` [connect.go:L202-L213] — observed as `smtp_code:550`, `smtp_enchcode:5.4.0`. Because `SMTPCode()` uses `IsTemporary()` (permanent-by-default) [exterrors/smtp.go:L112-L118] and neither `connection refused` nor `no such host` reports `Temporary() == true`, the code resolved to **`550`**; and `SMTPError.Temporary()` is `Code/100 == 4` [exterrors/smtp.go:L95-L97], so a `550` is **permanent** → `IsTemporaryOrUnspec()` returned `false` → **not retried** (the queue directory was emptied). This `550`/`5.4.0` outcome was **stable across the reproduction: 40 of 40 default-config submissions** (20 to `test@localhost`, 20 to `user@nxdomain-zzz-test.invalid`) produced `smtp_code:550` and **zero** produced `554`.
+  Both traces prove `remote.Start()` returns OK **without** connecting (`queue: target.Start OK` precedes the failure), and that the resolve/connect work happens lazily in `AddRcpt` — the opposite of `smtp_downstream`. The `[debug] remote: trying … {"mx":"localhost"}` line confirms the connect loop reached a candidate host and `connectionForDomain()` then wrapped the last error as an `SMTPError` with `Code: exterrors.SMTPCode(err, 451, 550)` and message `"No usable MXs, last err: …"` [connect.go:L202-L213] — observed as `smtp_code:550`, `smtp_enchcode:5.4.0`. Because `SMTPCode()` uses `IsTemporary()` (permanent-by-default) [exterrors/smtp.go:L112-L117] and neither `connection refused` nor `no such host` reports `Temporary() == true`, the code resolved to **`550`**; and `SMTPError.Temporary()` is `Code/100 == 4` [exterrors/smtp.go:L95-L97], so a `550` is **permanent** → `IsTemporaryOrUnspec()` returned `false` → **not retried** (the queue directory was emptied). This `550`/`5.4.0` outcome was **stable across the reproduction: 40 of 40 default-config submissions** (20 to `test@localhost`, 20 to `user@nxdomain-zzz-test.invalid`) produced `smtp_code:550` and **zero** produced `554`.
 
 #### The exact SMTP wrapper is DNS-environment-dependent — `550`/`5.4.0` **or** `554`/`5.4.4` (both observed directly; both permanent)
 
@@ -750,7 +750,7 @@ Every anchor cited above, grouped by file. Line numbers are for branch `maddy_26
 
 **`internal/exterrors/smtp.go`**
 - L95-L97 — `func (se *SMTPError) Temporary() bool { return se.Code/100 == 4 }` (a 4xx SMTP code is temporary; a 5xx is permanent)
-- L112-L118 — `func SMTPCode(err error, temporaryCode, permanentCode int) int` — returns `temporaryCode` iff `IsTemporary(err)`, else `permanentCode`
+- L112-L117 — `func SMTPCode(err error, temporaryCode, permanentCode int) int` — returns `temporaryCode` iff `IsTemporary(err)`, else `permanentCode`
 
 **`maddy.go`**
 - L41 — `Version = "unknown (built from source tree)"`
