@@ -387,7 +387,7 @@ The From domain (`example.org`) *does* match the key domain, so the domain check
 
 Here `RCPT` succeeds (`RCPT ok`) but the `submission_prepare` modifier rejects at `DATA` because the message has no `From` header — the only content-level enforcement submission performs, and it is purely syntactic (`internal/endpoint/smtp/submission.go:40-43`).
 
-**RFC 6409 §8.1–§8.2 observed:** for every accepted message the server logged `submission: adding missing Message-ID` and `submission: adding missing Date header` (lines 39-40, 53-54, 75-76, 89-90, 103), confirming maddy adds Date/Message-ID at submission time.
+**RFC 6409 §8.1–§8.2 observed:** for each of the four accepted messages the server logged a `submission: adding missing Message-ID` + `submission: adding missing Date header` pair (lines 39-40, 53-54, 75-76, 89-90), confirming maddy adds both Date and Message-ID at submission time. Line 103 also shows `submission: adding missing Message-ID` for Scenario F (`msg_id 7f53b7c0`), but that Message-ID is added *before* the missing-From rejection at `DATA` (line 104, `554 5.6.0`); Scenario F therefore receives no Date line and is never delivered.
 
 
 ---
@@ -733,9 +733,15 @@ Because the body hash reproduces exactly (§7.3) and the positive control passes
 
 ### 8.1 Probe configuration
 
-The probe config is the canonical `maddy.conf.used` with **only** the `sign_dkim` directive converted to block form to add one option. The exact `diff` (canonical → probe):
+The probe config is the canonical `maddy.conf.used` with one **policy-affecting** change — the `sign_dkim` directive converted to block form to add `require_sender_match envelope auth_domain` — together with a policy-neutral change to separate `state`/`runtime` directories (`probe_state`/`probe_runtime`) so the probe run generates its own DKIM keypair and database in isolation from the canonical run. The exact, unedited `diff` (canonical → probe) has both hunks:
 
 ```
+1,2c1,2
+< state /tmp/maddy_work/state
+< runtime /tmp/maddy_work/runtime
+---
+> state /tmp/maddy_work/probe_state
+> runtime /tmp/maddy_work/probe_runtime
 101c101,103
 <             sign_dkim $(primary_domain) default
 ---
@@ -743,6 +749,8 @@ The probe config is the canonical `maddy.conf.used` with **only** the `sign_dkim
 >                 require_sender_match envelope auth_domain
 >             }
 ```
+
+The `1,2c1,2` hunk is run-isolation only and has no bearing on sender/DKIM policy; the `101c101,103` hunk is the sole policy-affecting change under investigation.
 
 i.e., the probe's signer block is:
 
@@ -826,6 +834,14 @@ The selected tokens are turned into a set at `dkim.go:166-169`:
 4. With the authenticated-identity check skipped, only the `envelope` check and the domain check remain — and in the probe both pass. In the probe, both `MAIL FROM` and `From:` are `user2@example.org`, so the `envelope` check passes; the domain check also passes because `user2@example.org` is in `example.org`. With every remaining guard satisfied, the message is signed — **as the spoofed `user2@example.org`.**
 
 **Net effect:** a directive named `auth_domain`, which a reasonable operator would read as *"require the From to match the authenticated domain"* (a tightening), instead **disables** the authenticated-identity check entirely, because the code keys off the literal string `"auth"` that the operator cannot select. This is the case where maddy's runtime security behavior diverges from a reasonable reading of the configuration.
+
+> **Completeness note — the other `shouldSign` branches (outside the enforcement question).** The domain / envelope / auth guards above are the sender-alignment checks that produce the four `shouldSign` outcomes exercised in §4.2. For completeness — so this enumeration is not mistaken for the whole function — `shouldSign()` (`internal/modify/dkim/dkim.go:249-330`) contains three further branches that are *not* sender-alignment guards and fall outside the six questions and four scenarios:
+>
+> - **`off` short-circuit (`dkim.go:250-262`).** When the selectable `off` token is chosen, the function returns before any From/envelope/auth check and signs **unconditionally**, using the key-domain identifier (`return "@" + aDomain, true` at `:259` for a non-EAI message, `return "@" + m.domain, true` at `:261` for an EAI message). So the `off` token listed at `:151` *disables every* alignment guard rather than tuning one; the only non-signing path inside this branch is a failure to convert the key domain to A-labels (`:253-256`).
+> - **From-syntax guards (`dkim.go:264-285`).** The message is delivered **unsigned** (`return "", false`) when the `From` header is empty (`:265-268`), malformed (`:269-273`), carries multiple addresses without `allow_multiple_from` (`:274-277`), or holds an unparseable address (`:279-285`). These are syntactic checks, not identity checks.
+> - **EAI / A-label identifier construction (`dkim.go:314-329`).** For a non-EAI message the From domain is converted to A-labels to build the signing identifier emitted as `i=`.
+>
+> None of these branches change any canonical-config conclusion in this document; they are recorded so that "three guard branches / four outcomes" is understood as the sender-alignment subset of `shouldSign()`, not the entire function.
 
 
 ---
