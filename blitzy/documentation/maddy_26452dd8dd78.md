@@ -142,20 +142,20 @@ The three `X: listening on …` lines appear in **config order** — `smtp` (por
 
 - The **factory registry** lives in `[internal/module/registry.go]`: two maps `modules` (`[registry.go:L8]`) and `endpoints` (`[registry.go:L9]`) guarded by a `sync.RWMutex` (`[registry.go:L10]`). `Register` (`[registry.go:L19]`) and `RegisterEndpoint` (`[registry.go:L56]`) insert into them and **panic on a duplicate name** (`[registry.go:L24]`, `[registry.go:L61]`). These run from package `init()`s pulled in by the side-effect imports (`[maddy.go:L20-L37]`) — i.e., before `main`.
 - The **instance registry** lives in `[internal/module/instances.go]`: the `instances` map of `{mod, cfg}` (`[instances.go:L10-L13]`), an `aliases` map (`[instances.go:L14]`), and a separate `Initialized` map (`[instances.go:L16]`). `RegisterInstance` (`[instances.go:L23]`) files a constructed object; crucially it does **not** call `Init`.
-- In Loop 1, `instancesFromConfig` constructs each regular block with `factory(...)` (`[maddy.go:L332]`) and immediately `RegisterInstance`s it (`[maddy.go:L338]`) — but the `Init` calls only happen in Phase 3. The reason `Init` is deliberately kept out of the constructor is documented on the `Module` interface itself (`[internal/module/module.go:L32-L35]`), preserving the source's exact wording (including its typo):
+- In Loop 1, `instancesFromConfig` first guards the instance registry against a duplicate name — `module.HasInstance(instName)` (`[maddy.go:L328]`) aborts startup with `config block named %s already exists` (`[maddy.go:L329]`) if that name (or alias, `[maddy.go:L340-L341]`) is already taken — then constructs each regular block with `factory(...)` (`[maddy.go:L332]`) and immediately `RegisterInstance`s it (`[maddy.go:L338]`) — but the `Init` calls only happen in Phase 3. (This duplicate guard is the earliest startup gate; it is reproduced at runtime in Q6.) The reason `Init` is deliberately kept out of the constructor is documented on the `Module` interface itself (`[internal/module/module.go:L32-L35]`), preserving the source's exact wording (including its typo):
 
   > "It is not done in FuncNewModule so all module instances are registered at time of initialization, thus initialization does not depends on ordering of configuration blocks and modules can reference each other without any problems."
 
   (The typo "does not **depends**" is present in the source and is preserved here exactly.)
 
-**Observed evidence.** Excerpt from the Q1 command above (`/tmp/maddybin -debug -config /tmp/obs/maddy.conf`). In the Q1 log, the line `sql: go-imap-sql version 0.4.0` is printed by the `sql` module *inside its `Init`*. It does **not** appear at construction time; it appears immediately **after** the first reference to that block:
+**Observed evidence.** Excerpt from the Q1 command above (`/tmp/maddybin -debug -config /tmp/obs/maddy.conf`). In the Q1 log, the line `sql: go-imap-sql version 0.4.0` is printed by the `sql` module *inside its `Init`*. It does **not** appear at construction time; its `Init` is triggered lazily by the first `deliver_to &local_mailboxes` directive (config line 18). One subtlety of the *visible* log order matters here: in the captured output the banner appears **before** the `reference &local_mailboxes` line — not after it. That is because `ModuleFromNode` prints the `reference` line only *after* `GetInstance` returns (`[modconfig.go:L67-L68]`), while the banner is emitted *inside* the `sql` module's `Init`, which runs *during* that same `GetInstance` call (this log ordering is dissected in Q3). So the reference is the causal *trigger*, but the banner is what is *printed first*:
 
 ```text
 [debug] sql: go-imap-sql version 0.4.0
 [debug] /tmp/obs/maddy.conf:18: reference &local_mailboxes
 ```
 
-The `sql local_mailboxes local_authdb` instance was constructed and registered in Loop 1, but its `Init` (which prints the version banner) fired only when `smtp`'s `deliver_to &local_mailboxes` (config line 18) first referenced it. It printed **once** for the whole run even though the same instance is referenced five more times (lines 23, 26, 40, 50, 51) — because initialization is at-most-once (see Q3). That is the immediate-registration-vs-deferred-initialization split made visible.
+The `sql local_mailboxes local_authdb` instance was constructed and registered in Loop 1, but its `Init` (which prints the version banner) fired only when `smtp`'s `deliver_to &local_mailboxes` (config line 18) first referenced it — so the reference is the *cause*, even though the banner is *printed first* (the `reference` debug line follows, once `GetInstance` returns). It printed **once** for the whole run even though the same instance is referenced five more times (lines 23, 26, 40, 50, 51) — because initialization is at-most-once (see Q3). That is the immediate-registration-vs-deferred-initialization split made visible.
 
 ---
 
@@ -337,6 +337,7 @@ submission: listening on tls://127.0.0.1:5870
 - The final gate is Loop 3 (`[maddy.go:L358-L365]`): it walks every regular block and, for any whose `module.Initialized[...]` flag is still false (`[maddy.go:L359]`), fails startup with `Unused configuration block at %s:%d - %s (%s)` (`[maddy.go:L363-L364]`). Reaching the end of that loop without error means every top-level block was pulled into the graph through some reference — the graph is fully wired.
 - A `&` that names a non-existent block never settles: `GetInstance` returns `unknown config block: %s` (`[internal/module/instances.go:L61]`).
 - A config with no endpoints never settles: `if len(endpoints) == 0` returns `at least one endpoint should be configured` (`[maddy.go:L348-L349]`) before any endpoint `Init`.
+- A **duplicate top-level name** never even reaches instantiation: still inside Loop 1, `module.HasInstance(instName)` (`[maddy.go:L328]`; `HasInstance` defined at `[internal/module/instances.go:L38-L46]`) aborts with `config block named %s already exists` (`[maddy.go:L329]`) *before* the block is constructed or `RegisterInstance`d. The same guard is applied to each declared alias (`[maddy.go:L340-L341]`). This is the **earliest** startup gate — it fires per-block in Loop 1, ahead of the no-endpoints check (which runs after Loop 1), ahead of any endpoint binding (Loop 2), and ahead of the unused-block check (Loop 3).
 - After `instancesFromConfig` returns successfully, `moduleMain` signals readiness to the service manager with `systemdStatus(SDReady, "Listening for incoming connections...")` (`[maddy.go:L272]`).
 
 **Observed evidence.**
@@ -370,6 +371,20 @@ unknown config block: does_not_exist
 ```text
 at least one endpoint should be configured
 ```
+
+*Duplicate instance name (supplementary observed evidence).* This AAP-highlighted error path is the **earliest** startup guard, so it is reproduced here with a small supplementary config (outside the five checkpoint edge configs above, and outside the repo). The config declares the top-level name `local_mailboxes` twice; the second declaration lands on config line 12. Command:
+
+```bash
+/tmp/maddybin -config /tmp/obs/maddy_duplicate.conf
+```
+
+Output (exit code `2`):
+
+```text
+/tmp/obs/maddy_duplicate.conf:12: config block named local_mailboxes already exists
+```
+
+Two details confirm the mechanism described above. First, **no** `listening on` line precedes this error — the duplicate guard fires per-block in Loop 1, before any endpoint reaches its `Init` in Loop 2 (contrast the unused-block case, where all three endpoints bind first). Second, the `FILE:LINE:` prefix is produced by `config.NodeErr` (`[internal/config/config.go:L13-L18]`), which formats the message as `%s:%d: %s` whenever the offending node carries a file — hence `/tmp/obs/maddy_duplicate.conf:12: …`. The same guard also rejects a name reused as an **alias** (`[maddy.go:L340-L341]`); a config whose second block is `sql other_db primary_db` (with `primary_db` already an instance) aborts identically with `config block named primary_db already exists` (exit `2`). The supplementary config is listed in Appendix A.
 
 **Inferred (not observed on plain stderr).** The systemd readiness line `Listening for incoming connections...` (`[maddy.go:L272]`) is emitted through `systemdStatus`, which is only meaningful when the process runs under systemd with the `NOTIFY_SOCKET` environment variable set. In the runs above (plain stderr, no `NOTIFY_SOCKET`) that line was **never printed**, so it is labeled **inferred**. On plain stderr, the settle evidence is therefore the per-endpoint `listening on` lines **plus the absence of the unused-block fatal** — not the systemd status line.
 
@@ -503,6 +518,28 @@ imap tls://127.0.0.1:1930 {
 - `maddy_dangling.conf` = the config above with the IMAP `storage &local_mailboxes` (line 51) replaced by `storage &does_not_exist`.
 - `maddy_noendp.conf` = only the globals and the `sql local_mailboxes local_authdb` block (no endpoints).
 - `maddy_nobounce.conf` = the config above with the `autogenerated_msg_domain` global removed (this shifts `deliver_to &remote_queue` from line 29 to line 28).
+- `maddy_duplicate.conf` (**supplementary**; self-contained, **not** derived from the config above) demonstrates the duplicate-instance guard cited in Q6. It declares the top-level name `local_mailboxes` twice so the second declaration lands on line 12:
+  ```text
+  # SUPPLEMENTARY observation config (OUTSIDE the repo): duplicate instance name.
+  # Two top-level blocks both named "local_mailboxes" -> Loop 1 duplicate guard fires.
+  hostname localhost
+  state /tmp/obs/state
+  runtime /tmp/obs/runtime
+
+  sql local_mailboxes {
+      driver sqlite3
+      dsn /tmp/obs/dup_a.db
+  }
+
+  sql local_mailboxes {
+      driver sqlite3
+      dsn /tmp/obs/dup_b.db
+  }
+
+  smtp tcp://127.0.0.1:2526 {
+      deliver_to &local_mailboxes
+  }
+  ```
 
 **Environment note (canonical vs. assumed).** Some upstream planning notes assume a Go 1.13.4 / gcc 13.3.0 toolchain. The canonical toolchain image used here ships **Go 1.18.10 / cc (Debian) 10.2.1**; per the run-first rule, the actually-observed toolchain is what is reported. The behavior, log strings, and exit codes are governed by the source at commit `26452dd8dd78` and are unaffected by the newer toolchain.
 
@@ -527,6 +564,7 @@ imap tls://127.0.0.1:1930 {
 | `modify.Group` (serial, strict order) | Q5 (`[group.go:L38-L60]`, `[modifier.go:L22-L25]`) |
 | Verbatim main startup log | Q1 |
 | All five edge/error outputs, each with its command **and complete unedited output** | Edge 1 unused block (Q4/Q6); Edge 2 dangling `&` reference (Q4/Q6); Edge 3 no-endpoints (Q6); Edge 4 invocation guard `run` (Appendix A); Edge 5 nobounce (Q3) |
+| Duplicate instance-name guard (`config block named %s already exists`), earliest Loop-1 gate | Q2 (`[maddy.go:L328-L329]`) + Q6 (supplementary run, `[maddy.go:L328-L341]`, `[instances.go:L38-L46]`); config in Appendix A |
 | Settled-graph evidence (`listening on` + no unused-block fatal) | Q6 |
 | systemd readiness line labeled **inferred** | Q6 |
 | Per-message check/modifier ordering labeled **inferred from source** | Q5 |
