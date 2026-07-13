@@ -1055,7 +1055,7 @@ delivered body (unstuffed, 5201 bytes)
 ```text
 $ # (A) WRONG — broadened with --include=*.md; it matches THIS document, so it returns matches (exit 0), NOT exit 1:
 $ grep -rniE --include=*.md 'smuggl' . | wc -l
-34
+61   # self-referential count (every match is inside THIS document); the integer drifts with any edit to this file, so the meaningful signal is the exit code below, not the count
 $ grep -rniE --include=*.md 'smuggl' . ; echo "exit=$?"
 exit=0   # 0 = matched, because blitzy/documentation/maddy_26452dd8dd78.md itself contains 'smuggling'
 $ # (B) CORRECT — scope to the canonical maddy SOURCE + top-level config only:
