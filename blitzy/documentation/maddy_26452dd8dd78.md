@@ -140,15 +140,20 @@ ends with a literal, trailing TAB byte.
 To stay byte-faithful, these trailing TABs are **preserved verbatim** in the verbatim
 output blocks below and are deliberately **not** stripped. This has one visible
 consequence worth calling out explicitly: `git diff --check` treats a trailing TAB as
-trailing whitespace, so it reports each such line and exits non-zero (exit code `2`)
-for this document. That is expected and intentional — every flagged line is a no-field
+trailing whitespace. Run against the baseline commit —
+`git diff --check 26452dd8dd787dc455278b0fdd296f4a5432c768 HEAD` — it reports each such
+line and exits non-zero (exit code `2`) for this document. (The bare `git diff --check`
+compares the worktree against the index, so once this document is committed it exits
+`0`; reproducing the exit-`2` whitespace report requires the baseline-relative form
+above, or an unstaged edit that reintroduces the trailing TABs.) That is expected and
+intentional — every flagged line is a no-field
 record inside a fenced `text` code block (specifically the `smtp: listening on …` lines
 of the SMTP transcripts and the field-less `queue:` debug records — `delivery target`,
 `starting delivery for …`, `waiting on delivery semaphore for …`, and
 `delivery semaphore acquired for …`), and there is **no** trailing whitespace anywhere
 outside the verbatim runtime-output blocks. In other words, the non-zero
-`git diff --check` is a direct artifact of honoring the exact-output rule, not a
-formatting defect.
+`git diff --check 26452dd8dd787dc455278b0fdd296f4a5432c768 HEAD` result is a direct
+artifact of honoring the exact-output rule, not a formatting defect.
 
 ---
 
@@ -990,7 +995,7 @@ $ git status --porcelain
 
 $ git diff --name-status 26452dd8dd787dc455278b0fdd296f4a5432c768 -- .
 A	blitzy/documentation/maddy_26452dd8dd78.md
-(no output = no tracked file differs from baseline in worktree)
+(only the added doc above; no M/D entry = no other tracked file differs from baseline in the worktree)
 
 $ git diff --name-status 26452dd8dd787dc455278b0fdd296f4a5432c768 HEAD
 A	blitzy/documentation/maddy_26452dd8dd78.md
@@ -1017,8 +1022,10 @@ Two complementary facts are shown:
   untracked or temporary file remains in the repository tree (temporary observation
   scripts were kept outside the repository, under `/tmp`, and removed afterward).
 
-One intentional exception: `git diff --check` exits non-zero (status 2) because the
-no-field log records preserve the logger's terminal literal TAB, as explained in
-§1.4. This is deliberate exact-output fidelity, not a stray-whitespace defect, and
-it flags only lines inside this document's fenced transcripts — never any source
-file.
+One intentional exception: `git diff --check 26452dd8dd787dc455278b0fdd296f4a5432c768 HEAD`
+(the baseline-relative form) exits non-zero (status 2) because the no-field log records
+preserve the logger's terminal literal TAB, as explained in §1.4. (The bare
+`git diff --check` exits `0` here, since this document is committed and that form
+inspects only unstaged worktree changes.) This is deliberate exact-output fidelity, not
+a stray-whitespace defect, and it flags only lines inside this document's fenced
+transcripts — never any source file.
