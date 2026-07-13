@@ -45,7 +45,7 @@ inside the actual host (a Kubernetes pod), reproducing the image's toolchain
 (Go 1.13.15, gcc, CGO). **This is a disclosed deviation**: the runtime is a
 native replica of the requested image, not the image itself. It does not affect
 the SMTP code paths under test (identical maddy binary, identical go‑smtp and
-stdlib versions, confirmed in §1.10), but it is labelled here as **non‑canonical
+stdlib versions, confirmed in §1.9), but it is labelled here as **non‑canonical
 environment provenance** in the interest of full transparency.
 
 **Evidence — requested image, access failure, and actual host** (`captures/env_provenance.txt`):
