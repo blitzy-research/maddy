@@ -187,10 +187,16 @@ prefix on every record below.
 (driver: `TestSMTPDelivery`, `internal/endpoint/smtp/smtp_test.go` L122)
 
 The complete, unedited output of all four runs is reproduced below (each run's
-command echo, records, `PASS`, and package-result line are shown). The `msg_id`
-differs each run because it is random (see Q1e); every other token is identical.
-These four runs are the sole evidence source for the `msg_id` stability table in
-§2.5 (Q1e).
+command echo, records, `PASS`, and package-result line are shown). Three classes
+of token vary run-to-run and are therefore **not** part of the stable log
+content: the random `msg_id` (see Q1e); the **ephemeral TCP ports** the test's
+in-process listener and client bind to — the `listening on tcp://127.0.0.1:<port>`
+port (`16289`, `34986`, `33839`, `42631` in the four runs below) and the `src_ip`
+port (`51462`, `36376`, `45196`, `60644`); and the trailing `go test`
+package-result time (`0.005s`/`0.006s` here). Once those documented ephemeral
+values are normalized, every maddy **log field** — message text, JSON keys, and
+their values — is identical across the four runs. These four runs are the sole
+evidence source for the `msg_id` stability table in §2.5 (Q1e).
 
 ```text
 $ go test -mod=readonly -v -count=1 -run '^TestSMTPDelivery$' ./internal/endpoint/smtp/
@@ -389,10 +395,17 @@ avoid conflating it with the canonical random endpoint `msg_id` of Q1e.
 
 The complete, unedited output of all eight runs is reproduced below (each run's
 command echo, records, `PASS`, and package-result line are shown). The SHA-1
-`msg_id` is identical every run (see §3.1); the only token that varies is
-`next_try_delay`, a near-zero negative test-configuration artifact (explained in
-the Q4b caveat, §3.4). These eight runs are the sole evidence source for the
-`next_try_delay` distribution table in §3.4 (Q4b).
+`msg_id` is identical every run (see §3.1). Two things vary within maddy's own
+`queue:` log fields: `next_try_delay`, a near-zero negative test-configuration
+artifact (explained in the Q4b caveat, §3.4); and the **relative order of the two
+`delivery attempt failed` records**, which is nondeterministic because the queue
+ranges over a Go map to emit them (`internal/target/queue/queue.go` L383 — see the
+Q2a map-order caveat, §3.4). All eight runs shown below happen to print `tester1`
+before `tester2`, but that order is not guaranteed. Separately, the `go test`
+per-test and package-result elapsed times (`0.01s` to `0.05s` and `0.012s` to
+`0.054s` here) are run-to-run variable and are not part of the log content. These
+eight runs are the sole evidence source for the `next_try_delay` distribution
+table in §3.4 (Q4b).
 
 ```text
 $ go test -mod=readonly -v -count=1 -run '^TestQueueDelivery_TemporaryFail$' ./internal/target/queue/
@@ -650,6 +663,33 @@ from `internal/target/queue/queue.go`):
 20. `queue: delivered` — once per recipient, with `"attempt":2`; `dl.Msg("delivered", "rcpt", rcpt, "attempt", meta.TriesCount+1)` (L378)
 21. `[debug] queue: removed message from disk` — `dl.Debugf("removed message from disk")` (L619)
 
+**Recipient-order caveat (reported exactly as observed).** The *phase* ordering
+above is stable, but one detail within step 14 is **nondeterministic**: the
+**relative order of the two `queue: delivery attempt failed` records** varies from
+run to run. The queue emits them by ranging over the `partialErr.Errs` **map**
+(`internal/target/queue/queue.go` L383; the field is declared
+`Errs map[string]error` at L80), and Go randomizes map-iteration order. Everything
+else stays in a fixed order: the `will retry` record's `rcpts` array and the two
+`queue: delivered` records are built from the `TemporaryFailed`/`meta.To` **slice**,
+appended in recipient-acceptance order by `expandToPartialErr`
+(`internal/target/queue/queue.go` L484-L493) and assigned at L387, so they always
+read `tester1@example.org` then `tester2@example.org`.
+
+Re-running the non-debug command (§3.2) 50 consecutive times captured **both**
+orders — `tester1`-first in 45 runs and `tester2`-first in 5 (~90/10); the eight
+runs quoted in §3.2 all happen to be `tester1`-first. One captured `tester2`-first
+run is reproduced verbatim below: the two failure records are reversed, while the
+`rcpts` array and the `delivered` records remain in their stable slice order,
+confirming that only the map-ranged failure lines reorder:
+
+```text
+    output.go:41: queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org","reason":"you shall not pass"}
+    output.go:41: queue: delivery attempt failed	{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org","reason":"you shall not pass"}
+    output.go:41: queue: will retry	{"attempts_count":1,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","next_try_delay":"-559ns","rcpts":["tester1@example.org","tester2@example.org"]}
+    output.go:41: queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester1@example.org"}
+    output.go:41: queue: delivered	{"attempt":2,"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1","rcpt":"tester2@example.org"}
+```
+
 A behavioral detail, reported exactly as observed: in attempt #1 both a
 `delivery.Body failed: you shall not pass` **and** a `delivery.Body OK` debug line
 appear. This is **not** two body calls. The queue invokes `delivery.Body` exactly
@@ -671,8 +711,10 @@ before `delivery.Commit OK`.
 **Q2b — the exact attempt / failure / retry lines.** The three lines below are
 quoted verbatim from the single `[debug]` run in §3.3 (so the `delivery attempt #1`
 debug line and the retry line share one run's `next_try_delay` value, `-609ns`);
-the eight non-debug runs in §3.2 emit the identical `delivery attempt failed` and
-`will retry` records, differing only in the tabulated `next_try_delay` value below.
+the eight non-debug runs in §3.2 emit the same `delivery attempt failed` and
+`will retry` records, differing only in the tabulated `next_try_delay` value below
+and — for the two `delivery attempt failed` lines — in their run-to-run relative
+order (the Q2a map-order caveat).
 
 - **Delivery attempt** (debug-level), from `dl.Debugf("delivery attempt #%d", meta.TriesCount+1)` (`internal/target/queue/queue.go` L367):
   `[debug] queue: delivery attempt #1\t{"msg_id":"af8090c7eb39f761862b1f027b4f2b0bb1ce86d1"}`
@@ -743,9 +785,13 @@ L83, `Log: log.Logger{Name: "remote"}`).
 
 The complete, unedited output of **both consecutive runs** is reproduced below
 (each run's command echo, records, `PASS`, and package-result line are shown). The
-two runs are **byte-identical** — the MX-authenticity failure is fully
-deterministic — which is the evidence for the stability statement at the end of
-this subsection.
+MX-authenticity **error and reply artifact** — the `-- ... delivery.AddRcpt`
+line with its `map[…]` field dump — is fully deterministic and **byte-identical**
+across runs (no random `msg_id`, and no map-ordered records on this path); the
+only run-to-run variation is the trailing `go test` package-result time (`0.005s`
+in both runs below, which over 40 repeated runs was observed as `0.005s` in 34,
+`0.006s` in 3, `0.007s` in 2, and `0.016s` once). This is the evidence for the
+stability statement at the end of this subsection.
 
 ```text
 $ go test -mod=readonly -v -count=1 -run '^TestRemoteDelivery_AuthMX_Fail$' ./internal/target/remote/
@@ -846,9 +892,14 @@ Why `5.4.0` and not the inner `5.7.0`, and how X.Y.Z is formed:
   `SMTPError.Temporary()` maps 4xx codes to retryable via `se.Code/100 == 4`
   (`internal/exterrors/smtp.go` L95-L96); here the code is 550, i.e. permanent.
 
-This result is **stable across the two runs shown above**, whose output is
-byte-identical (the MX-authenticity failure is deterministic — no random `msg_id`,
-no timing-sensitive value is involved).
+This result is **stable across runs**: the MX-authenticity error string, the
+`smtp_code`/`smtp_enchcode`/`smtp_msg` fields, and the complete `map[…]` artifact
+are byte-identical on every run (deterministic — no random `msg_id`, and no
+map-ordered records on this path). The only run-to-run variation in the full
+`go test` transcript is the trailing package-result elapsed time (`0.005s` in the
+two runs above; across 40 repeated runs it was `0.005s` in 34, `0.006s` in 3,
+`0.007s` in 2, and `0.016s` once), which is timing-sensitive and is not part of
+the application artifact.
 
 ### 4.2 TLS-to-plaintext fallback — answers Q3c
 
@@ -941,7 +992,7 @@ Every named sub-question is answered above. Summary:
 | **Q1c** abort comparison | Terminal record differs; mid-DATA abort inserts `DATA error {reason:"unexpected EOF"}`, logout abort does not; success never emits `aborted` | `internal/endpoint/smtp/smtp.go` L72, L317, L334 |
 | **Q1d** module name in prefix | **`smtp`** | `internal/endpoint/smtp/smtp.go` L495, L715-L717 |
 | **Q1e** `msg_id` format | 8 lowercase hex `^[0-9a-f]{8}$`, random per message (`c8f9d807`,`e1629489`,`2b38bee0`,`5779cf57` — the four §2.2 runs) | `internal/msgpipeline/msgid.go` L12-L16 |
-| **Q2a** full sequence | Ordered records: acceptance → attempt #1 → failure → will retry → attempt #2 → delivered → removed | `internal/target/queue/queue.go` L367, L378, L384, L415-L418 |
+| **Q2a** full sequence | Stable phase order: acceptance → attempt #1 → failure → will retry → attempt #2 → delivered → removed; the two per-recipient `delivery attempt failed` lines reorder nondeterministically (Go map range, L383) | `internal/target/queue/queue.go` L367, L378, L383-L384, L415-L418 |
 | **Q2b** attempt / failure / retry lines | `delivery attempt #1` / `delivery attempt failed` / `will retry` | `internal/target/queue/queue.go` L367 / L384 / L415-L418 |
 | **Q3a** MX-auth error string | `Failed to estabilish the MX record (mx.example.invalid.) authenticity` (misspelling verbatim) | `internal/target/remote/connect.go` L98 |
 | **Q3b** enhanced code + reply text | Inner `5.7.0`; **surfaced `5.4.0`**, `smtp_code 550`; reply `No usable MXs, last err: …` | `internal/target/remote/connect.go` L96-L98, L204-L208; `internal/exterrors/smtp.go` L11-L13, L122-L128 |
