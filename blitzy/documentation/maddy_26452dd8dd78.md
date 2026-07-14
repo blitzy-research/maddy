@@ -18,7 +18,7 @@ The single most important finding, established below and reconfirmed at runtime:
 - **Q3 — pipelined pressure vs a stricter peer (observed).** Terminating the first transaction with a bare-LF `<LF>.<LF>` and pipelining a second `MAIL/RCPT/DATA` in one `send()` makes maddy deliver **two** messages — the second with a spoofed sender — where an RFC-5321-strict peer would treat `<LF>.<LF>` as body and deliver **one**. This is SMTP smuggling.
 - **Q4 — back-to-back stability (observed).** The decision is deterministic. Ten identical canonical messages across two independent 5-message batches were all accepted with byte-identical delivered bodies; three back-to-back transactions on one connection all delivered, with an envelope reset between each. No run-to-run wobble was observed.
 - **Q5 — a cleaning / blocking front proxy (observed).** A **normalize** proxy (bare `\n`→`\r\n`) does not stop the smuggle — it *manufactures* a canonical `<CRLF>.<CRLF>` boundary, so maddy still delivers two messages. A **reject** proxy (refuse bare `\n`) blocks the traffic upstream: the client gets a `500` from the proxy and maddy delivers nothing, while a fully-canonical message still passes.
-- **Q6 — what lingers, and what is expected but never seen (observed).** A connection dropped mid-`DATA` yields `io.ErrUnexpectedEOF` → `DATA error {"reason":"unexpected EOF"}` → `554`, `aborted`, envelope cleared (nothing lingers, nothing delivered). An oversize message yields `552 5.3.4 Maximum message size exceeded`; an over-long line yields `DATA error {"reason":"smtp: too longer line in input stream"}` → `554`. The headline **absence**: maddy emits **no** bare-newline `5xx` rejection — a repository-wide search for any such control returns nothing — the RFC-conformant refusal that peers like Postfix added (`smtpd_forbid_bare_newline`) is exactly what maddy never exhibits.
+- **Q6 — what lingers, and what is expected but never seen (observed).** A connection dropped mid-`DATA` is logged as `DATA error {"reason":"unexpected EOF"}` — that log line is the **observed** runtime signal; the Go stdlib symbol `io.ErrUnexpectedEOF` (whose `.Error()` text is the string `unexpected EOF`) is *code-grounded* at `reader.go:L341`, and maddy never prints the symbol by name. maddy then **attempts** `554` and logs `aborted`; nothing is delivered. What lingers is precise (and matches §2 Q6 / §3): the **message/envelope** state is cleared on abort (`smtp.go:L74-79`) while the **connection/session** state (HELO, error counters, `connState`) persists — so a fresh transaction succeeds on the *same* connection with no re-`EHLO` (observed directly: a `552` transaction followed by a queued `250` on one `src_ip`). An oversize message yields `552 5.3.4 Maximum message size exceeded`; an over-long line yields `DATA error {"reason":"smtp: too longer line in input stream"}` → `554`. The headline **absence**: maddy emits **no** bare-newline `5xx` rejection — a repository-wide search for any such control returns nothing — the RFC-conformant refusal that peers like Postfix added (`smtpd_forbid_bare_newline`) is exactly what maddy never exhibits.
 
 ---
 ## 2. Per-question findings (Q1–Q6)
@@ -847,7 +847,7 @@ The envelope reset between transactions is `go-smtp`'s `Conn.reset` (`conn.go:L6
 
 ### Q5 — A cleaning / blocking front proxy
 
-A small, hardened stdlib TCP proxy (`/tmp/maddy-smtp/proxy.py`, full source in §7) sits in front of maddy on `127.0.0.1:2524 -> 127.0.0.1:2525`, in two modes. The **same** ambiguous bare-LF smuggling payload from Q3 is routed through each. The proxy is **instrumented**: for every chunk it logs the byte range `[start..end)`, the event (`FORWARDED` / `NORMALIZED` / `REJECTED`), and on rejection the exact `offset` of the first bare LF and the running `forwarded_prefix_bytes`. It validates its mode argument (unknown modes abort rather than fail open), uses a `mktemp -d` 0700 working dir, bounds its scan buffer, sets socket deadlines, and cleans up in a `finally` block.
+A small, hardened stdlib TCP proxy (`/tmp/maddy-smtp/proxy.py`, full source in §7) sits in front of maddy on `127.0.0.1:2524 -> 127.0.0.1:2525`, in two modes. The **same** ambiguous bare-LF smuggling payload from Q3 is routed through each. The proxy is **instrumented**: for every chunk it logs the byte range `[start..end)`, the event (`FORWARDED` / `NORMALIZED` / `REJECTED`), and on rejection the exact `offset` of the first bare LF and the running `forwarded_prefix_bytes`. It validates its mode argument (unknown modes abort rather than fail open), bounds its per-chunk scan, sets socket deadlines, and cleans up in a `finally` block. (It writes only to the log path given on its command line; there is **no** `mktemp` working directory in `proxy.py` — the enclosing `0700` `/tmp/maddy-smtp/` scratch dir was created by the harness, not by the proxy.) Bare-newline handling is **mode-specific**: *reject* flags a bare `<LF>` **and** an in-stream bare `<CR>`, whereas *normalize* rewrites only a bare `<LF>` (a bare `<CR>` passes through unchanged) — see §7.5.
 
 **Proxy lifecycle (PID / readiness / shutdown).** Each proxy run captures its PID, waits for listener readiness, runs two correlated experiment runs, then is shut down by that exact PID (this is the general pattern; each experiment below states its own exact `proxy.py <mode>` and `rawclient.py <mode>` invocation, which is what determines its result):
 ```bash
@@ -1065,7 +1065,7 @@ delivered body (unstuffed, 5201 bytes)
 ```text
 $ # (A) WRONG — broadened with --include=*.md; it matches THIS document, so it returns matches (exit 0), NOT exit 1:
 $ grep -rniE --include=*.md 'smuggl' . | wc -l
-65   # self-referential count (every match is inside THIS document); the integer drifts with any edit to this file, so the meaningful signal is the exit code below, not the count
+66   # self-referential count (every match is inside THIS document); the integer drifts with any edit to this file, so the meaningful signal is the exit code below, not the count
 $ grep -rniE --include=*.md 'smuggl' . ; echo "exit=$?"
 exit=0   # 0 = matched, because blitzy/documentation/maddy_26452dd8dd78.md itself contains 'smuggling'
 $ # (B) CORRECT — scope to the canonical maddy SOURCE + top-level config only:
@@ -1499,7 +1499,87 @@ The following standards and advisory facts frame *why* maddy's observed behaviou
 
 ## 5. Caveats — observed vs inferred, environment, and reproducibility
 
-**Observed vs inferred.** Every behavioural claim tagged **(observed)** is backed by the captured transcript / log / delivered-bytes / error text shown inline together with the exact command that produced it. Claims tagged **(inferred)** are read from the cited code and were not independently instrumented — specifically: the precise internal state-variable transitions of the `dotReader` FSM are inferred from `net/textproto/reader.go` (their *effects* — acceptance, normalization, un-stuffing, `ErrUnexpectedEOF` — are observed); and the `HACKING.md` "body cannot be modified" invariant is a documentation claim, not a runtime measurement (its consequence — maddy never parsing `.` — is corroborated by the fact that maddy only ever receives an already-decoded reader).
+**Observed vs inferred.** Every behavioural claim tagged **(observed)** is backed by the captured transcript / log / delivered-bytes / error text shown inline together with the exact command that produced it. Claims tagged **(inferred)** — equivalently, *code-grounded* — are read from the cited code and were not independently instrumented — specifically: the precise internal state-variable transitions of the `dotReader` FSM are inferred from `net/textproto/reader.go` (their *effects* — acceptance, CRLF→LF normalization, dot un-stuffing, and the mid-`DATA` drop error — are observed). The Go symbol name `io.ErrUnexpectedEOF` is itself **code-grounded** (`reader.go:L341`); what is **observed** at runtime is the `DATA error {"reason":"unexpected EOF"}` log line, whose reason string is that symbol's `.Error()` text (`unexpected EOF`) — maddy never prints the symbol by name. Likewise, the `HACKING.md` "body cannot be modified" invariant is a documentation claim, not a runtime measurement (its consequence — maddy never parsing `.` — is corroborated by the fact that maddy only ever receives an already-decoded reader).
+
+**Canonical environment (supplied image, host vs. container, revisions, dependencies) — (observed).** Every value below was captured by running the command shown; this table is the authoritative environment reference for the investigation (the chronological transcript that follows is a point-in-time capture of the same facts).
+
+| Item | Value | How captured |
+|---|---|---|
+| Supplied Docker image | `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_foxcpp_maddy_1.0` (image ID `1a4db97f78be`; the setup instructions also name the container tag `andrewparkscaleai/coding-agent:foxcpp__maddy__26452dd8dd787dc455278b0fdd296f4a5432c768`) | `docker run --rm --network none --entrypoint /bin/bash <image> -lc '…'` |
+| Host OS (agent execution env) | `Ubuntu 25.10` | `. /etc/os-release; echo "$PRETTY_NAME"` |
+| Host Python | `Python 3.13.7` | `python3 --version` |
+| Canonical-container OS | `Debian GNU/Linux 11 (bullseye)` | same command, run **inside** the supplied image |
+| Canonical-container Python | `Python 3.9.2` | same command, run **inside** the supplied image |
+| Go (host **and** container) | `go version go1.18.10 linux/amd64` | `go version` |
+| `GOROOT` / `GOMODCACHE` (host **and** container) | `/usr/local/go` / `/go/pkg/mod` | `go env GOROOT GOMODCACHE` |
+| go-smtp pin | `github.com/emersion/go-smtp v0.12.1-0.20191206174923-1f576e0ec85c` | `go list -m github.com/emersion/go-smtp` |
+| go-message pin | `github.com/emersion/go-message v0.10.9-0.20191116124005-65fd0119e899` | `go list -m github.com/emersion/go-message` |
+| Source parent (maddy code under investigation) | `26452dd8dd787dc455278b0fdd296f4a5432c768` (short `26452dd`); the SWE-AtlasQnA-Repo source-branch name `maddy_26452dd8dd78` encodes it — hence this file is `maddy_26452dd8dd78.md` | `git rev-parse 26452dd`; the container's `/app` checkout HEAD is `26452dd` |
+| Destination branch | `blitzy-438524cc-5240-4dd1-904e-f2f199faf5de` | `git rev-parse --abbrev-ref HEAD` |
+| Destination HEAD | the tip of the destination branch; **self-referential** — every commit of *this document* advances it, so no hash printed inside the document can name its own final commit. Use the invariant below instead. | — |
+| One-file-added invariant | `git diff --name-only 26452dd..HEAD` = exactly `blitzy/documentation/maddy_26452dd8dd78.md` — no source/test/config/dependency file changed | `git diff --name-only 26452dd..HEAD` |
+
+**Revision labels — disambiguated (so the three hashes are never conflated).** `26452dd` is the **source parent** — the maddy code actually exercised; it is fixed forever and is what the branch name encodes. The chronological transcript below prints `git rev-parse --short HEAD` = `2fc2df9`; that was the **destination HEAD at the instant the transcript was captured**, i.e. the *initial* commit of this document. Because the destination branch receives further documentation-only commits as this answer is revised, the destination HEAD advances past `2fc2df9` (and past any later hash) — which is why a reader will observe a different destination HEAD than the transcript shows. The two facts that never change and that a reviewer should check are the **source parent `26452dd`** and the **one-file-added invariant** in the table above.
+
+**Complete resolved module inventory (55 modules) — (observed).** The full dependency set resolved for the build, captured with `go list -m all` (the JSON form is `go list -m -json all`):
+```text
+$ go list -m all
+github.com/foxcpp/maddy
+blitiri.com.ar/go/spf v0.0.0-20191018194539-a683815bdae8
+github.com/BurntSushi/toml v0.3.1
+github.com/GehirnInc/crypt v0.0.0-20190301055215-6c0105aabd46
+github.com/cpuguy83/go-md2man/v2 v2.0.0
+github.com/davecgh/go-spew v1.1.1
+github.com/emersion/go-imap v1.0.1
+github.com/emersion/go-imap-appendlimit v0.0.0-20190308131241-25671c986a6a
+github.com/emersion/go-imap-compress v0.0.0-20170105185004-f036eda44681
+github.com/emersion/go-imap-idle v0.0.0-20190519112320-2704abd7050e
+github.com/emersion/go-imap-move v0.0.0-20190710073258-6e5a51a5b342
+github.com/emersion/go-imap-specialuse v0.0.0-20161227184202-ba031ced6a62
+github.com/emersion/go-imap-unselect v0.0.0-20171113212723-b985794e5f26
+github.com/emersion/go-message v0.10.9-0.20191116124005-65fd0119e899
+github.com/emersion/go-milter v0.0.0-20190311184326-c3095a41a6fe
+github.com/emersion/go-msgauth v0.3.2-0.20191028231513-55b75676976c
+github.com/emersion/go-sasl v0.0.0-20190817083125-240c8404624e
+github.com/emersion/go-smtp v0.12.1-0.20191206174923-1f576e0ec85c
+github.com/emersion/go-textwrapper v0.0.0-20160606182133-d0e65e56babe
+github.com/foxcpp/go-imap-backend-tests v0.0.0-20190615132041-281c43ad777b
+github.com/foxcpp/go-imap-sql v0.3.2-0.20191208094750-8b4ec6b19a78
+github.com/foxcpp/go-mockdns v0.0.0-20191123143003-02edb10da1e3
+github.com/frankban/quicktest v1.5.0
+github.com/go-sql-driver/mysql v1.4.1
+github.com/golang/protobuf v1.3.1
+github.com/google/go-cmp v0.3.1
+github.com/google/uuid v1.1.1
+github.com/klauspost/compress v1.9.1
+github.com/kr/pretty v0.1.0
+github.com/kr/pty v1.1.1
+github.com/kr/text v0.1.0
+github.com/lib/pq v1.2.0
+github.com/mailru/easyjson v0.7.0
+github.com/martinlindhe/base36 v1.0.0
+github.com/mattn/go-sqlite3 v1.11.0
+github.com/miekg/dns v1.1.22
+github.com/pierrec/lz4 v2.3.0+incompatible
+github.com/pkg/errors v0.8.1
+github.com/pmezard/go-difflib v1.0.0
+github.com/russross/blackfriday/v2 v2.0.1
+github.com/shurcooL/sanitized_anchor_name v1.0.0
+github.com/stretchr/objx v0.1.0
+github.com/stretchr/testify v1.4.0
+github.com/urfave/cli v1.22.1
+golang.org/x/crypto v0.0.0-20191108234033-bd318be0434a
+golang.org/x/net v0.0.0-20191126235420-ef20fe5d7933
+golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e
+golang.org/x/sys v0.0.0-20191105231009-c1f44814a5cd
+golang.org/x/text v0.3.2
+golang.org/x/tools v0.0.0-20190907020128-2ca718005c18
+golang.org/x/xerrors v0.0.0-20190717185122-a985d3407aa7
+google.golang.org/appengine v1.6.5
+gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127
+gopkg.in/yaml.v2 v2.2.2
+gotest.tools v2.2.0+incompatible
+```
 
 **Environment, build, and startup — one chronological transcript (reproducibility).** The single captured transcript below shows, in order and with exact commands, exit statuses, PIDs, and readiness checks: the Go toolchain and module resolution, the git branch/HEAD, the `CGO_ENABLED=1 go build` (exit 0, with the unrelated `mattn/go-sqlite3` cgo notice), the built binary and its version, and the sink + maddy startup with captured PIDs and port-readiness gates. The matching shutdown/port-freedom transcript appears in **Read-only & cleanup** below. **(observed).**
 
@@ -1534,7 +1614,7 @@ $ ls -l /tmp/maddy-smtp/maddy
 -rwxr-xr-x 1 root root 19386576 Jul 13 18:10 /tmp/maddy-smtp/maddy
 $ /tmp/maddy-smtp/maddy -v
 maddy unknown (built from source tree)
-$ python3 sink.py 2526 ... &   (capturing sink)
+$ python3 /tmp/maddy-smtp/sink.py 2526 /tmp/maddy-smtp/delivered /tmp/maddy-smtp/sink_delivered.log &   # capturing sink; argv = port deliv_dir human_log
 SINK_PID=90281
 port 2526 ready
 $ /tmp/maddy-smtp/maddy -config /tmp/maddy-smtp/maddy.conf &
@@ -1551,7 +1631,7 @@ smtp: 220 test.local ESMTP Service Ready
 - `go version` → `go version go1.18.10 linux/amd64` (this is the exact stdlib whose `net/textproto/reader.go` `dotReader` was exercised; the file is `/usr/local/go/src/net/textproto/reader.go`, dated Jan 9 2023).
 - `GOROOT` = `/usr/local/go` ; `GOMODCACHE` = `/go/pkg/mod`.
 - go-smtp resolved pin: `go list -m github.com/emersion/go-smtp` → `github.com/emersion/go-smtp v0.12.1-0.20191206174923-1f576e0ec85c` (matches `go.mod:L19`); cache dir `/go/pkg/mod/github.com/emersion/go-smtp@v0.12.1-0.20191206174923-1f576e0ec85c`.
-- Repository: git branch `blitzy-438524cc-5240-4dd1-904e-f2f199faf5de`, HEAD short `26452dd`. (The **source** branch, per the SWE-AtlasQnA-Repo naming rule, is `maddy_26452dd8dd78`, which is why this document is named `maddy_26452dd8dd78.md`.)
+- Repository: destination git branch `blitzy-438524cc-5240-4dd1-904e-f2f199faf5de`; the **source parent** under investigation is `26452dd` (full `26452dd8dd787dc455278b0fdd296f4a5432c768`), on top of which this document is the single added file (see the *One-file-added invariant* in the canonical-environment table above — the destination HEAD itself is self-referential and advances with each documentation commit). Per the SWE-AtlasQnA-Repo naming rule the **source** branch is `maddy_26452dd8dd78`, which is why this document is named `maddy_26452dd8dd78.md`.
 
 > **Note on the Go version.** The task-analysis notes anticipated a Go 1.21.13 feasibility build; the actual canonical container ships **Go 1.18.10**, so that is the version reported here. The `dotReader` FSM regions cited (`reader.go` L311–408) were re-verified by inspection in this container's 1.18.10 stdlib and are stable across Go 1.13–1.21.
 
@@ -1606,7 +1686,9 @@ strictpeer 92627 dead
 
 ## 6. Coverage pass — every question and named item, confirmed addressed
 
-**The six sub-questions (each answered by name, with observed output):**
+This is the **exhaustive closing coverage pass**, generated against the full AAP named-item inventory: every sub-question; every AAP-referenced file across all three layers — *including the context-only reference files* that the `DATA`-boundary decision does **not** traverse but that the AAP lists (given here with their accurate, source-grounded role and labelled **context-only**); every named function/method/struct; every configuration flag/knob; every user-provided example; and every standard/advisory/vendor/CVE. Each entry names the item and points to where it is addressed (a §/Q section, a `file:line`, or observed output). Detail for the standards lives in §4 and is only *named* here for coverage.
+
+**(a) The six sub-questions (each answered by name, with observed output):**
 
 - [x] **Q1 — the boundary-decision moment.** §2 Q1: `354` greeting, terminator consumed → `stateEOF`, `250 OK: queued`, `smtp: accepted {msg_id}` (`smtp.go:L334`), delivered body at sink. (observed)
 - [x] **Q2 — framing-variation payloads.** §2 Q2 V-A…V-E: canonical vs bare-LF terminator, bare-LF body lines, dot-stuffing, terminator-resembling lines; V-A≡V-B byte-identical delivery (SHA-256). (observed)
@@ -1615,38 +1697,102 @@ strictpeer 92627 dead
 - [x] **Q5 — a cleaning / blocking front proxy.** §2 Q5 (instrumented proxy — byte/event log, rejection offset, forwarded-prefix; PID/readiness/shutdown): normalize rewrites `<LF>.<LF>`→`<CRLF>.<CRLF>` and **manufactures** the boundary (maddy still 2 delivered); reject shown both packetizations — single-chunk (`forwarded_prefix=0`, maddy sees only `220`, client `500`) and split-chunk (`forwarded_prefix=156`, maddy `EHLO`→`354`→`unexpected EOF`→aborted, `500`); sink `0` in both; canonical-through-reject control passes (`250`). Bounded invariant: bytes at/after the bare-LF are never forwarded. (observed)
 - [x] **Q6 — what lingers, and what is expected but never seen.** §2 Q6: dropped-mid-`DATA`→`unexpected EOF`, maddy **attempts** `554` on the dead socket while the closed client observes **no reply**; oversize→`552` (correct binary `/tmp/maddy-smtp/maddy -config …/maddy-oversize.conf`, with stop/port-free/live-diff/start/readiness/restore); over-long line **one-chunk**→`554` (client stays connected, sees `554`+`221`) vs **split-chunk**→**accepted** (value-receiver `curLineLength` reset); cleared message/envelope vs persistent connection/session shown by a post-error same-connection probe (`src_ip …:47100`, no re-EHLO); and the **absence** of any bare-newline `5xx` — the scoped source grep is `exit=1` (the broad `--include=*.md` grep that returns `exit=0` merely matches this document). (observed)
 
-**Named mechanisms (function/method/struct), each cited by `file:line` and shown in §3:**
+**(b) Named mechanisms (function/method/struct), each cited by `file:line` and shown in §3:**
 
 - [x] `Session.Data` (`smtp.go:L312`) · [x] `prepareBody` (`smtp.go:L283`) · [x] `BufferInMemory` (`memory.go:L27`, called `smtp.go:L298`) · [x] `GenerateReceived` (`received.go:L19`, called `smtp.go:L303`; add `smtp.go:L307`)
 - [x] `dotReader` states — `stateBeginLine`/`stateDot`/`stateDotCR`/`stateCR`/`stateData`/`stateEOF` (`reader.go:L327-333`, transitions L346-402)
 - [x] `handleData` (`conn.go:L498`) · [x] drain `io.Copy(ioutil.Discard, r)` (`conn.go:L521`) · [x] `Conn.reset` (`conn.go:L694`) · [x] `io.TeeReader`→`Debug` (`conn.go:L68`)
 - [x] `newDataReader`→`c.text.DotReader()` (`data.go:L51,L53`) · [x] `Session.abort`/`Session.Reset` (`smtp.go:L60,L67`, `aborted` log L72) · [x] delivery `Body`/`Commit` (`msgpipeline.go:L307,L406`); outbound relay chain (§3, “Layer 1 (outbound)”): `smtp_downstream` `Delivery.Body` L207 / `Commit` L226 → `d.conn.Data` L230 → `smtpconn.C.Data` L303 (`c.cl.Data()` L306, `textproto.WriteHeader` L311, `io.Copy` L315) → go-smtp `Client.Data` L387 → `c.Text.DotWriter()` L392 → stdlib `textproto` `Writer.DotWriter` `writer.go:L43` / `dotWriter.Write` L67 (canonical CRLF re-encode + dot re-stuff)
+- [x] `lineLimitReader` (go-smtp `lengthlimit_reader.go`; wraps the connection reader to enforce `MaxLineLength`) — the `curLineLength` value-receiver reset behind the Q6c one-chunk-`554` vs split-chunk-accepted split · [x] `dataReader` (go-smtp `data.go`; the `newDataReader` result type wrapping `c.text.DotReader()` with the `MaxMessageBytes` guard) · [x] `io.ErrUnexpectedEOF` — the Go stdlib sentinel the `dotReader` returns on mid-`DATA` EOF (`reader.go:L341`, `.Error()` == `"unexpected EOF"`); **code-grounded** symbol whose **observed** runtime footprint is the `DATA error {"reason":"unexpected EOF"}` log line (§2 Q6, §5 observed-vs-inferred)
 
-**Named flags / knobs:**
+**(c) Named flags / knobs:**
 
 - [x] `io_debug` (`smtp.go:L565`; enables `serv.Debug` `smtp.go:L603-604`; "I/O debugging is on!" `smtp.go:L605`)
 - [x] `max_message_size`→`MaxMessageBytes` (32 MiB default; `smtp.go:L561`) — observed via EHLO `SIZE 33554432` and the Q6b `552`
 - [x] `max_recipients`→`MaxRecipients` (20000 default; `smtp.go:L562`)
 - [x] `MaxLineLength` (default `2000`; go-smtp `server.go:L76`; not overridden by maddy) — observed via Q6c `too longer line`
 - [x] `EnableSMTPUTF8` (`smtp.go:L504`) — observed via `250-SMTPUTF8` in every EHLO
+- [x] `tls off` — test-baseline knob disabling the TLS wrapper on loopback (global `tls off` and inbound-endpoint `tls off`, §7.1 `maddy.conf` L1745/L1751); does **not** touch `DATA` byte framing (§5)
+- [x] `attempt_starttls no` / `require_tls no` — the `smtp_downstream` relay-block knobs that keep the loopback delivery leg in cleartext so the delivered bytes are observable at the sink (§7.1 `maddy.conf` L1757-1758); paired with `insecure_auth yes` / `defer_sender_reject no` on the inbound endpoint (L1752-1753)
+- [x] `smtpd_forbid_bare_newline` — **not a maddy knob**: the Postfix control (with `normalize`/`reject` handling) named for contrast; maddy has no equivalent, which is precisely the RFC-conformant bare-newline refusal maddy never exhibits (§2 Q6d, §4)
 
-**Files, all three layers:**
+**(d) Files — every AAP-referenced file across the three layers, plus this deliverable.** Files the boundary decision actually traverses are listed *on-path*; AAP reference files it does not traverse are listed **context-only** with their source-grounded role.
 
-- [x] Layer 1 — `internal/endpoint/smtp/smtp.go`, `internal/buffer/memory.go`, `internal/target/received.go`, `internal/msgpipeline/msgpipeline.go`, `internal/target/smtp_downstream/smtp_downstream.go`, `HACKING.md`, `go.mod`, `maddy.conf`
-- [x] Layer 2 — go-smtp `conn.go`, `data.go`, `server.go`, `lengthlimit_reader.go`
-- [x] Layer 3 — Go stdlib `net/textproto/reader.go`
+*Layer 1 — maddy in-repo (on the boundary / delivery path):*
 
-**User-provided examples (each addressed by name):**
+| File | Role on the investigation | Addressed |
+|------|---------------------------|-----------|
+| `internal/endpoint/smtp/smtp.go` | `Session.Data`/`prepareBody`, accept/`DATA error` logs, `io_debug`, size/recipient knobs | §3 Layer 1; §2 Q1/Q6 |
+| `internal/buffer/memory.go` | in-memory `Buffer` implementation returned by `BufferInMemory` | §3 Layer 1 (`memory.go:L27`) |
+| `internal/target/received.go` | `GenerateReceived` — builds the `Received:` trace header | §3 (`received.go:L19`) |
+| `internal/msgpipeline/msgpipeline.go` | delivery `Body`/`Commit` routing after acceptance | §3 (`msgpipeline.go:L307,L406`) |
+| `internal/target/smtp_downstream/smtp_downstream.go` | relay to the capturing sink (decode→re-encode→re-stuff) | §3 Layer 1 (outbound) |
+| `maddy.conf` | shipping-default config exemplar behind the §7.1 test baseline | §5; §7.1 |
+| `HACKING.md` | convention: pipeline modifiers never touch the message body | §3; §5 |
+| `go.mod` | module path, `go 1.13` minimum, the go-smtp pin | §4 (`go.mod:L19`); §5 |
+
+*Layer 1 — maddy in-repo (**context-only** reference files per AAP §0.4; NOT on the `DATA`-boundary path):*
+
+| File | Source-grounded role | Why context-only |
+|------|----------------------|------------------|
+| `internal/endpoint/smtp/smtp_test.go` | Session-level `DATA` tests with in-repo fake backends (`TestSMTPDelivery` L122, `TestSMTPDelivery_AbortData` L360, `TestSMTPDelivery_Reset` L429, `TestMain` L522) | establishes the harness convention this investigation deliberately bypasses — the Go test harness cannot emit a bare-LF `<LF>.<LF>` terminator, which is exactly why the raw-socket client (§7.4) is used |
+| `internal/endpoint/smtp/smtputf8_test.go` | SMTPUTF8 `DATA`/`Received` test conventions (`TestSMTPUTF8_Received_EHLO_ALabel` L204) | same test layer; codifies SMTPUTF8 expectations, not byte framing |
+| `internal/endpoint/smtp/submission.go` | `Session.submissionPrepare` (L27) — the Submission endpoint sharing the same `Session` type as inbound SMTP | the submission path, not the inbound `DATA` boundary |
+| `internal/endpoint/smtp/date.go` | `parseMessageDateTime` (L39) over RFC 5322 §3.3 date layouts (L11-30) — a date-parsing helper in the endpoint package | header date parsing, downstream of the boundary decision |
+| `internal/msgpipeline/check_runner.go` | `checkRunner` (L19) / `runAndMergeResults` (L142) — runs pipeline checks in parallel | executes *after* the `DATA` boundary is decided and the body is buffered |
+| `internal/target/delivery.go` | `DeliveryLogger` (L8) — stamps `msg_id` into the delivery logger (the id seen in `smtp: accepted {msg_id}`) | logging glue, not framing |
+| `internal/buffer/buffer.go` | the `Buffer` interface (L22: `Open`/`Len`/`Remove`) — the abstract contract behind `BufferInMemory` | `memory.go` is the concrete implementation actually exercised |
+
+*Layer 2 — go-smtp (module cache, read-only):*
+
+| File | Role | Addressed |
+|------|------|-----------|
+| go-smtp `conn.go` | `handleData`, `354`, drain, `Conn.reset`, `io.TeeReader`→`Debug` | §3 Layer 2 |
+| go-smtp `data.go` | `newDataReader`, the `dataReader` wrapper, `MaxMessageBytes`/`552` | §3 Layer 2 |
+| go-smtp `server.go` | `MaxLineLength` default `2000` | §6(c); §3 |
+| go-smtp `lengthlimit_reader.go` | `lineLimitReader` — the per-line length cap | §2 Q6c; §3 |
+| go-smtp `client.go` | `Client.Data` (L387) / `c.Text.DotWriter()` (L392) — the outbound relay re-encode entry | §3 Layer 1 (outbound) |
+
+*Layer 3 — Go standard library (read-only):*
+
+| File | Role | Addressed |
+|------|------|-----------|
+| Go stdlib `net/textproto/reader.go` | `dotReader` — the actual end-of-`DATA` state machine | §3 Layer 3 |
+| Go stdlib `net/textproto/writer.go` | `Writer.DotWriter` (L43) / `dotWriter.Write` (L67) — canonical CRLF re-encode + dot re-stuff on delivery | §3 Layer 1 (outbound) |
+
+*Deliverable (the single file this task adds to the repository):*
+
+| File | Role |
+|------|------|
+| `blitzy/documentation/maddy_26452dd8dd78.md` | this runtime-grounded answer document (branch-named per the SWE-AtlasQnA-Repo rule); the *one-file-added invariant* in §5 |
+
+**(e) User-provided examples (each addressed by name):**
 
 - [x] "CRLF.CRLF vs bare-LF dot" — Q2 V-A vs V-B (and the Q3 trigger).
 - [x] "dot-stuffing" — Q2 V-D (RFC 5321 §4.5.2 round trip).
 - [x] "cleans up or blocks ambiguous framing" — Q5 normalize (cleans up / manufactures) vs reject (blocks).
 
+**(f) Standards, advisory, vendors, and CVE (detail and attribution in §4; named here only for coverage):**
+
+| Item | What it pins down | Where addressed |
+|------|-------------------|-----------------|
+| RFC 5321 §2.3.8 (Lines) | an SMTP line ends **only** with `<CRLF>`; a bare `<LF>` or bare `<CR>` is not a terminator | §4 |
+| RFC 5321 §4.1.1.4 (DATA) | end-of-mail-data is `<CRLF>.<CRLF>`; `<LF>.<LF>` MUST NOT be treated as the end-of-data indication | §4; §2 Q2/Q3 |
+| RFC 5321 §4.5.2 (Transparency / dot-stuffing) | leading `.`→`..` on send, one leading period stripped on receive | §4; §2 Q2 V-D |
+| RFC 5322 §2.3 (body semantics) | in a body, CR and LF may appear **only together as CRLF** | §4 |
+| SMTP smuggling (SEC Consult disclosure, December 2023) | the lenient-terminator vulnerability class this investigation probes end-to-end | §4; §2 Q3 |
+| CVE-2023-51764 | the CVE assigned to the Postfix instance of the disclosure — **not** a maddy CVE (attributed as external context) | §4 (caveat) |
+| Postfix — `smtpd_forbid_bare_newline` | the vendor control added in response, with `normalize`/`reject` handling; the knob maddy lacks | §4; §6(c) |
+| Exim | shipped a bare-newline hardening fix in response to the disclosure | §4 |
+| Sendmail | shipped a bare-newline hardening fix in response to the disclosure | §4 |
+
+**Coverage confirmation.** This matrix was generated by cross-checking §1–§7 against the AAP named-item inventory — all six sub-questions, all 23 files (8 on-path Layer-1 + 7 context-only Layer-1 reference files + 5 Layer-2 go-smtp + 2 Layer-3 stdlib + this deliverable), all named functions/methods/structs of §3, all nine configuration flags/knobs, all three user-provided examples, and all standards/advisories/vendors/CVE of §4 — with **no** named item omitted.
+
 ---
 
 ## 7. Appendix — the temporary `/tmp` harness (verbatim source)
 
-These configs and scripts are the exact **hardened** artifacts that produced every transcript above. The hardening applied (finding: harness safety) is visible inline: the front proxy validates its mode and fails fast on an unknown one, and handles a **bare `<CR>`** as well as a bare `<LF>`; the sink uses a **bounded** accumulation guard (`MAX_MSG_BYTES`) and socket timeouts; the client and sink set socket deadlines and clean up in `finally`. They lived under `/tmp/maddy-smtp/` only (a `0700`-mode directory) and were removed on completion (see §5); all eight artifacts are reproduced verbatim below so the evidence is fully reproducible.
+These configs and scripts are the exact artifacts that produced every transcript above, reproduced verbatim so every claim about them can be checked against the code. The safety measures actually present are: the front proxy validates its mode and fails fast on an unknown one; in **reject** mode it flags a bare `<LF>` **and** an in-stream bare `<CR>` (in **normalize** mode it rewrites only a bare `<LF>`, leaving a bare `<CR>` unchanged — verified by `normalize_bare_lf(b"A\rB", False) → b"A\rB"`); the sink uses a **bounded** per-message accumulation guard (`MAX_MSG_BYTES`) and per-connection socket timeouts; and the client, sink, and proxy set socket deadlines and close sockets in a `finally` block. Two honest limits of the harness are stated for accuracy (neither affects any `DATA`-boundary conclusion, and neither is a defect for this read-only investigation): the sink is a plain thread-per-connection `ThreadingTCPServer` with **no** fixed worker-pool bound (its thread count tracks concurrent connections — observed `1 → 31 → 1` under 30 simultaneously held connections), and the reject proxy does **not** flag a bare `<CR>` that is the *final* byte before EOF (it is forwarded, because a CR is only confirmed a violation once a following non-`LF` byte arrives, which never happens at end-of-stream — verified by sending the 28-byte payload `EHLO trailing-cr.test<CR><LF>NOOP<CR>` through reject mode: it is forwarded with no `500`). They lived under `/tmp/maddy-smtp/` only (a `0700`-mode directory) and were removed on completion (see §5); all eight artifacts are reproduced verbatim below so the evidence is fully reproducible.
 
 ### 7.1 Canonical TEST baseline config — `/tmp/maddy-smtp/maddy.conf`
 ```text
@@ -1714,8 +1860,11 @@ smtp tcp://127.0.0.1:2525 {
 # records the EXACT delivered bytes (post decode+re-encode produced by maddy's
 # smtp_downstream relay via conn.Data) to a per-message .bin file plus a human log.
 # Does NOT advertise STARTTLS. Handles multiple transactions per connection.
-# Hardening: per-connection socket deadline, bounded read accumulation, bounded
-# worker threads, and guaranteed socket cleanup in a finally block.
+# Safety: per-connection socket deadline, bounded read accumulation (MAX_MSG_BYTES),
+# and guaranteed socket cleanup in a finally block. Concurrency model: one daemon
+# handler thread per connection (ThreadingTCPServer, daemon_threads=True) -- there is
+# NO fixed worker-pool bound (thread count tracks concurrent connections: 1 -> 31 -> 1
+# observed under 30 simultaneously held connections).
 import socket, socketserver, sys, os, threading
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 2526
@@ -2159,7 +2308,7 @@ if __name__ == "__main__":
     sys.stdout.write("### rawclient done (mode=%s)\n" % MODE); sys.stdout.flush()
 ```
 
-### 7.5 Front proxy (normalize / reject / passthrough; validates mode; handles bare CR and bare LF) — `/tmp/maddy-smtp/proxy.py`
+### 7.5 Front proxy (normalize / reject / passthrough; validates mode; reject flags bare LF + in-stream bare CR, normalize rewrites bare LF) — `/tmp/maddy-smtp/proxy.py`
 ```python
 #!/usr/bin/env python3
 # Small instrumented TCP front proxy (stdlib socket/selectors/threading only).
@@ -2167,9 +2316,12 @@ if __name__ == "__main__":
 #   normalize  : rewrite bare '\n' (LF not preceded by CR) to '\r\n' on the client->server
 #                stream before forwarding (the "clean" analogue; can MANUFACTURE a canonical
 #                <CRLF>.<CRLF> boundary out of ambiguous bare-LF framing).
-#   reject     : fully CRLF-strict. On the FIRST bare '\n' (LF not preceded by CR) OR bare
-#                '\r' (CR not followed by LF) in the client->server stream, emit a 5xx to the
-#                client and close WITHOUT forwarding the offending chunk or any later bytes.
+#   reject     : CRLF-strict for IN-STREAM violations. On the FIRST bare '\n' (LF not preceded
+#                by CR) OR bare '\r' (a CR followed by a non-LF byte) in the client->server
+#                stream, emit a 5xx to the client and close WITHOUT forwarding the offending
+#                chunk or any later bytes. KNOWN EDGE: a bare '\r' that is the FINAL byte before
+#                EOF is forwarded, not rejected -- a CR is only confirmed a violation once a
+#                following non-LF byte arrives, which never happens at end-of-stream.
 #   passthrough: forward verbatim (control).
 # Instrumentation: logs every client->server chunk with its absolute byte-offset range, whether
 # it was forwarded or rejected, the exact rejection offset+kind, and the forwarded-prefix length.
