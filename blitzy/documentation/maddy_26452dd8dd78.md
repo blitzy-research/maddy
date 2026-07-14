@@ -33,22 +33,63 @@ ordinary mail libraries would normalise or reject. All runtime scaffolding
 
 # 0. Environment and provenance
 
-## 0.1 Requested container image vs. actual runtime (non‑canonical environment disclosure)
+## 0.1 Requested container image vs. actual runtime (environment provenance)
 
 The AAP (§0.8.1) specifies the build/run environment as the container image
 `andrewparkscaleai/coding-agent:foxcpp__maddy__26452dd8dd787dc455278b0fdd296f4a5432c768`
-(from `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_foxcpp_maddy_1.0`). That exact
-image reference could **not** be pulled in this environment: the dockerhub
-reference returns *pull access denied*, while the ghcr reference is reachable.
-The investigation therefore ran on a **native‑equivalent Go 1.13.15 toolchain**
-inside the actual host (a Kubernetes pod), reproducing the image's toolchain
-(Go 1.13.15, gcc, CGO). **This is a disclosed deviation**: the runtime is a
-native replica of the requested image, not the image itself. It does not affect
-the SMTP code paths under test (identical maddy binary, identical go‑smtp and
-stdlib versions, confirmed in §1.9), but it is labelled here as **non‑canonical
-environment provenance** in the interest of full transparency.
+(from `ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_foxcpp_maddy_1.0`). The dockerhub
+reference returns *pull access denied*; the **ghcr reference is reachable and was
+used to cross-check the build**. The two toolchains are **not** the same, and that
+difference is disclosed here precisely rather than described as equivalence:
 
-**Evidence — requested image, access failure, and actual host** (`captures/env_provenance.txt`):
+- The **canonical evidence matrix in this report** (all of §2 and §3) was captured
+  with a **native toolchain on the actual host** (a Kubernetes pod): **Go 1.13.15,
+  gcc 15.2.0**, CGO enabled.
+- The **AAP-requested ghcr image** ships a **different toolchain**: **Go 1.18.10,
+  gcc (Debian 10.2.1-6) 10.2.1**.
+
+Because the Go compiler versions differ, the two builds do **not** produce the
+same binary. Built from the identical maddy source (commit
+`26452dd8dd787dc455278b0fdd296f4a5432c768`), the artifacts differ in size and
+SHA-256:
+
+| Build | Go | gcc | `maddy` size | `maddy` SHA-256 | `maddyctl` SHA-256 |
+|-------|----|-----|-------------:|-----------------|--------------------|
+| Native (canonical; produced the §2/§3 evidence) | 1.13.15 | 15.2.0 | 21,847,696 | `7aa3baaff8…8251a7b` | `8ac9abba2e…51b3c328` |
+| Supplied ghcr image | 1.18.10 | 10.2.1 | 19,307,784 | `e4c4831230…3eb72d1c` | `72ab99700b…67d92964` |
+
+The native SHA-256 is reproducible (reconfirmed by rebuilding, and it matches the
+value observed independently during review). Go embeds build-path/settings
+metadata into each binary, so the **exact** image-build SHA-256 is
+build-environment-dependent; the environment-independent, always-true fact is that
+the Go 1.18.10 image build is **not** byte-identical to the Go 1.13.15 native build
+(different compiler, different size, different hash — `cmp` reports DIFFER).
+
+**What is genuinely shared, and what is not:**
+
+- **Identical** — the maddy source (same commit) and the pinned **go-smtp** module
+  `v0.12.1-0.20191206174923-1f576e0ec85c` (present at that exact version in both
+  toolchains' module caches, shown below). The SMTP code paths under test are the
+  same source in both builds.
+- **Different** — the compiled binaries (table above) and the **Go standard
+  library** (1.13.15 vs 1.18.10). The `net/textproto` `dotReader` line numbers
+  cited in §1.9 are those of the **Go 1.13.15** stdlib that produced the canonical
+  matrix; the image's Go 1.18.10 stdlib places the equivalent logic at different
+  line numbers, though the state-machine behaviour is the same.
+- **Behaviourally equivalent (observed, not assumed)** — replaying the D2
+  embedded-lone-dot probe (:25) and the full Q2 `AUTH A → MAIL A → RSET → MAIL B`
+  probe (:587) against a maddy **built inside the ghcr image** produced
+  **byte-identical** wire transcripts, an identical enforcement-hook line
+  (`auth_user=usera@example.org  sender=userb@example.org`), and identical stored
+  bytes to the native build (evidence below).
+
+In short: the runtime that produced this report's evidence is a native Go 1.13.15
+build, **not** the image itself; the AAP-requested image uses a newer toolchain and
+yields a **different binary**; and the two are **behaviourally equivalent** for the
+SMTP paths these questions probe. This is a disclosed environment-provenance fact,
+not a claim of binary identity.
+
+**Evidence — image reachability, both toolchains, binary hashes, and behavioural equivalence** (`captures/env_provenance.txt`):
 
 ```text
 ### Requested container image (AAP 0.8.1):
@@ -62,18 +103,59 @@ $ grep PRETTY_NAME /etc/os-release
 PRETTY_NAME="Ubuntu 25.10"
 $ head -1 /proc/1/cgroup
 0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod298d4edf_30a1_4728_ba5b_bac7736c136e.slice/cri-containerd-881048cd3f61f2a7911b319c5f4efbd2ebb5551f0ff62da1a53ceb9aa7da7e7d.scope
-$ docker pull andrewparkscaleai/coding-agent:foxcpp__maddy__26452dd8dd787dc455278b0fdd296f4a5432c768
-Error response from daemon: pull access denied for andrewparkscaleai/coding-agent, repository does not exist or may require 'docker login': denied: requested access to the resource is denied
-docker pull exit=1
 
+### Image reference reachability:
+$ docker pull andrewparkscaleai/coding-agent:foxcpp__maddy__26452dd8dd787dc455278b0fdd296f4a5432c768
+Error response from daemon: pull access denied for andrewparkscaleai/coding-agent, repository does not exist or may require 'docker login': denied
+docker pull exit=1
 $ docker manifest inspect ghcr.io/scaleapi/swe-atlas:swe_atlas_QnA_foxcpp_maddy_1.0 >/dev/null; echo exit=$?
 exit=0
+
+### NATIVE toolchain (produced the canonical 2/3 evidence matrix):
+$ go version
+go version go1.13.15 linux/amd64
+$ gcc --version | head -1
+gcc (Ubuntu 15.2.0-4ubuntu4) 15.2.0
+
+### SUPPLIED ghcr IMAGE toolchain (captured via non-login bash -c):
+$ docker run --rm --entrypoint bash <ghcr-image> -c 'go version; gcc --version | head -1'
+go version go1.18.10 linux/amd64
+gcc (Debian 10.2.1-6) 10.2.1 20210110
+
+### Pinned go-smtp module version in BOTH toolchains' caches (identical):
+$ ls -d $(go env GOPATH)/pkg/mod/github.com/emersion/go-smtp@*    # native host
+/root/go/pkg/mod/github.com/emersion/go-smtp@v0.12.1-0.20191206174923-1f576e0ec85c
+$ docker run --rm --entrypoint bash <ghcr-image> -c 'ls -d $(go env GOPATH)/pkg/mod/github.com/emersion/go-smtp@*'
+/go/pkg/mod/github.com/emersion/go-smtp@v0.12.1-0.20191206174923-1f576e0ec85c
+
+### Binary artifacts from identical source (commit 26452dd...), different toolchains:
+$ sha256sum maddy-native maddy-image maddyctl-native maddyctl-image
+7aa3baaff860deffa33b1f477e72e9b42e52c241f493b3a6c7bd05bda8251a7b  maddy-native
+e4c483123051db629b811c686b9c7a5d24a922d3d40af3113a8924263eb72d1c  maddy-image
+8ac9abba2e1ad5e5ea12dbee53702a1625eaf590ba623ed609f6b16c51b3c328  maddyctl-native
+72ab99700b4d7f06ffe97900201badffc0890c6e6419c923ab4f0a2a67d92964  maddyctl-image
+$ stat -c '%n %s bytes' maddy-native maddy-image
+maddy-native 21847696 bytes
+maddy-image 19307784 bytes
+$ cmp -s maddy-native maddy-image && echo IDENTICAL || echo DIFFER
+DIFFER
+
+### Behavioural equivalence (observed): D2 + Q2 probes replayed on the image build
+$ diff native_d2.txt image_d2.txt && echo 'D2 wire IDENTICAL'
+D2 wire IDENTICAL
+$ diff native_q2.txt image_q2.txt && echo 'Q2 wire IDENTICAL'
+Q2 wire IDENTICAL
+# image enforcement hook: auth_user=[usera@example.org] sender=[userb@example.org]
+#   (both A and B, byte-identical to the native build)
 ```
 
-## 0.2 Toolchain (canonical build tooling) and `go env GOMODCACHE`
+## 0.2 Native build toolchain and `go env GOMODCACHE`
 
-The build tooling matches the requested image's toolchain: Go 1.13.15 with CGO
-enabled (required by the SQLite driver). The checkpoint requires the literal
+The canonical evidence matrix was built with the **native host** toolchain: Go
+1.13.15 with CGO enabled (required by the SQLite driver). Go 1.13.15 is the
+highest patch of the `go 1.13` version declared in maddy's `go.mod`; it is **not**
+the AAP-requested image's Go 1.18.10 toolchain (§0.1), and the two toolchains
+produce different binaries (§0.1 table). The checkpoint requires the literal
 output of `go env GOMODCACHE`. Under Go 1.13.15 the `GOMODCACHE` variable does
 **not exist** (it was introduced in Go 1.14), so `go env GOMODCACHE` prints an
 **empty line and exits 0**; the module cache is therefore derived as
@@ -101,27 +183,47 @@ $ ls -d $(go env GOPATH)/pkg/mod/github.com/emersion/go-smtp@*
 /root/go/pkg/mod/github.com/emersion/go-smtp@v0.12.1-0.20191206174923-1f576e0ec85c
 ```
 
-## 0.3 Network isolation of the plaintext test listeners
+## 0.3 Network exposure of the plaintext test listeners
 
 The test binds `smtp` on `:25` and `submission` on `:587` on `0.0.0.0`, as the
 scenario requires. Because TLS is disabled for the offline test, these are
-**plaintext** listeners (including a plaintext AUTH listener on :587). The
-following evidence documents that they are **not exposed** to any untrusted
-peer: the process runs inside a Kubernetes pod network namespace
-(`cri-containerd`), no port is published to the node or any external network,
-and **every probe in this investigation connects to `127.0.0.1` (loopback)**, so
-traffic never leaves the pod. The listeners exist only for the duration of the
-run and are torn down at cleanup (§5). (Note: `ip`/`ss`/`netstat`/`lsof` are not
-installed in this pod, so listener state is read from `/proc/net/tcp{,6}`; the
-listeners appear on the IPv6 wildcard `::` — the raw `/proc/net/tcp6`
-local-address column reads `00000000000000000000000000000000:0019` for :25
-and `00000000000000000000000000000000:024B` for :587 — see §1.7.)
+**plaintext** listeners (including a plaintext AUTH listener on :587). This
+section reports only what was **demonstrated**, and is explicit about what was
+**not** proven — it does **not** claim the listeners are isolated:
 
-**Evidence** (`captures/network_isolation.txt`):
+- **Demonstrated — wildcard bind (not loopback).** Both listeners bind the IPv6
+  wildcard `::` (all in-namespace interfaces), not `127.0.0.1`. `ip`/`ss`/`netstat`/
+  `lsof` are not installed, so listener state is read from `/proc/net/tcp{,6}`; the
+  raw `/proc/net/tcp6` local-address column reads
+  `00000000000000000000000000000000:0019` for :25 and `…:024B` for :587 (see §1.7).
+- **Demonstrated — the evidence probes use loopback.** Every Q1/Q2 probe in this
+  investigation connects to `127.0.0.1`. That is a property of the **probes**, not
+  a restriction on the listeners.
+- **Demonstrated — reachable beyond loopback.** Because the bind is wildcard, the
+  listeners answer on the **non-loopback pod IP `10.236.0.171`**, and a process in
+  a **separate Docker network namespace** (its own `eth0`/`lo`, a distinct network
+  namespace) connected to both `10.236.0.171:25` and `:587` and received a valid
+  `220 example.org ESMTP Service Ready` banner and a `221` QUIT reply (evidence
+  below). The listeners are therefore **not** loopback-only.
+- **Demonstrated — temporary lifetime.** The listeners exist only for the duration
+  of the run and are torn down at cleanup (§5).
+- **NOT proven — external isolation.** This report makes **no** claim that the
+  listeners are unreachable from outside the pod, and does **not** treat loopback
+  probe traffic or the pod cgroup as proof of isolation. The process runs in a
+  Kubernetes pod network namespace (`cri-containerd`, cgroup below), but the
+  Kubernetes API returns **HTTP 403** here, so **no** `Service` or `NetworkPolicy`
+  object could be read to establish node-level or cluster-level isolation. Whether
+  anything outside the pod can route to `10.236.0.171` was not tested and is not
+  asserted.
+
+The security-relevant fact is that these are wildcard-bound plaintext listeners
+(with plaintext AUTH on :587) whose reachability **beyond loopback** was positively
+observed; external isolation was **not** established.
+
+**Evidence** (`captures/network_exposure.txt`):
 
 ```text
-### F13 - network exposure/isolation of the plaintext test listeners
-# Captured 2026-07-13T17:37:11Z
+### Network exposure of the plaintext test listeners
 
 $ hostname -I
 10.236.0.171 172.17.0.1 
@@ -142,13 +244,29 @@ docker0 000011AC 0000FFFF
 $ head -1 /proc/1/cgroup    # container runtime (Kubernetes pod)
 0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod298d4edf_30a1_4728_ba5b_bac7736c136e.slice/cri-containerd-881048cd3f61f2a7911b319c5f4efbd2ebb5551f0ff62da1a53ceb9aa7da7e7d.scope
 
-# Isolation summary: the maddy test binds smtp :25 and submission :587 on
-# 0.0.0.0 (all in-namespace interfaces), but this process runs inside a
-# Kubernetes pod network namespace (cri-containerd). No port is published
-# to the node or any external network; the only reachable peers are inside
-# the pod. Every probe in this investigation connects to 127.0.0.1 (loopback),
-# so traffic never leaves the pod. The plaintext listeners exist only for the
-# duration of the run and are torn down at cleanup (see server lifecycle).
+### Listener bind (from /proc/net/tcp6 — wildcard ::, NOT loopback):
+$ awk 'LISTEN rows for :25(0019)/:587(024B)' /proc/net/tcp6
+  00000000000000000000000000000000:024B  state=0A
+  00000000000000000000000000000000:0019  state=0A
+# local-address 000...000 = IPv6 wildcard :: (all interfaces), not 127.0.0.1.
+
+### Reachable over the NON-loopback pod IP 10.236.0.171 (host client):
+$ connect 10.236.0.171:25
+S< 220 example.org ESMTP Service Ready
+S< 221 2.0.0 Goodnight and good luck  (after QUIT)
+$ connect 10.236.0.171:587
+S< 220 example.org ESMTP Service Ready
+S< 221 2.0.0 Goodnight and good luck  (after QUIT)
+
+### Reachable from a SEPARATE Docker network namespace (distinct netns) to 10.236.0.171:
+$ docker run --rm --entrypoint bash <ghcr-image> -c '<connect 10.236.0.171:25 and :587 via /dev/tcp>'
+  container netns interfaces: eth0 lo
+  connect 10.236.0.171:25  -> S< 220 example.org ESMTP Service Ready | 221 2.0.0 Goodnight and good luck
+  connect 10.236.0.171:587 -> S< 220 example.org ESMTP Service Ready | 221 2.0.0 Goodnight and good luck
+
+### External isolation NOT proven: Kubernetes API is 403 (no Service/NetworkPolicy readable):
+$ curl -sk -o /dev/null -w "k8s api http=%{http_code}\n" https://kubernetes.default.svc/api
+k8s api http=403
 
 $ python3 /tmp/maddy-test/scripts/netcheck.py 25 587   # BEFORE server start
 PORT 25 LISTENING: False
@@ -1292,8 +1410,8 @@ Reads `/proc/net/tcp` and `/proc/net/tcp6`, filters for state `0A` (LISTEN) on t
 #!/usr/bin/env python3
 """netcheck.py - enumerate TCP listeners from /proc/net/tcp{,6}.
 ip/ss/netstat are not installed in this Kubernetes pod, so we parse the
-kernel tables directly. Used for F13 isolation evidence and F10
-readiness / post-stop verification. State 0A == TCP_LISTEN."""
+kernel tables directly. Used for the §0.3 network-exposure evidence (wildcard
+bind) and for readiness / post-stop verification. State 0A == TCP_LISTEN."""
 import sys
 
 
@@ -3711,12 +3829,20 @@ the question asks about.
 
 ## 3.2 Standards framing (factual)
 
-**RFC 6409** (message submission; successor to RFC 4409) requires authentication
-on the submission port and **permits** a submission server to enforce or rewrite
-the sender identity — but it does **not mandate** that `MAIL FROM` equal the
-authenticated user. Binding is an implementation policy choice. maddy's default
-is the permissive end of that spectrum: it authenticates the connection but binds
-the envelope sender only by **domain locality**, as the evidence below shows.
+**RFC 6409** (message submission; successor to RFC 4409) requires submissions to
+be **authorized** — not merely to arrive on a given port. By default the MSA
+**MUST** reject `MAIL` when the session "has not been authenticated using
+[SMTP-AUTH]" (RFC 6409 §4.3, "Require Authentication"; reply code `530`), *unless*
+authentication or authorization was already independently established, "such as
+being within a protected subnetwork." SMTP AUTH is therefore the **default**
+mechanism, not the only permitted basis: §3.3 is titled "Authorized Submission",
+and §3.2 notes that authorization may rest on either the authenticated identity
+**or** the submitting endpoint being within a protected IP environment. Separately,
+RFC 6409 **permits** a submission server to enforce or rewrite the sender identity
+but does **not mandate** that `MAIL FROM` equal the authenticated user — binding is
+an implementation policy choice. maddy's default sits at the permissive end of that
+spectrum: it authenticates the connection (the test binds SMTP AUTH on `:587`) but
+binds the envelope sender only by **domain locality**, as the evidence below shows.
 
 ## 3.3 The code path (grounded)
 
@@ -4395,6 +4521,129 @@ ALL Q2 SINK VALUES + NORMALIZED TRANSCRIPTS STABLE ACROSS RUNS: True
 
 ---
 
+## 3.10 Malformed AUTH PLAIN initial-response — observed no-reply behavior (disclosure)
+
+While exercising the authenticated submission listener for Q2, a negative input
+adjacent to the authentication path was also driven to characterize how maddy
+handles a syntactically malformed `AUTH` command: an `AUTH PLAIN` whose
+initial-response argument is **not** valid base64. This subsection discloses the
+observed runtime behavior; it is reported, not remediated (see the scope note at
+the end of this subsection).
+
+**What was sent.** After `EHLO` on the submission listener (`tcp://0.0.0.0:587`),
+the client transmitted the exact bytes `AUTH PLAIN !!!not-base64!!!\r\n`
+(TX sha256 `9271a18493203e4536ae2fc4651ed85f6a911fec5eb8469b1bfc42abf52e84d2`),
+waited 1.5 s for any reply, then issued `NOOP` followed by `QUIT`.
+
+**Observed behavior.** maddy sends **no reply at all** to the malformed `AUTH`
+within the 1.5 s window — no `501`, no `500`, no error line — yet the connection
+remains fully open and usable: the subsequent `NOOP` is answered
+`250 2.0.0 I have sucessfully done nothing` and `QUIT` is answered
+`221 2.0.0 Goodnight and good luck`. No auth-error line is written to the
+`-debug` log for the malformed command. The behavior was identical across two
+runs of the same unchanged input (the `[AUTH-badb64 (1.5s wait)]` label below is
+followed by nothing, which is the visible proof of the silent drop).
+
+**Command that produced the output:**
+
+```text
+python3 /tmp/maddy-test/scripts/spotprobe.py m4 587
+```
+
+**Evidence** (`captures/badbase64_M4.txt`, unedited):
+
+```text
+### m4 - malformed AUTH PLAIN base64: observed no-reply behavior (captured 2026-07-14T00:29:33Z)
+### exact TX after EHLO:  AUTH PLAIN !!!not-base64!!!<CR><LF>
+TX bytes = b'AUTH PLAIN !!!not-base64!!!\r\n'
+TX sha256 = 9271a18493203e4536ae2fc4651ed85f6a911fec5eb8469b1bfc42abf52e84d2
+
+=== RUN 1 ===
+[S<banner]
+    220 example.org ESMTP Service Ready\r\n
+[EHLO]
+    250-Hello probe.test\r\n
+    250-PIPELINING\r\n
+    250-8BITMIME\r\n
+    250-ENHANCEDSTATUSCODES\r\n
+    250-AUTH PLAIN\r\n
+    250-SMTPUTF8\r\n
+    250 SIZE 33554432\r\n
+[TX-bytes]
+    AUTH PLAIN !!!not-base64!!!\r\n
+[AUTH-badb64 (1.5s wait)]
+[NOOP]
+    250 2.0.0 I have sucessfully done nothing\r\n
+[QUIT]
+    221 2.0.0 Goodnight and good luck\r\n
+
+=== RUN 2 (identical unchanged input) ===
+[S<banner]
+    220 example.org ESMTP Service Ready\r\n
+[EHLO]
+    250-Hello probe.test\r\n
+    250-PIPELINING\r\n
+    250-8BITMIME\r\n
+    250-ENHANCEDSTATUSCODES\r\n
+    250-AUTH PLAIN\r\n
+    250-SMTPUTF8\r\n
+    250 SIZE 33554432\r\n
+[TX-bytes]
+    AUTH PLAIN !!!not-base64!!!\r\n
+[AUTH-badb64 (1.5s wait)]
+[NOOP]
+    250 2.0.0 I have sucessfully done nothing\r\n
+[QUIT]
+    221 2.0.0 Goodnight and good luck\r\n
+```
+
+**Why this happens (grounded in source).** The `AUTH` command is handled by
+go-smtp's `handleAuth` (`conn.go:L393`). When an initial-response argument is
+present it is base64-decoded at `conn.go:L416`
+(`ir, err = base64.StdEncoding.DecodeString(parts[1])`); on a decode error the
+handler executes a **bare `return` with no `WriteResponse`** at
+`conn.go:L417-L419`, so the client is never sent a reply:
+
+```go
+ir, err = base64.StdEncoding.DecodeString(parts[1])
+if err != nil {
+    return
+}
+```
+
+This is internally inconsistent with the *continuation*-response decode later in
+the same function (`conn.go:L457-L461`), which on the same class of error does
+emit a reply — `454 4.7.0 Invalid base64 data` — before returning:
+
+```go
+response, err = base64.StdEncoding.DecodeString(encoded)
+if err != nil {
+    c.WriteResponse(454, EnhancedCode{4, 7, 0}, "Invalid base64 data")
+    return
+}
+```
+
+So an undecodable base64 in the AUTH *initial response* is silently dropped,
+whereas an undecodable base64 in a *continuation* response yields `454`.
+
+**Standards note.** RFC 4954 §4 requires that a server which cannot base64-decode
+a client response reject the `AUTH` command with a `501` reply (enhanced status
+code `5.5.2`). The observed silent no-reply for the initial-response case deviates
+from that requirement; the continuation-response case does emit a reply but uses
+`454` rather than the prescribed `501`. maddy does not override this go-smtp
+behavior, so the deviation is exhibited by the running server exactly as captured
+above.
+
+**Scope note.** This behavior originates in the pinned go-smtp dependency
+(`github.com/emersion/go-smtp@v0.12.1-0.20191206174923-1f576e0ec85c`, `conn.go`),
+not in maddy's own source, and correcting it would require modifying dependency
+source. Per the controlling read-only / documentation-only mandate (AAP §0.3
+"Explicitly Out of Scope" and §0.8), no source change is made — this subsection
+**discloses** the observed runtime behavior as evidence, consistent with the
+investigation's observe-and-report charter.
+
+---
+
 # 4. Coverage pass
 
 Every named part of both questions, confirmed answered with observed evidence:
@@ -4440,17 +4689,20 @@ Every named part of both questions, confirmed answered with observed evidence:
 `AUTH A → MAIL FROM A → RSET → MAIL FROM B` sequence (E1 and E2), each twice.
 
 **Findings from the prior review, addressed:** full harness scripts + exact
-invocations (§1.7); the complete 24‑execution run‑indexed ledger with sent bytes,
+invocations (§1.7); the complete run‑indexed ledger — **24 mandatory executions** (D1–D5, each run twice on both listeners = 20; plus the Q2 E1/E2 cases = 4) **plus two supplementary D6 runs**, **26 run blocks total** — with sent bytes,
 wire, `-debug`, connection state, artifact IDs/paths, and exact persisted bytes
 (§2.4–2.10, §3.4–3.8); all placeholders/ellipsis replaced with literal captured
 output; corrected Q2 enforcement‑sink semantics (§3.6 Sink 3); correlated
 `.header`/`.body`/`.meta`/`.meta.new` + reproducible source search (§3.6, §3.8);
-requested‑image/native‑fallback provenance (§0.1); every config deviation incl.
+requested‑image vs native‑build provenance, incl. divergent binary hashes and observed behavioural equivalence (§0.1); every config deviation incl.
 `sign_dkim`/plus‑addressing/`alias_file` (§1.3); D6 reframed (§2.9); normalized
 repeatability hashes (§2.11, §3.9); process lifecycle (§1.6, §5); `go env
 GOMODCACHE` blank output (§0.2); correct `internal/testutils/smtp_server.go`
 path scoped to production consumers (§3.8); and plaintext‑listener network
-isolation (§0.3).
+exposure — wildcard bind, non‑loopback/cross‑namespace reachability, external
+isolation not proven (§0.3). Supplementary to the two questions, the silent
+no-reply to a malformed `AUTH PLAIN` initial response (go-smtp `conn.go`) is
+disclosed as an observed negative-path behavior (§3.10).
 
 ---
 
