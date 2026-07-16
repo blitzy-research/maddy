@@ -193,7 +193,7 @@ All six scenarios authenticate as **alice**. Each was run **≥2× over plaintex
 
 The following codes were identical across all sessions where applicable:
 
-- EHLO advertised: `PIPELINING`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `AUTH PLAIN`, `SMTPUTF8`, `SIZE 33554432`.
+- EHLO advertised: `PIPELINING`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `STARTTLS`, `AUTH PLAIN`, `SMTPUTF8`, `SIZE 33554432` (matching the complete §5.0 transcript). **`STARTTLS` is transport-specific (OBSERVED):** it is advertised on the plaintext `587` submission listener (TLS is available but not yet active) but is **absent on the implicit-TLS `465` listener** (the connection is already encrypted) — a live EHLO on each port confirmed `STARTTLS` present on `587` and absent on `465`, stable across repeated probes. *(Source-grounded: `github.com/emersion/go-smtp` `conn.go:229-230` appends `STARTTLS` only when `c.server.TLSConfig != nil && !isTLS`.)*
 - AUTH success: `235 2.0.0 Authentication succeeded`
 - `MAIL FROM` **always** returned `250 2.0.0 Roger, accepting mail from <ADDR>` — **including for `x@remote.tld`**. The sender reject is *deferred* to the first `RCPT`, because `defer_sender_reject` defaults to true (`internal/endpoint/smtp/smtp.go:567`).
 - RCPT accept: `250 2.0.0 I'll make sure <alice@example.org> gets this`
@@ -621,7 +621,7 @@ Two observed details worth stating exactly:
 - The value is **`Authentication-Results: ; dkim=none`** — `dkim=none` because the check ran on the *incoming* message, which has no signature yet (signing happens later, in the modify stage). The result reflects what the check saw, not the signature the pipeline subsequently added.
 - The **authserv-id field is empty** (the string is literally `; dkim=none` with nothing before the semicolon) in this configuration.
 
-**Grounding.** The header is added by the check runner whenever a check populates an authentication result, with **no submission-vs-inbound guard**: `internal/check/check_runner.go` builds and calls `textproto.Header.Add("Authentication-Results", ...)` (L299-303). The submission endpoint does not suppress it. So the correct statement is the config-conditional one above: **absent by default because the canonical submission blocks run no such check; present the moment one is configured.** The canonical daemon and config were restored immediately after this measurement.
+**Grounding.** The header is added by the check runner whenever a check populates an authentication result, with **no submission-vs-inbound guard**: `internal/msgpipeline/check_runner.go` builds and calls `textproto.Header.Add("Authentication-Results", ...)` (L299-303). The submission endpoint does not suppress it. So the correct statement is the config-conditional one above: **absent by default because the canonical submission blocks run no such check; present the moment one is configured.** The canonical daemon and config were restored immediately after this measurement.
 
 ---
 
@@ -861,7 +861,7 @@ Every `file:line` cited above, with the named symbol. Line numbers are for commi
 - L9 "`for` field is never included in the `Received` header field".
 
 **`internal/check/command/command.go`** (per-user policy mechanism, §11.1)
-- `modName = "command"` L29; default actions `1:Reject`, `2:Quarantine` `New` L54-61; inline `cmd`/`cmdArgs` L67-68; `run_on` enum `{conn,sender,rcpt,body}` default `body` L88-90; `code <exit> <action>` → `ParseActionDirective` L106-118; `{auth_user}`→`Conn.AuthUser` L145, `{sender}`→`mailFrom` L178; `CheckSender` L314; `module.Register(modName, New)` L374.
+- `modName = "command"` L28; default actions `1:Reject`, `2:Quarantine` `New` L54-61; inline `cmd`/`cmdArgs` L68-69; `run_on` enum `{conn,sender,rcpt,body}` default `body` L88-90; `code <exit> <action>` → `ParseActionDirective` L106-118; `{auth_user}`→`Conn.AuthUser` L145, `{sender}`→`mailFrom` L178; `CheckSender` L314; `module.Register(modName, New)` L374.
 
 **`cmd/maddyctl/main.go`** (P5-F1)
 - `if err := app.Run(os.Args); err != nil { fmt.Fprintln(os.Stderr, err) }` L563-565 — **no `os.Exit(1)`** on error.
@@ -870,9 +870,9 @@ Every `file:line` cited above, with the named symbol. Line numbers are for commi
 - `if !ctx.Bool("yes,y")` L109 (looks up a nonexistent composite flag name; flag is `yes`/`y`); prompt L119; contrast correct `ctx.Bool("yes")` at L235 (`imap-msgs remove`).
 
 **`internal/address/split.go`** (P7-F1)
-- "intentionally naive … does almost no sanity checks" comment L15-17; `strings.LastIndexByte(addr, '@')` L20 → `bad@@example.org` = local-part `bad@` + domain `example.org`.
+- "intentionally naive … does almost no sanity checks" comment L15-17; `strings.LastIndexByte(addr, '@')` L23 → `bad@@example.org` = local-part `bad@` + domain `example.org`.
 
-**`internal/check/check_runner.go`** (P4-F2)
+**`internal/msgpipeline/check_runner.go`** (P4-F2)
 - `Authentication-Results` built and added L299-303 (no submission-vs-inbound guard).
 
 **Pinned dependencies exercised for the supplementary observations (`go.mod`)**
@@ -951,7 +951,7 @@ The delivery outcome then depends on the **`From` header** (the precise, observe
 - `From: bad@@example.org` → `DATA -> 554 5.6.0 Invalid address in From (msg ID = 45b425ec)` — the malformed address fails `submissionPrepare`'s `From` syntax check.
 - `From: alice@example.org` (a separately-valid header) → `DATA -> 250 2.0.0 OK: queued`, delivered **unsigned**, stored with `Received:  by example.org (envelope-sender <bad@@example.org>)`.
 
-**Grounding:** `internal/address/split.go` `Split` uses `strings.LastIndexByte(addr, '@')` (L20), so `bad@@example.org` splits into local-part `bad@` and domain `example.org` — the **local** domain — which is why the envelope passes the domain gate; the function is documented as "intentionally naive … does almost no sanity checks" (comment L15-17). Provisioning persists the identity without rejecting the extra `@`. **Scope:** Maddy source defect — documented, not fixed.
+**Grounding:** `internal/address/split.go` `Split` uses `strings.LastIndexByte(addr, '@')` (L23), so `bad@@example.org` splits into local-part `bad@` and domain `example.org` — the **local** domain — which is why the envelope passes the domain gate; the function is documented as "intentionally naive … does almost no sanity checks" (comment L15-17). Provisioning persists the identity without rejecting the extra `@`. **Scope:** Maddy source defect — documented, not fixed.
 
 ### 14.3 Protocol robustness (pinned `go-smtp v0.12.1-0.20191206174923-1f576e0ec85c`)
 
