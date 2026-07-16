@@ -337,7 +337,7 @@ Maddy stamps `Authentication-Results` **only on the inbound check path** (`verif
 
 §4–§6 already establish the triggering behavior under `From` manipulation: T1 (`From` = cross-user), T4 (`From` ≠ envelope), and T5 (`From`-domain ≠ key-domain) are each **accepted and delivered UNSIGNED** — a manipulated `From` never causes a rejection, only the absence of a signature; and for the aligned T2 the signature **covers `From`** (oversigned). This section reports what a recipient attempting cryptographic verification would actually conclude.
 
-Verification used the **same library Maddy uses** — `github.com/emersion/go-msgauth v0.3.2-0.20191028231513-55b75676976c` (`go.mod:17`), `dkim.Verify`, with the DKIM DNS record served locally — and was cross-checked with Python `dkimpy`. Three findings, each labeled **OBSERVED** with its source grounding:
+Verification used the **same library Maddy uses** — `github.com/emersion/go-msgauth v0.3.2-0.20191028231513-55b75676976c` (`go.mod:17`), `dkim.Verify`, with the DKIM DNS record served locally. Three findings, each labeled **OBSERVED** with its source grounding:
 
 ### Finding A (OBSERVED) — the published public key is PKCS#1 but the verifier expects PKIX (a real interop divergence at this commit)
 
@@ -347,7 +347,7 @@ Maddy's auto-generated `.dns` record's `p=` value base64-decodes to DER beginnin
 RESULT: FAIL domain=example.org err=dkim: key syntax error: x509: failed to parse public key (use ParsePKCS1PublicKey instead for this key format)
 ```
 
-Python `dkimpy` likewise returned `False`. **Conclusion:** a recipient using Maddy's own auto-generated TXT record verbatim gets a **key syntax error for every signed message** — and this is the same parsing code path Maddy's own `verify_dkim` check would use. (Later Maddy versions switched to `MarshalPKIXPublicKey`; at commit `26452dd` it is PKCS#1.) This is an **OBSERVED interop divergence**.
+**Conclusion:** a recipient using Maddy's own auto-generated TXT record verbatim gets a **key syntax error for every signed message** — and this is the same parsing code path Maddy's own `verify_dkim` check would use. (Later Maddy versions switched to `MarshalPKIXPublicKey`; at commit `26452dd` it is PKCS#1.) This is an **OBSERVED interop divergence**.
 
 ### Finding B (OBSERVED) — the signature scheme itself is sound (in-library round-trip PASSES)
 
